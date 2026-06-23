@@ -4,6 +4,16 @@ import shutil
 
 import torch
 import torch.distributed as dist
+
+# [NPU] Register torch.npu + transfer_to_npu BEFORE any megatron import. The GDN-patched
+# megatron (megatron.core.ssm.gated_delta_net) imports mindspeed triton ops at module-load
+# time, which dereference torch.npu. Mirrors slime-ascend's convert + vime train.py ordering.
+try:
+    import torch_npu  # noqa: F401
+    import mindspeed.megatron_adaptor  # noqa: F401
+except ImportError:
+    pass
+
 from megatron.core.enums import ModelType
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
@@ -27,6 +37,16 @@ def add_convertion_args(parser):
         choices=["raw", "bridge"],
         default="raw",
         help="The method to convert megatron weights to hugging face weights for vLLM.",
+    )
+    # [NPU/GDN] mirror vime's full-parser arg; the model reads getattr(args,"qwen_gdn_backend","fla").
+    # On NPU this must be "npu" so get_chunk_gated_delta_rule/get_causal_conv1d route to mindspeed ops
+    # instead of fla (which is not installed on Ascend).
+    parser.add_argument(
+        "--qwen-gdn-backend",
+        type=str,
+        choices=["fla", "flashqla", "npu"],
+        default="fla",
+        help="GDN implementation backend for Qwen linear-attention layers.",
     )
     try:
         parser.add_argument("--padded-vocab-size", type=int, default=None)
@@ -92,15 +112,23 @@ def main():
     os.environ.setdefault("LOCAL_RANK", str(local_rank))
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
-    backend = "nccl"
     if is_npu():
-        backend = "hccl"
-    dist.init_process_group(
-        backend=backend,
-        world_size=world_size,
-        rank=global_rank,
-        device_id=torch.device(f"cuda:{local_rank}"),
-    )
+        # [NPU] hccl must NOT receive device_id: transfer_to_npu maps cuda:n->npu:n, and a
+        # npu device_id on the default PG makes gloo sub-group creation in
+        # mpu.initialize_model_parallel hit `_get_backend(npu).supports_splitting`
+        # -> "No backend type associated with device type npu". Mirrors slime-ascend convert.
+        dist.init_process_group(
+            backend="hccl",
+            world_size=world_size,
+            rank=global_rank,
+        )
+    else:
+        dist.init_process_group(
+            backend="nccl",
+            world_size=world_size,
+            rank=global_rank,
+            device_id=torch.device(f"cuda:{local_rank}"),
+        )
     args = get_args()
     init(args)
 

@@ -15,8 +15,20 @@ from megatron.core import mpu
 from ray import ObjectRef
 from ray.actor import ActorHandle
 from tqdm import tqdm
-from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
-from vllm_ascend.distributed.weight_transfer.hccl_engine import HCCLTrainerSendWeightsArgs, HCCLWeightTransferEngine
+
+# Weight-transfer engines are only used by the *distributed* (disaggregated) send path.
+# The colocate tensor path (UpdateWeightFromTensor) transfers via CUDA/NPU IPC and never
+# touches these. vllm_ascend's HCCL engine is absent in some NPU builds, so guard the
+# top-level imports: a missing engine must not break importing this module (and thus the
+# whole actor + the colocate path). The distributed path re-imports HCCL lazily at use.
+try:
+    from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs, NCCLWeightTransferEngine
+except ImportError:  # pragma: no cover - non-CUDA / partial vllm build
+    NCCLTrainerSendWeightsArgs = NCCLWeightTransferEngine = None
+try:
+    from vllm_ascend.distributed.weight_transfer.hccl_engine import HCCLTrainerSendWeightsArgs, HCCLWeightTransferEngine
+except ImportError:  # pragma: no cover - vllm_ascend build without weight_transfer
+    HCCLTrainerSendWeightsArgs = HCCLWeightTransferEngine = None
 
 from vime.utils.distributed_utils import get_gloo_group
 

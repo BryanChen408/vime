@@ -407,6 +407,36 @@ class _VLLMHijack:
         IPCWeightTransferEngine._vime_receive_patched = True  # type: ignore[attr-defined]
 
 
+def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
+    """Copy vLLM custom attrs (set via ``set_weight_attrs``) from *src* to *dst*.
+
+    ``torch.nn.Parameter(data)`` creates a fresh tensor that drops every
+    non-standard attribute, so this must be called whenever a param is
+    re-created during post-weight-sync transpose (was in vllm-ascend
+    worker.wake_up, now runs after :meth:`finish_weight_update`).
+    """
+    _SKIP = frozenset(
+        {
+            "data", "dtype", "device", "grad", "grad_fn", "layout",
+            "name", "names", "ndim", "output_nr", "requires_grad",
+            "retains_grad", "shape", "size",
+        }
+    )
+    for key in dir(src):
+        if key.startswith("_") or key in _SKIP:
+            continue
+        try:
+            val = getattr(src, key)
+        except (AttributeError, RuntimeError):
+            continue
+        if callable(val) and key not in ("weight_loader",):
+            continue
+        try:
+            setattr(dst, key, val)
+        except (AttributeError, TypeError, RuntimeError):
+            pass
+
+
 class vLLMColocateWorkerExtension:
     """vLLM ``--worker-extension-cls`` entry for colocated IPC weight sync."""
 
@@ -491,3 +521,43 @@ class vLLMColocateWorkerExtension:
         # Ensure the receiver has finished consuming the IPC tensors before
         # the sender drops its reference on the next barrier.
         torch.accelerator.synchronize()
+
+    # ── IPC weight-update lifecycle (init / start / finish) ───────────────────
+    # vllm's CUDA Worker (gpu_worker.py) provides these, but vllm-ascend's NPUWorker
+    # does not, so the extension supplies them. The vime IPC path reconstructs handles
+    # inline in update_weights_chunk and never uses a weight_transfer_engine, so engine
+    # init is a no-op and start/finish only manage the layerwise-reload + active flag.
+
+    def init_weight_transfer_engine(self, init_info: dict) -> None:
+        """No-op for the colocate IPC path (update_weights_chunk needs no transfer engine)."""
+        return None
+
+    def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
+        if getattr(self, "_weight_update_active", False):
+            raise RuntimeError(
+                "start_weight_update called while a weight update is already active. "
+                "Call finish_weight_update first."
+            )
+        # Layerwise reload un-does vllm's post-load kernel-format fusion so params are
+        # loadable again (they otherwise lack a weight_loader after process_weights_after_loading).
+        # The earlier aclnnInplaceCopy failure here was because vllm was OFFLOADED (param.data on
+        # host); with --no-offload-rollout the params stay on NPU and the restore copy is d2d-valid.
+        if is_checkpoint_format:
+            from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+            model = self.model_runner.model
+            with torch.device(self.device):
+                initialize_layerwise_reload(model)
+        self._is_checkpoint_format = is_checkpoint_format
+        self._weight_update_active = True
+
+    def finish_weight_update(self) -> None:
+        if not getattr(self, "_weight_update_active", False):
+            raise RuntimeError("start_weight_update must be called before finish_weight_update.")
+        if self._is_checkpoint_format:
+            from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+
+            model = self.model_runner.model
+            with torch.device(self.device):
+                finalize_layerwise_reload(model, self.model_config)
+        self._weight_update_active = False

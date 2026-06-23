@@ -115,7 +115,7 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--qwen-gdn-backend",
                 type=str,
-                choices=["fla", "flashqla"],
+                choices=["fla", "flashqla", "npu"],
                 default="fla",
                 help="GDN implementation backend for Qwen linear-attention layers.",
             )

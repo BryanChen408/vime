@@ -358,6 +358,12 @@ def build_vllm_subprocess_env(server_args: dict[str, Any]) -> dict[str, str]:
     args = server_args["args"]
     env = os.environ.copy()
     env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    # [NPU] Drop a parent-inherited PYTORCH_NPU_ALLOC_CONF (the Docker image sets
+    # expandable_segments:True for training). vllm-ascend manages this itself and
+    # MUST NOT have expandable_segments under sleep mode — its CaMemAllocator
+    # memory pool asserts against it (camem.py). Letting vllm-ascend's own
+    # sleep-mode-aware logic (platform.py) re-add it only when sleep mode is off.
+    env.pop("PYTORCH_NPU_ALLOC_CONF", None)
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
     if is_npu():
         env["ASCEND_RT_VISIBLE_DEVICES"] = server_args["visible_devices"]
@@ -871,8 +877,16 @@ class VLLMEngine(RayActor):
             )
         return self._weight_version
 
-    def release_memory_occupation(self, level: int = 2):
-        """Flush prefix cache, then ``POST /sleep?level={level}``."""
+    def release_memory_occupation(self, level: int = 1):
+        """Flush prefix cache, then ``POST /sleep?level={level}``.
+
+        Default level=1 (offload weights to host, keep the param objects) NOT level=2.
+        On NPU (vllm-ascend), level=2 sleep discards weights and the subsequent
+        wake_up re-allocates them as plain tensors WITHOUT vllm's ``weight_loader``
+        attribute, breaking the RLHF weight update (`'Parameter' object has no
+        attribute 'weight_loader'`). Level 1 preserves the param objects (and thus
+        weight_loader) while still freeing GPU HBM for colocated training.
+        """
         if self.node_rank != 0:
             return None
         self.flush_cache()
@@ -906,7 +920,10 @@ class VLLMEngine(RayActor):
         last_error = None
         for attempt in range(1, 4):
             try:
-                return self._make_request("init_weight_transfer_engine", payload, timeout=init_timeout_s)
+                # NOTE: _make_request takes no timeout kwarg (the upstream `timeout=init_timeout_s`
+                # was doubly broken: undefined name + unsupported kwarg). The 3-attempt retry below
+                # provides resilience for the first-call IPC setup handshake.
+                return self._make_request("init_weight_transfer_engine", payload)
             except Exception as e:
                 last_error = e
                 if attempt < 3:

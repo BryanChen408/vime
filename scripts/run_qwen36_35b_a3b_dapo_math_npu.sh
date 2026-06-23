@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Qwen3.6-35B-A3B (GDN/MoE, Route B port) DAPO-math RL — single node, 16 Ascend NPUs.
+#
+# Validation vehicle for the GDN port + converted checkpoint:
+#   - actor (policy/ref) = vime_plugins.models.qwen3_5 GDN model, loaded from the
+#     converted torch_dist via native mcore load_checkpoint (--megatron-to-hf-mode raw).
+#   - rollout = vllm Qwen3_5MoeForConditionalGeneration on the same HF safetensors.
+#   - data = dapo-math-17k, reward = deepscaler (local \boxed{} checker, NO sandbox).
+#   - DAPO = grpo advantage + decoupled clip (eps 0.2 / 0.28), kl 0.
+# Disaggregated like scripts/run-qwen3-30B-A3B-npu.sh: 8 actor + 8 rollout = 16 NPUs.
+
+pkill -9 -f "vllm serve" 2>/dev/null || true
+pkill -9 -f "VLLM::" 2>/dev/null || true
+pkill -9 -f "EngineCore" 2>/dev/null || true
+pkill -9 -f "from multiprocessing" 2>/dev/null || true
+ray stop --force 2>/dev/null || true
+pkill -9 ray 2>/dev/null || true
+sleep 5
+
+set -ex
+
+# ============ NPU / megatron env (mirrors run-qwen3-30B-A3B-npu.sh) ============
+export SLIME_SCRIPT_TRAIN_BACKEND=megatron
+export PYTHONPATH="/root/Megatron-Bridge/src:/root/Megatron-LM/:/workspace/vime:$PYTHONPATH"
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
+export HYDRA_FULL_ERROR=1
+export MASTER_PORT=$(shuf -i 20000-65000 -n 1)
+export DISABLE_L2_CACHE=1
+export VLLM_ASCEND_ENABLE_NZ=0
+export QWEN36_CAUSAL_CONV1D_IMPL=triton
+# [proxy] All RL traffic is in-cluster (vllm engines, router, health checks, weight sync).
+# A leaked HTTP(S)_PROXY makes requests.get(node_ip:port/health) route through the proxy and
+# hang forever in VLLMEngine._wait_server_healthy. Clear every variant (upper+lower) and put
+# the node IP on no_proxy so nothing internal is proxied.
+NODE_IP="$(hostname -I | awk '{print $1}')"
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+export no_proxy="127.0.0.1,localhost,${NODE_IP}"
+export NO_PROXY="${no_proxy}"
+
+VIME_DIR=/workspace/vime
+HF_CKPT=/home/s50057377/Qwen3.6-35B-A3B
+REF_LOAD=/home/s50057377/Qwen3.6-35B-A3B_torch_dist
+PROMPT_DATA=/home/c00937190/dapo-math-17k.jsonl
+
+source "${VIME_DIR}/scripts/models/qwen3.5-35B-A3B.sh"   # -> MODEL_ARGS
+
+STAMP="$(date +%Y%m%d_%H%M%S)"
+RUN_ROOT="${VIME_DIR}/runs/dapo_math_${STAMP}"
+mkdir -p "${RUN_ROOT}"
+
+python ${VIME_DIR}/train.py \
+  --train-backend megatron \
+  --actor-num-nodes 1 \
+  --actor-num-gpus-per-node 16 \
+  --colocate \
+  --no-offload-train \
+  --rollout-num-gpus 16 \
+  --rollout-num-gpus-per-engine 8 \
+  ${MODEL_ARGS[@]} \
+  --qwen-gdn-backend npu \
+  \
+  --hf-checkpoint ${HF_CKPT} \
+  --ref-load ${REF_LOAD} \
+  --megatron-to-hf-mode raw \
+  \
+  --prompt-data ${PROMPT_DATA} \
+  --input-key prompt \
+  --label-key label \
+  --apply-chat-template \
+  --rollout-shuffle \
+  --rm-type deepscaler \
+  \
+  --rollout-backend vllm \
+  --vllm-weight-sync-mode native \
+  --vllm-gpu-memory-utilization 0.30 \
+  --vllm-enable-sleep-mode \
+  --vllm-enforce-eager \
+  --vllm-max-model-len $((1024 * 12)) \
+  \
+  --num-rollout 50 \
+  --rollout-batch-size 4 \
+  --n-samples-per-prompt 4 \
+  --rollout-max-response-len $((1024 * 2)) \
+  --rollout-temperature 1.0 \
+  --global-batch-size 16 \
+  --balance-data \
+  \
+  --advantage-estimator grpo \
+  --kl-loss-coef 0.0 \
+  --kl-loss-type low_var_kl \
+  --entropy-coef 0.0 \
+  --eps-clip 0.2 \
+  --eps-clip-high 0.28 \
+  \
+  --optimizer adam \
+  --lr 1e-6 \
+  --lr-decay-style constant \
+  --weight-decay 0.1 \
+  --adam-beta1 0.9 \
+  --adam-beta2 0.98 \
+  --optimizer-cpu-offload \
+  --overlap-cpu-optimizer-d2h-h2d \
+  --use-precision-aware-optimizer \
+  \
+  --tensor-model-parallel-size 2 \
+  --sequence-parallel \
+  --pipeline-model-parallel-size 1 \
+  --context-parallel-size 1 \
+  --expert-model-parallel-size 8 \
+  --expert-tensor-parallel-size 1 \
+  --recompute-granularity full \
+  --recompute-method uniform \
+  --recompute-num-layers 1 \
+  --use-dynamic-batch-size \
+  --max-tokens-per-gpu 4096 \
+  \
+  --attention-dropout 0.0 \
+  --hidden-dropout 0.0 \
+  --attention-softmax-in-fp32 \
+  --attention-backend flash \
+  --use-flash-attn \
+  --no-gradient-accumulation-fusion \
+  \
+  --train-memory-margin-bytes 2147483648 \
+  2>&1 | tee "${RUN_ROOT}/run.log"
+
+echo "RUN_ROOT=${RUN_ROOT}"

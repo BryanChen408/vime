@@ -7,6 +7,25 @@ from mbridge.core import register_model
 from mbridge.models import Qwen2MoEBridge
 
 
+# ============================================================================
+# [Route B] GDN fused-in_proj weight conversion helpers.
+#
+# Single source of truth lives in gdn_param_mapping.py (pure-torch, unit-tested in
+# isolation). They are VENDORED there from Megatron-Bridge because importing
+# megatron.bridge transitively pulls in transformer_engine, which is NOT installed
+# in the vime/NPU env. Imported here under the names the converter call-sites use;
+# the layout contract ([q|k|v|z|beta|alpha], TP-interleaved) is documented there.
+# ============================================================================
+from .gdn_param_mapping import (
+    _fuse_gdn_separate_to_grouped as _gdn_fuse_separate_to_grouped,
+    _split_gdn_grouped_to_separate as _gdn_split_grouped_to_separate,
+    deinterleave_gdn_conv1d as _deinterleave_gdn_conv1d,
+    interleave_gdn_conv1d as _interleave_gdn_conv1d,
+    merge_gdn_linear_weights as _gdn_merge_linear_weights,
+    split_gdn_linear_weights as _gdn_split_linear_weights,
+)
+
+
 @register_model(["qwen3_5", "qwen3_5_moe"])
 class Qwen3_5Bridge(Qwen2MoEBridge):
     """
@@ -38,18 +57,26 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
             "model.language_model.layers.{layer_number}.self_attn.k_proj.bias",
             "model.language_model.layers.{layer_number}.self_attn.v_proj.bias",
         ],
+        # [Route B] HF 的 4 个分离张量(in_proj_qkv|z|b|a)→ megatron 单 fused in_proj.
+        # _weight_to_mcore_format 里用 _gdn_fuse_separate_to_grouped + _gdn_merge_linear_weights(tp 交错)合成,
+        # 之后 mbridge chunk(tp,dim0) 落每 rank [q_r|k_r|v_r|z_r|b_r|a_r].顺序必须 qkv,z,b,a.
+        "self_attention.linear_attn.in_proj.weight": [
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_z.weight",
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_b.weight",
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_a.weight",
+        ],
+        # HF conv1d[Q|K|V] → megatron 单 conv1d,_weight_to_mcore_format 里按 [q|k|v] 段做 tp 交错
+        "self_attention.linear_attn.conv1d.weight": [
+            "model.language_model.layers.{layer_number}.linear_attn.conv1d.weight"
+        ],
     } | {
         f"self_attention.{weight_name}": ["model.language_model.layers.{layer_number}." + weight_name]
         for weight_name in [
             "input_layernorm.weight",
-            # linear attn
+            # linear attn(直通=直接按 partition_dim 切/复制;in_proj_qkv/z/b/a + conv1d 已并入 fused 显式映射,不在此列)
             "linear_attn.A_log",
-            "linear_attn.conv1d.weight",
             "linear_attn.dt_bias",
-            "linear_attn.in_proj_a.weight",
-            "linear_attn.in_proj_b.weight",
-            "linear_attn.in_proj_qkv.weight",
-            "linear_attn.in_proj_z.weight",
             "linear_attn.norm.weight",
             "linear_attn.out_proj.weight",
             # gated attn (full attention layers)
@@ -303,11 +330,34 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
                 expert_w = w[global_expert_id]  # (out_features, in_features)
                 return expert_w.contiguous()
 
+        # [Route B] HF 4 分离张量 → fused in_proj(tp 交错全局张量,之后 mbridge chunk(tp,dim0) 落每 rank).
+        if mcore_weights_name.endswith("linear_attn.in_proj.weight"):
+            tc = self._get_text_config()
+            qkv, z, b, a = hf_weights  # 顺序与映射一致
+            qkvz, ba = _gdn_fuse_separate_to_grouped(tc, qkv, z, b, a)
+            in_proj = _gdn_merge_linear_weights(tc, qkvz, ba, tp_size=self.mpu.tp_size)
+            return in_proj.contiguous()
+        # conv1d[q|k|v] → 按段 tp 交错(与 in_proj 的 qkv 段对齐)
+        if mcore_weights_name.endswith("linear_attn.conv1d.weight"):
+            return _interleave_gdn_conv1d(hf_weights[0], self._get_text_config(), self.mpu.tp_size)
+
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
 
     def _weight_to_hf_format(
         self, mcore_weights_name: str, mcore_weights: torch.Tensor
     ) -> tuple[list[str], list[torch.Tensor]]:
+        # [Route B] fused in_proj(gather 后全局)→ 4 个 HF 分离张量(update_weights 给 rollout)
+        if mcore_weights_name.endswith("linear_attn.in_proj.weight"):
+            tc = self._get_text_config()
+            hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)  # [qkv, z, b, a] 顺序
+            qkvz, ba = _gdn_split_linear_weights(tc, mcore_weights, tp_size=self.mpu.tp_size)
+            qkv, z, b, a = _gdn_split_grouped_to_separate(tc, qkvz, ba)
+            return hf_names, [qkv.contiguous(), z.contiguous(), b.contiguous(), a.contiguous()]
+        # conv1d(gather 后全局)→ 去交错回 [q|k|v]
+        if mcore_weights_name.endswith("linear_attn.conv1d.weight"):
+            hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
+            conv = _deinterleave_gdn_conv1d(mcore_weights, self._get_text_config(), self.mpu.tp_size)
+            return hf_names, [conv]
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 
     def _build_config(self):

@@ -1,3 +1,5 @@
+import os
+
 import torch
 
 
@@ -43,4 +45,41 @@ def get_chunk_gated_delta_rule(backend: str):
         _validate_flashqla_runtime()
         return chunk_gated_delta_rule
 
+    if backend == "npu":
+        # Ascend NPU path: AscendC-hybrid GDN op shipped with MindSpeed
+        # (mindspeed.ops.chunk_gated_delta_rule). This is the proven slime-ascend
+        # training kernel; it has the same call signature as the fla op.
+        try:
+            from mindspeed.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
+        except ImportError as exc:
+            raise ImportError(
+                "Qwen GDN backend 'npu' requires mindspeed.ops.chunk_gated_delta_rule "
+                "(MindSpeed with GDN support + fla_npu AscendC kernels)."
+            ) from exc
+        return chunk_gated_delta_rule
+
     raise ValueError(f"Unsupported Qwen GDN backend: {backend}")
+
+
+def get_causal_conv1d(backend: str):
+    """Return the depthwise causal-conv1d fn for the given GDN backend, or None.
+
+    Only the Ascend NPU path replaces fla's ShortConvolution forward with an
+    external kernel (mindspeed.ops.causal_conv1d, the Triton conv ported from the
+    MindSpeed-MM Qwen3.6 SFT path). GPU backends keep using ShortConvolution and
+    return None here. Set QWEN36_CAUSAL_CONV1D_IMPL=eager to force the eager
+    F.silu(F.conv1d) fallback instead of the Triton kernel.
+    """
+    if backend != "npu":
+        return None
+    if os.environ.get("QWEN36_CAUSAL_CONV1D_IMPL", "triton") != "triton":
+        return None
+    try:
+        from mindspeed.ops.causal_conv1d import causal_conv1d
+    except ImportError as exc:
+        raise ImportError(
+            "Qwen GDN backend 'npu' requires mindspeed.ops.causal_conv1d "
+            "(MindSpeed with GDN support). Set QWEN36_CAUSAL_CONV1D_IMPL=eager to "
+            "fall back to the eager conv1d implementation."
+        ) from exc
+    return causal_conv1d

@@ -116,6 +116,12 @@ class HuggingfaceAttention(MegatronModule, ABC):
 
         if mpu.get_context_parallel_world_size() > 1:
             cp_size = mpu.get_context_parallel_world_size()
+        # [CP mode] ulysses(默认,真 CP)= 保持 CP-scattered,GDN._forward_cp 内部 a2a(Ulysses)处理,
+        #   hf_attention 不做 CP gather/scatter;gather_dup(旧基线)= 跨 CP all-gather + un-zigzag 全序列
+        #   冗余计算,保留作 A/B 对照(QWEN36_CP_MODE=gather_dup)。cp=1 两分支都不进 → 零影响。
+        cp_mode = os.environ.get("QWEN36_CP_MODE", "ulysses")
+
+        if mpu.get_context_parallel_world_size() > 1 and cp_mode == "gather_dup":
             # Use custom all-gather whose backward returns local gradient
             # instead of reduce-scatter, since the computation is duplicated.
             hidden_states_list = _AllGatherForDuplicatedComputation.apply(
@@ -149,7 +155,7 @@ class HuggingfaceAttention(MegatronModule, ABC):
 
         output = output.permute(1, 0, 2)  # [seq_len, bsz, hidden_dim]
 
-        if mpu.get_context_parallel_world_size() > 1:
+        if mpu.get_context_parallel_world_size() > 1 and cp_mode == "gather_dup":
             cp_rank = mpu.get_context_parallel_rank()
             output_list = []
             for i in range(len(cu_seqlens) - 1):
