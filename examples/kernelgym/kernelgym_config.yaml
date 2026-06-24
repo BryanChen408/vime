@@ -1,0 +1,57 @@
+# KernelGym custom-rollout config, loaded via --custom-config-path.
+# Every top-level key is set onto `args` (vime arguments.py merges them), so
+# `max_turns`, `rollout_interaction_env_path` and the `kernelgym` block are all
+# readable from the rollout/env code.
+
+# Shared by rollout.generate's loop and KernelGymEnv.
+max_turns: 4
+
+# Module exposing build_env(sample, args). Override to plug a different env.
+rollout_interaction_env_path: examples.kernelgym.env_kernelgym
+
+kernelgym:
+  # kernelGym evaluation service. Default port 10907 (kernelGym-NPU settings.py).
+  # Point this at the host running start_all_with_monitor.sh (e.g. npu2).
+  server_url: http://127.0.0.1:10907
+
+  # Stop the episode once a correct kernel is produced (saves eval cost).
+  stop_on_correct: true
+  # Trajectory reward = best | last turn reward.
+  reward_aggregation: best
+
+  # Forwarded into the kernelGym /evaluate payload.
+  num_correct_trials: 5
+  num_perf_trials: 100
+  enable_profiling: true
+  verbose_errors: true
+  detect_decoy_kernel: true
+  reference_backend: null      # how the reference runs: null | pytorch | compile
+  backend: triton              # default kernel backend; per-sample metadata wins
+  is_valid: false              # set true for validation rollouts (forces decoy check)
+
+  # Timeouts (seconds). Invariant: client_timeout >= server_timeout.
+  server_timeout: 600          # kernelGym per-task budget (payload.timeout)
+  client_timeout: 900          # client-side total wait for one evaluation
+  request_timeout: 120         # per single HTTP request
+  max_retries: 2
+  poll_interval: 1.0
+  feedback_max_chars: 4000     # truncate long error text fed back to the model
+
+  # Reward shaping. reward_func_name selects the strategy:
+  #   calculate_reward_weighted  -> w_c*correct + w_p*(speedup>1+eps) [+coverage]
+  #   calculate_reward_speedup   -> w_c*correct + w_p*clamp(speedup)  [+coverage]
+  #   calculate_reward_like_kernel -> ladder by speedup tier
+  reward:
+    reward_func_name: calculate_reward_weighted
+    init_correct_weight: 0.5
+    init_performance_weight: 0.5
+    speedup_eps: 0.01
+    speedup_reward_upper_bound: 3.0
+    speedup_reward_lower_bound: 0.0
+    penalty_score: 0.0           # failure/decoy reward (weighted & speedup)
+    compilation_fail_penalty: -0.5   # like_kernel only
+    correctness_fail_penalty: -0.3   # like_kernel only
+    perf_degrade_penalty: -0.1       # like_kernel only
+    coverage_enable: false
+    coverage_reward_type: time_coverage   # time_coverage | number_coverage
+    coverage_weight: 0.25
