@@ -49,7 +49,7 @@ MODEL_ARGS=(
    --moe-grouped-gemm
    --moe-token-drop-policy probs
    --moe-router-dtype fp32
-   --moe-permute-fusion
+   --no-moe-permute-fusion
    --moe-aux-loss-coeff 0
 
    # qwen3.5 specific

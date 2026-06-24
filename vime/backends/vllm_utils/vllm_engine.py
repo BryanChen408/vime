@@ -364,6 +364,9 @@ def build_vllm_subprocess_env(server_args: dict[str, Any]) -> dict[str, str]:
     # memory pool asserts against it (camem.py). Letting vllm-ascend's own
     # sleep-mode-aware logic (platform.py) re-add it only when sleep mode is off.
     env.pop("PYTORCH_NPU_ALLOC_CONF", None)
+    env.pop("TORCHDYNAMO_DISABLE", None)
+    # torch.compile; the vLLM subprocess MUST have torch.compile enabled for
+    # cudagraph capture.
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
     if is_npu():
         env["ASCEND_RT_VISIBLE_DEVICES"] = server_args["visible_devices"]

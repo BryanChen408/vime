@@ -59,6 +59,12 @@ class RayTrainGroup:
             **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
             **self.args.train_env_vars,
         }
+        # Forward diagnostic env vars that the training actor code checks directly
+        # via os.environ (e.g. VIME_SAVE_TIS_LOGPROBS for train-inference consistency
+        # logprob capture).  Ray actors do NOT inherit the parent environment.
+        for _ev in ("VIME_SAVE_TIS_LOGPROBS",):
+            if _ev in os.environ:
+                env_vars[_ev] = os.environ[_ev]
 
         if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver

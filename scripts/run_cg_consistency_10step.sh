@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
-# Qwen3.6-35B-A3B (GDN/MoE, Route B port) DAPO-math RL — single node, 16 Ascend NPUs.
+# Qwen3.6-35B-A3B DAPO-math RL — 10-step consistency validation with CUDAGraph
+#   - Measures throughput with cudagraph enabled
+#   - Saves per-token logprobs for train-inference consistency analysis
+#   - Logs to wandb
 #
-# Validation vehicle for the GDN port + converted checkpoint:
-#   - actor (policy/ref) = vime_plugins.models.qwen3_5 GDN model, loaded from the
-#     converted torch_dist via native mcore load_checkpoint (--megatron-to-hf-mode raw).
-#   - rollout = vllm Qwen3_5MoeForConditionalGeneration on the same HF safetensors.
-#   - data = dapo-math-17k, reward = deepscaler (local \boxed{} checker, NO sandbox).
-#   - DAPO = grpo advantage + decoupled clip (eps 0.2 / 0.28), kl 0.
-# Disaggregated like scripts/run-qwen3-30B-A3B-npu.sh: 8 actor + 8 rollout = 16 NPUs.
+# Key metrics automatically logged by vime:
+#   train_rollout_logprob_abs_diff — mean absolute diff between train & rollout logprobs
+#   train/log_prob, train/pg_loss, train/entropy_loss, train/grad_norm
+#
+# Post-hoc analysis (provided by separate consistency script):
+#   quantiles, scatter plots, Pearson/Spearman correlation, cosine similarity
 
+set -ex
+
+# ============ Cleanup ============
 pkill -9 -f "vllm serve" 2>/dev/null || true
 pkill -9 -f "VLLM::" 2>/dev/null || true
 pkill -9 -f "EngineCore" 2>/dev/null || true
 pkill -9 -f "from multiprocessing" 2>/dev/null || true
+pkill -9 -f "train.py" 2>/dev/null || true
 ray stop --force 2>/dev/null || true
 pkill -9 ray 2>/dev/null || true
 sleep 5
 
-set -ex
-
-# ============ NPU / megatron env (mirrors run-qwen3-30B-A3B-npu.sh) ============
+# ============ NPU / megatron env ============
 export SLIME_SCRIPT_TRAIN_BACKEND=megatron
 export PYTHONPATH="/root/Megatron-Bridge/src:/root/Megatron-LM/:/workspace/vime:$PYTHONPATH"
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
@@ -32,10 +36,15 @@ export MASTER_PORT=$(shuf -i 20000-65000 -n 1)
 export DISABLE_L2_CACHE=1
 export VLLM_ASCEND_ENABLE_NZ=0
 export QWEN36_CAUSAL_CONV1D_IMPL=triton
-# [proxy] All RL traffic is in-cluster (vllm engines, router, health checks, weight sync).
-# A leaked HTTP(S)_PROXY makes requests.get(node_ip:port/health) route through the proxy and
-# hang forever in VLLMEngine._wait_server_healthy. Clear every variant (upper+lower) and put
-# the node IP on no_proxy so nothing internal is proxied.
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_BUFFERSIZE=1024
+
+# Save per-token logprobs for consistency analysis (each rank saves its shard)
+TIS_DIR=/workspace/vime/runs/tis_logprobs_$(date +%Y%m%d_%H%M%S)
+mkdir -p "${TIS_DIR}"
+export VIME_SAVE_TIS_LOGPROBS="${TIS_DIR}"
+
+# proxy cleanup
 NODE_IP="$(hostname -I | awk '{print $1}')"
 unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 export no_proxy="127.0.0.1,localhost,${NODE_IP}"
@@ -49,9 +58,12 @@ PROMPT_DATA=/home/c00937190/dapo-math-17k.jsonl
 source "${VIME_DIR}/scripts/models/qwen3.5-35B-A3B.sh"   # -> MODEL_ARGS
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_ROOT="${VIME_DIR}/runs/dapo_math_${STAMP}"
+RUN_ROOT="${VIME_DIR}/runs/dapo_cg_consistency_${STAMP}"
 mkdir -p "${RUN_ROOT}"
 
+# ============ Launch ============
+# 40 prompts × 4 samples = 160 total, global_batch_size=16 → 10 training steps
+export TORCHDYNAMO_DISABLE=1
 python ${VIME_DIR}/train.py \
   --train-backend megatron \
   --actor-num-nodes 1 \
@@ -82,7 +94,7 @@ python ${VIME_DIR}/train.py \
   --vllm-max-model-len $((1024 * 12)) \
   --vllm-max-num-seqs 32 \
   \
-  --num-rollout 50 \
+  --num-rollout 40 \
   --rollout-batch-size 4 \
   --n-samples-per-prompt 4 \
   --rollout-max-response-len $((1024 * 2)) \
@@ -127,6 +139,17 @@ python ${VIME_DIR}/train.py \
   --no-gradient-accumulation-fusion \
   \
   --train-memory-margin-bytes 2147483648 \
+  \
+  --use-wandb \
+  --wandb-project vime-qwen36-dapo \
+  --wandb-group cg-consistency-check \
   2>&1 | tee "${RUN_ROOT}/run.log"
 
+RC=$?
+echo "TRAIN_EXIT_CODE=${RC}"
 echo "RUN_ROOT=${RUN_ROOT}"
+echo "TIS_DIR=${TIS_DIR}"
+
+# Save the TIS directory path for post-hoc analysis
+echo "${TIS_DIR}" > "${RUN_ROOT}/tis_dir.txt"
+echo "${RUN_ROOT}" > /tmp/last_consistency_run.txt

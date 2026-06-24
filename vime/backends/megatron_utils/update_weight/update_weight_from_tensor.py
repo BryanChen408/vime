@@ -35,9 +35,23 @@ from .update_weight_from_distributed import (
 )
 
 
+def _device_module() -> Any:
+    """Return ``torch.npu`` if NPU is available, else ``torch.cuda``.
+
+    This avoids importing ``mindspeed.megatron_adaptor`` in the vLLM
+    subprocess (it breaks ``torch.compile``'s ``aot_compile``).
+    """
+    try:
+        import torch_npu  # noqa: F401
+        return torch.npu
+    except ImportError:
+        return torch.cuda
+
+
 def _current_gpu_uuid() -> str:
-    device_index = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device_index)
+    dev = _device_module()
+    device_index = dev.current_device()
+    props = dev.get_device_properties(device_index)
     return str(props.uuid)
 
 
@@ -295,12 +309,12 @@ class UpdateWeightFromTensor:
             # then release CUDA IPC cache entries whose consumers (vLLM engines)
             # have already closed their IPC handles.
             del long_lived_tensors, hf_named_tensors
-            torch.cuda.ipc_collect()
+            _device_module().ipc_collect()
 
         dist.barrier(group=get_gloo_group())
         # After the barrier all engines have returned, so every rank's last-chunk
         # IPC handles are now released by the consumers.  Clean them up.
-        torch.cuda.ipc_collect()
+        _device_module().ipc_collect()
 
         # vLLM #39212: exit weight-update mode.
         if self._ipc_engine is not None and rank == self._ipc_gather_src:
@@ -485,8 +499,8 @@ class vLLMColocateWorkerExtension:
         shapes: list[list[int]] = inner["shapes"]
         ipc_handles: list[dict] = inner["ipc_handles"]
 
-        device_index = torch.cuda.current_device()
-        physical_gpu_id = str(torch.cuda.get_device_properties(device_index).uuid)
+        device_index = _device_module().current_device()
+        physical_gpu_id = str(_device_module().get_device_properties(device_index).uuid)
 
         # Reconstruct weights from per-tensor IPC handles (one handle per
         # parameter — the vLLM IPCWeightTransferEngine.trainer_send_weights

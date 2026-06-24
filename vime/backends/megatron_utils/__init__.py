@@ -2,8 +2,20 @@ import logging
 
 import torch
 from vime.utils.common import is_npu
-if is_npu():
-    import mindspeed.megatron_adaptor
+
+
+def _ensure_npu_adaptor():
+    """Lazy-import mindspeed.megatron_adaptor to patch torch for NPU.
+
+    This MUST be called before any megatron code that touches NPU (model
+    build, checkpoint load, etc.).  It is deliberately lazy (not at module
+    level) so that the **vLLM subprocess** — which only imports
+    ``update_weight_from_tensor`` for the colocate worker extension — does
+    NOT pull in mindspeed.  mindspeed breaks ``torch.compile``'s
+    ``aot_compile`` path, which would otherwise kill cudagraph capture.
+    """
+    if is_npu():
+        import mindspeed.megatron_adaptor  # noqa: F811
 
 try:
     import deep_ep

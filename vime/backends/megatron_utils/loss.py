@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -65,8 +66,11 @@ def get_responses(
     """
     qkv_format = args.qkv_format
 
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
+    # NPU: logits may be bfloat16 (mixed-precision).  Cast to float32 for the
+    # log-softmax below, which needs float32 range.
+    if logits.dtype != torch.float32:
+        logits = logits.float()
 
     if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
@@ -406,8 +410,11 @@ def get_log_probs_and_entropy(
     assert non_loss_data
     qkv_format = args.qkv_format
 
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
+    # NPU: logits may be bfloat16 (mixed-precision).  Cast to float32 for the
+    # log-softmax below, which needs float32 range.
+    if logits.dtype != torch.float32:
+        logits = logits.float()
 
     if qkv_format == "thd":
         assert logits.size(0) == 1, f"{logits.shape}"
@@ -993,6 +1000,16 @@ def policy_loss_function(
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+
+        # Save per-token logprobs for train-inference consistency analysis
+        _save_ci_logprobs = os.environ.get("VIME_SAVE_TIS_LOGPROBS", "")
+        if _save_ci_logprobs:
+            _save_path = os.path.join(_save_ci_logprobs, f"tis_logprobs_step{getattr(args, 'curr_iteration', 0)}_rank{dist.get_rank()}.pt")
+            torch.save({
+                "old_log_probs": old_log_probs.detach().cpu(),
+                "rollout_log_probs": rollout_log_probs.detach().cpu(),
+            }, _save_path)
+            logger.info(f"Saved TIS logprobs to {_save_path}")
 
     reported_loss = {
         "loss": loss.clone().detach(),
