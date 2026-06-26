@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Qwen3.6-35B-A3B (GDN/MoE, Route B port) DAPO-math RL — single node, 16 Ascend NPUs.
 #
+# Variant for reward curve: rollout-max-response-len 4096, wandb enabled,
+# num-rollout 80, global-batch-size 32.
+#
 # Validation vehicle for the GDN port + converted checkpoint:
 #   - actor (policy/ref) = vime_plugins.models.qwen3_5 GDN model, loaded from the
 #     converted torch_dist via native mcore load_checkpoint (--megatron-to-hf-mode raw).
@@ -32,7 +35,6 @@ export MASTER_PORT=$(shuf -i 20000-65000 -n 1)
 export DISABLE_L2_CACHE=1
 export VLLM_ASCEND_ENABLE_NZ=0
 export QWEN36_CAUSAL_CONV1D_IMPL=triton
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 # [proxy] All RL traffic is in-cluster (vllm engines, router, health checks, weight sync).
 # A leaked HTTP(S)_PROXY makes requests.get(node_ip:port/health) route through the proxy and
 # hang forever in VLLMEngine._wait_server_healthy. Clear every variant (upper+lower) and put
@@ -50,7 +52,7 @@ PROMPT_DATA=/home/c00937190/dapo-math-17k.jsonl
 source "${VIME_DIR}/scripts/models/qwen3.5-35B-A3B.sh"   # -> MODEL_ARGS
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_ROOT="${VIME_DIR}/runs/dapo_math_${STAMP}"
+RUN_ROOT="${VIME_DIR}/runs/dapo_reward_curve_${STAMP}"
 mkdir -p "${RUN_ROOT}"
 
 python ${VIME_DIR}/train.py \
@@ -58,6 +60,7 @@ python ${VIME_DIR}/train.py \
   --actor-num-nodes 1 \
   --actor-num-gpus-per-node 16 \
   --colocate \
+  --no-offload-train \
   --rollout-num-gpus 16 \
   --rollout-num-gpus-per-engine 8 \
   ${MODEL_ARGS[@]} \
@@ -77,18 +80,22 @@ python ${VIME_DIR}/train.py \
   --rollout-backend vllm \
   --vllm-weight-sync-mode native \
   --vllm-gpu-memory-utilization 0.30 \
-  --vllm-max-num-seqs 32 \
   --vllm-enable-sleep-mode \
   --vllm-compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
-  --vllm-max-model-len $((1024 * 18)) \
+  --vllm-max-model-len 12288 \
+  --vllm-max-num-seqs 32 \
   \
-  --num-rollout 50 \
+  --num-rollout 80 \
   --rollout-batch-size 4 \
   --n-samples-per-prompt 4 \
-  --rollout-max-response-len $((1024 * 16)) \
+  --rollout-max-response-len 4096 \
   --rollout-temperature 1.0 \
-  --global-batch-size 8 \
+  --global-batch-size 32 \
   --balance-data \
+  \
+  --use-wandb \
+  --wandb-project vime-qwen36-dapo \
+  --wandb-group dapo-reward-curve \
   \
   --advantage-estimator grpo \
   --kl-loss-coef 0.0 \
@@ -117,8 +124,7 @@ python ${VIME_DIR}/train.py \
   --recompute-method uniform \
   --recompute-num-layers 1 \
   --use-dynamic-batch-size \
-  --max-tokens-per-gpu 1024 \
-  --log-probs-chunk-size 1024 \
+  --max-tokens-per-gpu 4096 \
   \
   --attention-dropout 0.0 \
   --hidden-dropout 0.0 \
@@ -127,12 +133,7 @@ python ${VIME_DIR}/train.py \
   --use-flash-attn \
   --no-gradient-accumulation-fusion \
   \
-  --use-wandb \
-  --wandb-project vime-dapo-math \
-  --wandb-group qwen36-35b-a3b \
-  \
   --train-memory-margin-bytes 2147483648 \
-  --distributed-timeout-minutes 60 \
   2>&1 | tee "${RUN_ROOT}/run.log"
 
 echo "RUN_ROOT=${RUN_ROOT}"

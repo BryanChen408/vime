@@ -12,10 +12,13 @@ https://docs.vllm.ai/en/stable/examples/rl/rlhf_ipc/
 
 from __future__ import annotations
 
+import logging
 import os
 from argparse import Namespace
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import ray
 import torch
@@ -451,6 +454,97 @@ def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
             pass
 
 
+# Per-model cache of vLLM parameter attributes, keyed by ``id(model)``.
+# Captured once on first start_weight_update so that weight_loader and
+# friends can be re-applied after sleep level 2 (which discards param
+# objects via CaMem pool reset) or after layerwise reload unfuses params.
+_VLLM_PARAM_ATTRS_CACHE: dict[int, dict[str, dict[str, object]]] = {}
+
+
+def _capture_vllm_param_attrs(model) -> dict[str, dict[str, object]]:
+    """Iterate all named parameters of *model* and capture every non-standard
+    attribute (``weight_loader``, ``weight_loader_impl``, ``output_dim``,
+    ``input_dim``, etc.) into a nested dict ``{param_name: {attr: value}}``.
+
+    The result is cached in the module-level ``_VLLM_PARAM_ATTRS_CACHE`` keyed
+    by ``id(model)`` so subsequent calls are cheap.
+
+    Returns the captured dict (same as the cached value).
+    """
+    model_id = id(model)
+    if model_id in _VLLM_PARAM_ATTRS_CACHE:
+        return _VLLM_PARAM_ATTRS_CACHE[model_id]
+
+    _SKIP = frozenset(
+        {
+            "data", "dtype", "device", "grad", "grad_fn", "layout",
+            "name", "names", "ndim", "output_nr", "requires_grad",
+            "retains_grad", "shape", "size",
+        }
+    )
+    captured: dict[str, dict[str, object]] = {}
+    for name, param in model.named_parameters():
+        attrs: dict[str, object] = {}
+        for key in dir(param):
+            if key.startswith("_") or key in _SKIP:
+                continue
+            try:
+                val = getattr(param, key)
+            except (AttributeError, RuntimeError):
+                continue
+            # Skip non-weight_loader callables — they are bound methods that
+            # won't survive a param re-creation anyway.
+            if callable(val) and key not in ("weight_loader", "weight_loader_impl"):
+                continue
+            attrs[key] = val
+        if attrs:
+            captured[name] = attrs
+
+    _VLLM_PARAM_ATTRS_CACHE[model_id] = captured
+    return captured
+
+
+def _restore_vllm_param_attrs(model, captured: dict[str, dict[str, object]] | None = None) -> set[str]:
+    """Re-apply vLLM custom attributes to model parameters.
+
+    Uses the cached attribute map (see :func:`_capture_vllm_param_attrs`) so
+    that weight syncing works after sleep level 2 (which discards param
+    objects) or after layerwise reload unfuses parameters.
+
+    Already-present attributes are NOT overwritten (idempotent), so repeated
+    calls are safe.
+
+    Returns the set of parameter names that were re-patched.
+    """
+    if captured is None:
+        model_id = id(model)
+        if model_id not in _VLLM_PARAM_ATTRS_CACHE:
+            _capture_vllm_param_attrs(model)
+        captured = _VLLM_PARAM_ATTRS_CACHE[model_id]
+
+    patched: set[str] = set()
+    params_dict = dict(model.named_parameters())
+    for name, attrs in captured.items():
+        param = params_dict.get(name)
+        if param is None:
+            continue
+        needs_patch = False
+        for key in attrs:
+            if not hasattr(param, key):
+                needs_patch = True
+                break
+        if not needs_patch:
+            continue
+        for key, val in attrs.items():
+            if not hasattr(param, key):
+                try:
+                    setattr(param, key, val)
+                except (AttributeError, TypeError, RuntimeError):
+                    pass
+        patched.add(name)
+    return patched
+
+
 class vLLMColocateWorkerExtension:
     """vLLM ``--worker-extension-cls`` entry for colocated IPC weight sync."""
 
@@ -552,14 +646,34 @@ class vLLMColocateWorkerExtension:
                 "start_weight_update called while a weight update is already active. "
                 "Call finish_weight_update first."
             )
-        # Layerwise reload un-does vllm's post-load kernel-format fusion so params are
-        # loadable again (they otherwise lack a weight_loader after process_weights_after_loading).
-        # The earlier aclnnInplaceCopy failure here was because vllm was OFFLOADED (param.data on
-        # host); with --no-offload-rollout the params stay on NPU and the restore copy is d2d-valid.
+
+        model = self.model_runner.model
+
+        # ── Re-patch vLLM weight_loader attributes ──────────────────────────
+        # VERL-style re-patch: async IPC weight sync can happen long after
+        # init, and sleep level ≥ 2 discards param objects (CaMem pool reset)
+        # → weight_loader / weight_loader_impl / output_dim / etc. are lost.
+        # Capture once on first call, then re-apply any missing attributes on
+        # every subsequent call.  Idempotent — already-present attrs are
+        # NOT overwritten.
+        _capture_vllm_param_attrs(model)  # no-op after first call
+        patched = _restore_vllm_param_attrs(model)
+        if patched:
+            logger.debug(
+                "Re-patched weight_loader attrs on %d params: %s",
+                len(patched),
+                ", ".join(sorted(patched)[:10]),
+            )
+
+        # Layerwise reload un-does vllm's post-load kernel-format fusion so
+        # params are loadable again (they otherwise lack a weight_loader
+        # after process_weights_after_loading).  The earlier aclnnInplaceCopy
+        # failure here was because vllm was OFFLOADED (param.data on host);
+        # with --no-offload-rollout the params stay on NPU and the restore
+        # copy is d2d-valid.
         if is_checkpoint_format:
             from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
 
-            model = self.model_runner.model
             with torch.device(self.device):
                 initialize_layerwise_reload(model)
         self._is_checkpoint_format = is_checkpoint_format

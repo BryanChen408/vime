@@ -164,34 +164,38 @@ class _VocabParallelEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, vocab_parallel_logits: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
 
-        @torch.compile(dynamic=True)
-        def mul_reduce(a, b):
-            return (a * b).sum(dim=-1, keepdim=True)
-
         logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
         dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=process_group)
-        normalized_vocab_parallel_logits = vocab_parallel_logits - logits_max
-        normalized_exp_logits = normalized_vocab_parallel_logits.exp_()
-        normalized_sum_exp_logits = normalized_exp_logits.sum(dim=-1, keepdim=True)
-        dist.all_reduce(normalized_sum_exp_logits, group=process_group)
-        softmax_logits = normalized_exp_logits.div_(normalized_sum_exp_logits)
-        sum_softmax_times_logits = mul_reduce(softmax_logits, vocab_parallel_logits)
-        dist.all_reduce(sum_softmax_times_logits, group=process_group)
-        entropy = logits_max + normalized_sum_exp_logits.log() - sum_softmax_times_logits
-        ctx.save_for_backward(vocab_parallel_logits, softmax_logits, sum_softmax_times_logits)
+
+        # softmax_workspace: allocated once, reused for: normalized → exp → softmax → gradient.
+        softmax_workspace = vocab_parallel_logits - logits_max
+        softmax_workspace.exp_()
+        sum_exp = softmax_workspace.sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_exp, group=process_group)
+        softmax_workspace.div_(sum_exp)  # now holds softmax
+
+        # S = sum(softmax * raw_logits) over vocab dim.
+        S = (softmax_workspace * vocab_parallel_logits).sum(dim=-1, keepdim=True)
+        dist.all_reduce(S, group=process_group)
+
+        entropy = logits_max + sum_exp.log() - S
+
+        # Pre-compute the gradient ∂H/∂logits = softmax · (S - logits)
+        # so backward only has to multiply by grad_output.  This avoids saving
+        # both raw logits AND softmax — only the pre-computed gradient (1 tensor
+        # instead of 2) is saved, cutting saved memory per chunk in half.
+        vocab_parallel_logits.sub_(S)          # raw - S (in-place, safe: clone in caller)
+        softmax_workspace.mul_(vocab_parallel_logits)  # softmax · (raw - S)
+        vocab_parallel_logits.add_(S)          # recover raw logits
+        softmax_workspace.mul_(-1.0)           # softmax · (S - raw) = gradient
+
+        ctx.save_for_backward(softmax_workspace)
         return entropy.squeeze(dim=-1)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
-        vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
-        # reuse softmax_logits as grad
-        vocab_parallel_logits.sub_(sum_softmax_times_logits)
-        softmax_logits.mul_(vocab_parallel_logits)
-        softmax_logits.mul_(grad_output.unsqueeze(dim=-1))
-        # recover vocab_parallel_logits
-        vocab_parallel_logits.add_(sum_softmax_times_logits)
-        softmax_logits.mul_(-1)
-        return softmax_logits, None
+        grad_logits, = ctx.saved_tensors
+        return grad_logits * grad_output.unsqueeze(dim=-1), None
 
 
 def compute_entropy_from_logits(logits: torch.Tensor, process_group) -> torch.Tensor:
@@ -655,17 +659,21 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
             logits_chunks = logits.chunk(num_chunks, dim=0)
             tokens_chunks = tokens.chunk(num_chunks, dim=0)
 
-            if with_entropy:
-                entropys = []
-                for logits_chunk in logits_chunks:
-                    entropy_input = logits_chunk.clone()
-                    entropys.append(compute_entropy_from_logits(entropy_input, tp_group))
-                entropy = torch.cat(entropys, dim=0)
-
+            # Fused loop: process both entropy and log_probs per chunk to reduce
+            # peak memory by interleaving the two computations.
+            entropys = [] if with_entropy else None
             log_probs = []
             for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                if with_entropy:
+                    entropy_input = logits_chunk.clone()
+                    entropys.append(compute_entropy_from_logits(entropy_input, tp_group))
+                # clone is required here: logits_chunk is a view from torch.chunk,
+                # and fused_vocab_parallel_cross_entropy backward modifies it in-place,
+                # which is not allowed on chunk/split views.
                 log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
                 log_probs.append(log_prob)
+            if with_entropy:
+                entropy = torch.cat(entropys, dim=0)
             log_prob = torch.cat(log_probs, dim=0)
         else:
             if with_entropy:

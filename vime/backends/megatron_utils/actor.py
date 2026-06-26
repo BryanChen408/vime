@@ -13,7 +13,10 @@ if is_npu():
     import mindspeed.megatron_adaptor
     from mindspeed.megatron_adaptor import repatch
 from megatron.core import mpu
-from torch_memory_saver import torch_memory_saver
+if is_npu():
+    from vime.utils.npu_weight_offloader import NPUWeightOffloader
+else:
+    from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from vime.ray.train_actor import TrainRayActor
@@ -80,9 +83,13 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
-            if (x := args.train_memory_margin_bytes) > 0:
-                logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
-                torch_memory_saver.memory_margin_bytes = x
+            if is_npu():
+                self._weight_offloader = NPUWeightOffloader()
+                logger.info("NPU weight offloader initialised for rollout-stage actor offload")
+            else:
+                if (x := args.train_memory_margin_bytes) > 0:
+                    logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
+                    torch_memory_saver.memory_margin_bytes = x
 
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
@@ -187,7 +194,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
-        torch_memory_saver.pause()
+        if is_npu():
+            self._weight_offloader.offload(self.model)
+        else:
+            torch_memory_saver.pause()
 
         print_memory("after offload model")
 
@@ -196,7 +206,10 @@ class MegatronTrainRayActor(TrainRayActor):
         assert self.args.offload_train
         print_memory("before wake_up model")
 
-        torch_memory_saver.resume()
+        if is_npu():
+            self._weight_offloader.onload(self.model)
+        else:
+            torch_memory_saver.resume()
 
         clear_memory()
         reload_process_groups()
@@ -623,7 +636,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        with (torch_memory_saver.disable() if (self.args.offload_train and not is_npu()) else nullcontext()):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
