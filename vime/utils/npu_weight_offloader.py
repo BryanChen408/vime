@@ -237,56 +237,63 @@ def _zero_grads(model) -> None:
 
 
 def _release_ddp_buffers(model) -> None:
-    """Release Megatron DDP flat gradient/parameter buffers.
+    """Release Megatron DDP flat gradient/parameter buffers via storage().resize_(0).
 
-    Megatron's ``_ParamAndGradBuffer`` replaces param.data with views
-    into a flat ``param_data`` tensor (when ``use_distributed_optimizer``
-    is True) and always creates a ``grad_data`` flat tensor for gradient
-    all-reduce.  These flat tensors prevent individual param offload from
-    freeing NPU storage because the views share the flat buffer's storage.
+    Megatron's ``_ParamAndGradBuffer`` holds flat ``grad_data`` (fp32, always) and
+    ``param_data`` (bf16 in colocate), which are shared by multiple bucket views.
+    Previous implementation (clone + empty) failed because bucket views alias the
+    flat storage, preventing its physical release despite Python-level clones.
 
-    1. Copy each param out of the flat buffer into an independent tensor
-       (so it owns its storage).
-    2. Release the flat buffers.
+    Correct approach (verl-style):
+    - grad_data.storage().resize_(0) + empty_cache() → releases grad buffer physics
+      (grad content can be lost; backward will recompute).
+    - param_data: controlled by VIME_OFFLOAD_PARAM_BUFFER env var:
+      - 0 (default): keep param on NPU (for IPC export). Only release grad.
+      - 1: also release param + backup to CPU. Requires vLLM load_weights to copy.
     """
+    import os
+    offload_param = int(os.environ.get("VIME_OFFLOAD_PARAM_BUFFER", "0"))
+
     ddps = _get_ddp_wrappers(model)
+    released_size = 0
 
     for ddp in ddps:
-        # Find the _ParamAndGradBuffer on the DDP wrapper (not inner module).
-        grad_buf = None
-        param_buf = None
-        for attr in dir(ddp):
-            if attr.startswith("__"):
-                continue
-            try:
-                val = getattr(ddp, attr)
-            except (AttributeError, RuntimeError):
-                continue
-            if val is None:
-                continue
-            if hasattr(val, "grad_data") and isinstance(val.grad_data, torch.Tensor):
-                grad_buf = val
-            if hasattr(val, "param_data") and isinstance(val.param_data, torch.Tensor):
-                param_buf = val
+        # Megatron stores buffers in ddp.buffers (list) and ddp.expert_parallel_buffers (MoE).
+        buffers_to_release = []
+        if hasattr(ddp, "buffers"):
+            buffers_to_release.extend(ddp.buffers)
+        if hasattr(ddp, "expert_parallel_buffers"):
+            buffers_to_release.extend(ddp.expert_parallel_buffers)
 
-        # Step 1: clone params out of the flat buffer.
-        if param_buf is not None and param_buf.param_data is not None:
-            flat_storage = param_buf.param_data.untyped_storage()
-            for p in param_buf.params:
-                if p.data.untyped_storage() is flat_storage:
-                    p.data = p.data.clone()  # detach from flat buffer
-            del flat_storage
-            logger.debug("Cloned %d params out of flat param_data buffer", len(param_buf.params))
+        for buf in buffers_to_release:
+            if not hasattr(buf, "grad_data") or not hasattr(buf, "param_data"):
+                continue
 
-        if grad_buf is not None:
-            flat_storage = grad_buf.grad_data.untyped_storage()
-            for p in grad_buf.params:
-                if hasattr(p, "main_grad") and p.main_grad is not None:
-                    if p.main_grad.untyped_storage() is flat_storage:
-                        p.main_grad = None  # will be recreated on next backward
-            del flat_storage
+            # Release grad_data (always, grad is recomputed in backward).
+            if buf.grad_data is not None:
+                grad_storage = buf.grad_data.untyped_storage()
+                grad_size = grad_storage.size()
+                grad_storage.resize_(0)
+                released_size += grad_size
+                # Mark for backward recomputation (zero + overwrite with backward).
+                for p in buf.params:
+                    if hasattr(p, "main_grad"):
+                        p.main_grad = None
 
-        # Step 2: release flat buffers.
+            # Release param_data (optional, depends on VIME_OFFLOAD_PARAM_BUFFER).
+            if offload_param and buf.param_data is not None:
+                param_storage = buf.param_data.untyped_storage()
+                param_size = param_storage.size()
+                param_storage.resize_(0)
+                released_size += param_size
+
+    if released_size > 0:
+        torch.npu.empty_cache()
+        logger.info(
+            "Released DDP flat buffers: %.0f MiB (grad always, param %s)",
+            released_size / (1024 * 1024),
+            "yes" if offload_param else "no",
+        )
         if param_buf is not None and param_buf.param_data is not None:
             sz = param_buf.param_data.numel() * param_buf.param_data.element_size()
             param_buf.param_data = torch.empty(0, device="cpu")
