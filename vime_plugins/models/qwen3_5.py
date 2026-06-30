@@ -583,7 +583,9 @@ class Attention(HuggingfaceAttention):
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
-            cu_seqlens=packed_seq_params.cu_seqlens_q,
+            # GDN needs the padded leading-0 cu_seqlens; cu_seqlens_q is repointed to the
+            # MindSpeed ring convention (no leading 0) under CP>1, so prefer the stashed copy.
+            cu_seqlens=getattr(packed_seq_params, "cu_seqlens_gdn", packed_seq_params.cu_seqlens_q),
         )
         return hidden_states
 

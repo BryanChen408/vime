@@ -121,6 +121,37 @@ def get_batch(
             qkv_format="thd",
         )
 
+        # GDN linear-attn CP path (qwen3_5/hf_attention) needs the padded, leading-0 cu_seqlens
+        # exactly as built above; stash it under a private name so those consumers keep reading
+        # the TE-convention layout after we repoint cu_seqlens_q for the ring path below.
+        packed_seq_params.cu_seqlens_gdn = cu_seqlens
+
+        # [CP ring fix] vime drives Megatron core's GPTModel.forward, NOT MindSpeed's patched
+        # gpt_forward_wrapper, so under megatron_cp_algo two MindSpeed consumers of this
+        # packed_seq_params disagree on the cu_seqlens convention, and Megatron decouples them
+        # via the *_padded fields (see attention.py: rotary prefers cu_seqlens_q_padded):
+        #   - RoPE (_apply_rotary_pos_emb_thd) reads cu_seqlens_q_padded and does //cp_size, so
+        #     it wants the ORIGIN cumulative WITH leading 0 ([b+1], origin length).
+        #   - Ring attention (ring_context_parallel) reads cu_seqlens_q as-is (no //cp_size) and
+        #     a leading 0 yields a zero-length segment → npu_fusion_attention 161001; it wants
+        #     the CP-LOCAL cumulative with NO leading 0.
+        # It also needs q_index/kv_index (zigzag half-split indices), never set by Megatron core
+        # → "PackedSeqParams has no attribute kv_index". Compute all three for the ring here.
+        if cp_size > 1:
+            packed_seq_params.cu_seqlens_q_padded = cu_seqlens
+            packed_seq_params.cu_seqlens_kv_padded = cu_seqlens
+            ring_cu = (cu_seqlens // cp_size)[1:].contiguous()
+            packed_seq_params.cu_seqlens_q = ring_cu
+            packed_seq_params.cu_seqlens_kv = ring_cu
+            try:
+                from mindspeed.utils import compute_qkv_index
+
+                q_index, kv_index = compute_qkv_index(ring_cu.tolist())
+                packed_seq_params.q_index = q_index
+                packed_seq_params.kv_index = kv_index
+            except ImportError:
+                pass
+
         tokens = tokens.unsqueeze(0)
     else:
         raise ValueError(f"Unsupported qkv_format: {qkv_format}")

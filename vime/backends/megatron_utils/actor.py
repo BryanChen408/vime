@@ -68,6 +68,32 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if is_npu():
             repatch(args)
+            # [CP ring-group fix] init() above already called mpu.initialize_model_parallel,
+            # but the MindSpeed CP patches (ring DotProductAttention + the
+            # initialize_model_parallel wrapper that builds the ring-attention window groups)
+            # are only applied here, by repatch(args) — too late for that wrapper to run.
+            # Result: full_attention layers under CP>1 use the patched ring attention but the
+            # ring window process groups were never created, crashing with
+            # "Context parallel ranks for ring intra window not initialized".
+            # Finish what the wrapper would have done now that dist + the base CP group exist
+            # (each helper self-guards on context_parallel_algo / use_cp_send_recv_overlap, so
+            # this is a no-op for ulysses / non-overlap configs).
+            if args.context_parallel_size > 1:
+                from mindspeed.core.context_parallel.model_parallel_utils import (
+                    initialize_context_parallel_group_for_double_ring,
+                    initialize_context_parallel_group_for_hybrid_cp,
+                    initialize_context_parallel_group_for_send_recv_overlap,
+                )
+
+                _cp_grp_args = (
+                    args.tensor_model_parallel_size,
+                    args.pipeline_model_parallel_size,
+                    args.context_parallel_size,
+                    {},
+                )
+                initialize_context_parallel_group_for_send_recv_overlap(*_cp_grp_args)
+                initialize_context_parallel_group_for_hybrid_cp(*_cp_grp_args)
+                initialize_context_parallel_group_for_double_ring(*_cp_grp_args)
         if is_megatron_main_rank():
             init_tracking(args, primary=False, role=role)
 
@@ -84,6 +110,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if args.offload_train:
             if is_npu():
+                # [storage-resize] The default NPUWeightOffloader._release_ddp_buffers swaps
+                # param_data/grad_data to empty tensors, but Megatron's bucket views still alias
+                # the original storage, so the DDP flat buffers (grad_data fp32 + param_data bf16,
+                # ~13GB/rank for 9B/TP4) are NOT freed — leaving too little HBM for vLLM's KV
+                # cache on wake_up (OOM: aclrtMallocPhysical at camem_allocator). Patch
+                # offload/onload to verl-style storage().resize_(0) which frees the shared storage.
+                # Done here, NOT via the npu_mem_offload sitecustomize hook, because importing the
+                # hook at interpreter startup runs before torch is ready ("operator prims::sum does
+                # not exist"); by this point torch/torch_npu are fully initialised.
+                # B-mode (param+grad) via env VIME_OFFLOAD_PARAM_BUFFER=1.
+                try:
+                    import storage_resize_hook
+
+                    storage_resize_hook.patch_offloader(NPUWeightOffloader)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"storage-resize patch unavailable, using default offloader: {e}")
                 self._weight_offloader = NPUWeightOffloader()
                 logger.info("NPU weight offloader initialised for rollout-stage actor offload")
             else:

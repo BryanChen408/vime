@@ -102,7 +102,9 @@ class HuggingfaceAttention(MegatronModule, ABC):
         inference_params: BaseInferenceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert packed_seq_params is not None
-        cu_seqlens = packed_seq_params.cu_seqlens_q
+        # GDN needs the padded leading-0 cu_seqlens; under CP>1 cu_seqlens_q is repointed to the
+        # MindSpeed ring convention (no leading 0), so read the stashed GDN copy when present.
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_gdn", packed_seq_params.cu_seqlens_q)
 
         if self.args.sequence_parallel:
             # tensor_parallel_output_grad=False: the linear attention after this
