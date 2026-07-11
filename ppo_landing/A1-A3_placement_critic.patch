@@ -1,0 +1,35 @@
+--- /workspace/vime/vime/ray/placement_group.py	2026-07-11 05:01:55.720438813 +0000
++++ /home/docker/ppo_adapt_dev/placement_group.py.ppo	2026-07-11 17:55:53.538711917 +0000
+@@ -168,7 +168,9 @@
+ 
+     return {
+         "actor": (pg, actor_bundle_indices, actor_gpu_ids),
+-        "critic": None,
++        # [F-PPO-2 步骤2] critic 复用 actor bundle(共卡 offload 时分),与位置路径
++        # result["critic"]=result["actor"] 及官方 slime 的 actor/critic 共卡切换一致。
++        "critic": (pg, actor_bundle_indices, actor_gpu_ids) if args.use_critic else None,
+         "rollout": (pg, rollout_bundle_indices, rollout_gpu_ids),
+     }
+ 
+@@ -177,8 +179,8 @@
+     """Create placement groups for actor, critic, and rollout engines."""
+ 
+     if getattr(args, "resource_layout_spec", None) is not None:
+-        if args.use_critic:
+-            raise ValueError("--resource-layout does not support critic placement in the first implementation")
++        # [F-PPO-2 步骤2] critic 与 actor 共卡(见 _create_placement_groups_from_layout),
++        # 故 layout 路径支持 critic;原 "does not support critic" 限制取消。
+         return _create_placement_groups_from_layout(args)
+ 
+     num_gpus = 0
+@@ -272,6 +274,10 @@
+         )
+         if args.megatron_config_path is None:
+             critic_args.disable_param_buffers_cpu_backup = False
++            # [A3] actor 与 critic 都经 save_model→save()(读 get_args().save)、不分 role → 分开
++            # save 目录避免 ckpt 互撞(仅 deepcopy 路径;megatron_config_path 路径由 role=critic 配置自带 save)。
++            if getattr(critic_args, "save", None):
++                critic_args.save = critic_args.save.rstrip("/") + "_critic"
+ 
+         critic_model = allocate_train_group(
+             args=critic_args,

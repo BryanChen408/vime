@@ -1,0 +1,11 @@
+--- a/vime/ray/rollout.py	2026-07-11 17:57:55.414770372 +0000
++++ b/vime/ray/rollout.py	2026-07-11 17:57:55.506770417 +0000
+@@ -385,7 +385,7 @@
+ 
+         init_tracking(args, primary=False)
+         device_name = "NPU" if is_npu() else "GPU"
+-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0, resources={device_name:0}).remote()
++        self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0, resources={device_name:0}).remote()  # [F-PPO-2] mutex 无需 CPU;layout capture 下 num_cpus=1 会占 actor bundle CPU → dist-init 7/8
+         self.rollout_id = -1
+ 
+         self._health_monitors = []

@@ -1,0 +1,12 @@
+--- a/vime/backends/megatron_utils/chunked_lm_head_patch.py	2026-07-11 17:57:55.166770253 +0000
++++ b/vime/backends/megatron_utils/chunked_lm_head_patch.py	2026-07-11 17:57:55.258770297 +0000
+@@ -47,6 +47,9 @@
+             or not getattr(self, "post_process", False)
+             or labels is not None
+             or getattr(self, "mtp_process", False)  # MTP 路径不走(它在 postprocess 内算 loss)
++            # [PPO/critic] value head(hidden→1)别旁路(否则 critic get_values 收 hidden[T,h]≠values[T,1] 崩)。
++            or getattr(getattr(self, "output_layer", None), "weight", None) is None
++            or self.output_layer.weight.shape[0] == 1
+         ):
+             return _orig_forward(self, *args, **kwargs)
+ 
