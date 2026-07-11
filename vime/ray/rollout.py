@@ -384,7 +384,9 @@ class RolloutManager:
 
         init_tracking(args, primary=False)
         device_name = "NPU" if is_npu() else "GPU"
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0, resources={device_name:0}).remote()
+        self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0, resources={device_name:0}).remote()  # [F-PPO-2] num_cpus=0: 纯 mutex(ray/utils.py Lock)无需 CPU 预留。layout 路径 RolloutManager
+        # 开了 capture_child_tasks=True,会捕获此未钉 bundle 的 child;num_cpus=1 时它占掉某 actor
+        # bundle 的 CPU:1 → 该 actor 无法调度 → dist-init 7/8 rendezvous 超时。
         self.rollout_id = -1
 
         self._health_monitors = []
