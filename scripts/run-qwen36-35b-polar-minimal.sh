@@ -256,6 +256,9 @@ if [ "${#ADDCFG_PARTS[@]}" -gt 0 ]; then
    ADDCFG_JSON="{$(IFS=,; echo "${ADDCFG_PARTS[*]}")}"
    VLLM_ARGS+=(--vllm-additional-config "$ADDCFG_JSON")
 fi
+if [ "${FEAT_HCCL_AIV:-0}" = "1" ]; then
+   export HCCL_OP_EXPANSION_MODE=AIV               # batch5:CANN 层通信优化(HCCL 算子 offload→AIV 核),低风险 env
+fi
 # [可复现] ⚠️ 经查证 --vllm-enable-deterministic-inference 不适配 polar:其"每样本 seed"只在 vime
 #   原生 rollout(vllm_rollout.py:501/743)注入,polar 多轮 agent 自建请求(vime_bridge 只发任务
 #   payload)→ seed 够不到 polar;仅 VLLM_BATCH_INVARIANT=1(engine 级)生效。且 polar 轨迹含环境非
@@ -265,7 +268,7 @@ fi
 if [ "${REPRO_DETERMINISTIC:-0}" = "1" ]; then
    VLLM_ARGS+=(--vllm-enable-deterministic-inference)
 fi
-echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
+echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
 
 MISC_ARGS=(
    --attention-dropout 0.0
