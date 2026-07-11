@@ -1027,12 +1027,15 @@ class VLLMEngine(RayActor):
         return _response_json(response)
 
     def pause_generation(self):
-        """``POST /pause`` with mode="keep"; returns the ``requests.Response``."""
+        """``POST /pause`` with mode="abort": abort in-flight requests at weight sync so
+        they return finish_reason="abort" (consumer marks the session ERROR — slime
+        option-3, prevents mixed-weight trajectories reaching the trainer). See
+        docs/design/vime_abort_on_weight_sync.md. Returns the ``requests.Response``."""
         if self.node_rank != 0:
             return None
         response = requests.post(
             f"{self._http_base()}/pause",
-            params={"mode": "keep", "clear_cache": "false"},
+            params={"mode": "abort", "clear_cache": "false"},
             json={},
             timeout=120,
         )
