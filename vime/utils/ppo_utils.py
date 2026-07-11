@@ -687,3 +687,61 @@ def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool
             entropy = logits.new_zeros((0,))
 
     return log_prob, entropy
+
+
+def chunked_logprob_entropy_from_hidden(
+    hidden: torch.Tensor,
+    lm_head_weight: torch.Tensor,
+    tokens: torch.Tensor,
+    tp_group,
+    chunk_size: int = 1024,
+    with_entropy: bool = False,
+):
+    """[Phase B / dev_12] 分块 LM-head:不材料化完整 logits 即算 logprob/entropy。
+
+    训练路径(is_grad_enabled):每 chunk 用 torch.utils.checkpoint — backward 时 recompute
+    logit_chunk 而非缓存 softmax 张量,与 TP all_reduce 完全兼容(等价 MindSpeed-MM 的
+    torch.func.grad_and_value 方案,但后者不支持分布式 all_reduce)。
+    推理路径(no_grad,forward_only):plain loop,逐 chunk 释放 logit 峰值。
+    两路峰值均为 [chunk_size, vocab/tp] 而非 [T, vocab/tp]。
+    """
+    if hidden.size(0) == 0:
+        zeros = hidden.new_zeros((0,))
+        return zeros, (hidden.new_zeros((0,)) if with_entropy else None)
+
+    from torch.utils.checkpoint import checkpoint as ckpt
+
+    num_chunks = (hidden.size(0) - 1) // chunk_size + 1
+    hidden_chunks = hidden.chunk(num_chunks, dim=0)
+    tokens_chunks = tokens.chunk(num_chunks, dim=0)
+    log_probs, entropys = [], []
+    use_ckpt = torch.is_grad_enabled()
+
+    for h_chunk, t_chunk in zip(hidden_chunks, tokens_chunks, strict=True):
+        # 传 h_chunk 和 lm_head_weight 作显式参数(有 grad),t_chunk/tp_group 闭包捕获(无 grad)。
+        def _fwd(h, w, t=t_chunk):
+            # h.to(w.dtype):对齐 output_layer 的 matmul 精度(hidden 上游可能被 float 成
+            # fp32,w 是 bf16 权重)。cast 回 w.dtype 复现模型 bf16 matmul → 与 full-logits
+            # 路径逐位一致(P1);同时避免 fp32×bf16 dtype 报错。
+            logit = torch.matmul(h.to(w.dtype), w.t()).float()   # [chunk_s, vocab/tp]
+            # compute_log_probs/entropy 对 logits 做 in-place 操作 → 各传 clone
+            lp = compute_log_probs(logit.clone(), t, tp_group)
+            ent = compute_entropy_from_logits(logit.clone(), tp_group) if with_entropy else None
+            return (lp, ent) if with_entropy else lp
+
+        if use_ckpt:
+            # use_reentrant=False:checkpoint 保存 h_chunk/w 不存 softmax 张量,backward 时 recompute
+            result = ckpt(_fwd, h_chunk, lm_head_weight, use_reentrant=False)
+        else:
+            result = _fwd(h_chunk, lm_head_weight)
+
+        if with_entropy:
+            lp, ent = result
+            entropys.append(ent)
+        else:
+            lp = result
+        log_probs.append(lp)
+
+    log_prob = torch.cat(log_probs, dim=0)
+    entropy = torch.cat(entropys, dim=0) if with_entropy else None
+    return log_prob, entropy

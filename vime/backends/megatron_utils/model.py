@@ -215,6 +215,17 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
+    # [chunk LM-head] 开启时 patch GPTModel.forward(labels=None 返回 decoder hidden,下游
+    # loss 走 chunked logprob → logits 峰值 [chunk,V/tp] 脱离序列长 → 长序列不 OOM)。幂等。
+    # 对齐 slime(model.py:111-114):--chunked-lm-head arg 自动置 env,消除"必须手动传 env"的
+    # footgun(vime 原移植漏了此桥接,导致 arg 形同虚设、忘传 env 则静默走满 logits→OOM)。
+    if getattr(args, "chunked_lm_head", False):
+        os.environ["QWEN36_CHUNK_LMHEAD"] = "1"
+    if os.environ.get("QWEN36_CHUNK_LMHEAD", "0") == "1":
+        from vime.backends.megatron_utils.chunked_lm_head_patch import apply_chunked_lm_head_patch
+
+        apply_chunked_lm_head_patch()
+
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Optimizer
