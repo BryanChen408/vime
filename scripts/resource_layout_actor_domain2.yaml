@@ -1,0 +1,12 @@
+# [拓扑] actor 训练 8 卡全钉后八卡域 8-15(同一 HCCS 域,集合通信不跨 7/8 边界 → 免 EI0013 跨域 RoCE)。
+# rollout 4 卡钉 4-7(polar 独占 0-3)。单节点 80.48.5.88。
+# 机制:placement 探测 12 卡(升序 visible 4-15)→ select_role_bundles 按 device 号分角色;
+#   actor worker 走 train_actor.get_accelerator_ids 绑到 8-15;rollout 走 reordered_gpu_ids[base]=4 → 4-7。
+# 保持 ASCEND_RT_VISIBLE_DEVICES 升序(Ascend 硬约束),不 pop、无 polar 撞卡风险。
+roles:
+  actor:
+    - {node: 80.48.5.88, devices: "8-15"}
+  rollout:
+    - {node: 80.48.5.88, devices: "4-7"}
+rollout:
+  num_gpus_per_engine: 4
