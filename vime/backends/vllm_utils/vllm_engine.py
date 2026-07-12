@@ -483,14 +483,25 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
         if disagg_backend == "mooncake":
             # P=producer / D=consumer;kv_port = 每引擎 bootstrap 端口(mooncake 由它派生握手:
             #   side_channel_port = kv_port + dp_rank*tp*pp,mooncake_hybrid_connector.py:1091)。
+            #   端口经 get_port() 从 base 15000 顺分(rollout.py:958,值 <20000)→ **不落** ADXL RDMA
+            #   保留区 [20000,20000+npu*1000)(该保留区只坑官方教程硬编的 kv_port 20001/20002)。
             # 注入 --kv-transfer-config → _forward_vllm_cli_args 见 flag 已在 cmd 即跳过(:289/:295),
             #   故优先于用户 --vllm-kv-transfer-config,且能按 worker_type 分设 kv_role。
-            # TODO(1P1D 冒烟核实):是否需 kv_connector_extra_config.{prefill,decode}.tp_size
-            #   (官方 MooncakeConnectorV1 教程带;Hybrid scheduler 从 parallel_config 取 tp,疑不需)。
+            # ⚠️ kv_connector_extra_config.{prefill,decode}.tp_size 是连接器**硬需**(源码核实:
+            #   mooncake_hybrid_connector.py:1474 get_from_extra_config("prefill") + :1476
+            #   assert "tp_size" in prefill_parallel_config —— 从 extra_config 取、**不是** parallel_config;
+            #   缺则 init assert 崩)。--prefill-num-servers 路径两组同 per_engine → 对称 T_p=T_d;连接器
+            #   要求 P_tp>=D_tp 且 P_tp%D_tp==0(:1376),对称必然满足。dp_size=1(P/D 各自 DP 副本
+            #   是后续阶段 P2/P3;届时按每侧 DP 形状填)。非对称/DP-on-PD 需走 --vllm-config YAML 分组配。
+            _pd_tp = int(getattr(args, "rollout_num_gpus_per_engine", 0)) or 1
             _kv_cfg = {
                 "kv_connector": "MooncakeHybridConnector",
                 "kv_role": "kv_producer" if worker_type == "prefill" else "kv_consumer",
                 "kv_port": server_args["disaggregation_bootstrap_port"],
+                "kv_connector_extra_config": {
+                    "prefill": {"tp_size": _pd_tp, "dp_size": 1},
+                    "decode": {"tp_size": _pd_tp, "dp_size": 1},
+                },
             }
             cmd += ["--kv-transfer-config", json.dumps(_kv_cfg)]
         else:
