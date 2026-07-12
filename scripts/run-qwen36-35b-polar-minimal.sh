@@ -319,6 +319,13 @@ if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
       #   库分两处:/usr/local/lib(+lib64)与 CANN site-packages/mooncake;在 ray start 前 export → raylet
       #   继承 → 引擎子进程可 import mooncake(缺则 ModuleNotFoundError,PD 引擎秒崩)。
       export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:/usr/local/Ascend/cann-9.0.0/python/site-packages/mooncake:${LD_LIBRARY_PATH:-}"
+      # [HMA 硬前置,与 FEAT_KV_POOL 同款] 任何 --kv-transfer-config(W2 给 P/D 注入 MooncakeHybridConnector)
+      #   都触发 vllm 默认关 hybrid KV manager(config/vllm.py:1342);GDN+full-attn 有两种 KV spec、必须 HMA,
+      #   否则引擎 init 崩 "failed to convert the KV cache specs to one unified type"。MooncakeHybridConnector
+      #   是 SupportsHMA(mooncake_hybrid_connector.py:969)→ 加 flag 保 HMA、连接器共存(设计文档 §5/§8:PD 复用)。
+      if [[ ! " ${VLLM_ARGS[*]} " == *" --no-vllm-disable-hybrid-kv-cache-manager "* ]]; then
+         VLLM_ARGS+=(--no-vllm-disable-hybrid-kv-cache-manager)
+      fi
    fi
 fi
 echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} pd_disagg=${FEAT_PD_DISAGG:-0}(P=${PD_PREFILL_NUM_SERVERS:-1},be=${PD_BACKEND:-mooncake}) | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
