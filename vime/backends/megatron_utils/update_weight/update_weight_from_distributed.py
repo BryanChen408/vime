@@ -173,6 +173,11 @@ class UpdateWeightFromDistributed:
                     post_process_quantization=True,
                     rollout_engines=self.rollout_engines,
                 )
+            # version-span guard: still paused (before resume) -> tell the polar gateway the
+            # new weight version so post-resume turns are stamped v_{N+1} and continuations
+            # that would span this update are rejected.  Best-effort, never blocks resume.
+            from vime_bridge.version_span import push_policy_version_to_gateway
+            push_policy_version_to_gateway(self.args, self.weight_version)
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
