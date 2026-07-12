@@ -36,7 +36,14 @@ RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_qwen36_vime_polar}
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
 ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-8}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-4}
-ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
+# [PD 分离 #5] PD 要求 rollout 卡拆 ≥2 引擎(P/D 各 ≥1)。per-engine 默认:FEAT_PD_DISAGG=1 时压到 2
+# (4 卡 rollout→1P1D 两引擎、各 TP2);单引擎默认 4。P/D 的 TP 必须相等(MooncakeHybridConnector 约束),
+# 全引擎共用同一 per-engine 即满足。2P2D 见下方 PD 块注释(需扩 rollout 到 8 卡)。
+if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
+   ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}
+else
+   ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
+fi
 
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
 OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
@@ -292,7 +299,21 @@ fi
 if [ "${REPRO_DETERMINISTIC:-0}" = "1" ]; then
    VLLM_ARGS+=(--vllm-enable-deterministic-inference)
 fi
-echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
+# [PD 分离 #5] mooncake MooncakeHybridConnector(GDN-hybrid/Mamba 必需——Nixl 无 hybrid SSM-FA,RFC #36780
+#   closed not-planned)。FEAT_PD_DISAGG=1:prefill_num_servers×per_engine 卡做 prefill、余卡 decode
+#   (from_prefill_num_servers,vllm_config.py:183)→ has_pd_disaggregation → rollout manager 起我们的
+#   proxy(rollout.py:_start_mooncake_pd_proxy,W4)替 vllm-router,避 #3 return_token_ids 丢弃。
+#   链路:vime→proxy→P prefill(max_tokens=1)返 kv_transfer_params→注入 D→D 拉 P 的 KV+decode→透传。
+#   引擎侧注入 --kv-transfer-config MooncakeHybridConnector(P=producer/D=consumer,vllm_engine.py W2)。
+#   最小验证 1P1D=rollout 4 卡(per-engine=2,上方已自动);2P2D 需 ROLLOUT_NUM_GPUS=8 + 缩 actor 到 8 卡 +
+#   PD_PREFILL_NUM_SERVERS=2。验证阶梯:差分贪婪(temp=0,PD vs 单引擎逐字,验 Mamba-state P→D)→ token-faith TIS。
+#   默认 OFF=零回归(不传 --prefill-num-servers → 单引擎路径原样)。见 docs/design/pd_disaggregation_dev_plan.md。
+PD_ARGS=()
+if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
+   PD_ARGS+=(--prefill-num-servers "${PD_PREFILL_NUM_SERVERS:-1}")
+   PD_ARGS+=(--disaggregation-backend "${PD_BACKEND:-mooncake}")
+fi
+echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} pd_disagg=${FEAT_PD_DISAGG:-0}(P=${PD_PREFILL_NUM_SERVERS:-1},be=${PD_BACKEND:-mooncake}) | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -330,6 +351,7 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
          python3 train_async.py \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             ${TOPO_ARGS[@]} \
+            ${PD_ARGS[@]+"${PD_ARGS[@]}"} \
             ${MODEL_ARGS[@]} \
             ${ROLLOUT_ARGS[@]} \
             ${POLAR_ARGS[@]} \
