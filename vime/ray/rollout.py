@@ -39,6 +39,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# [PD-mooncake W4] 存活的 mooncake PD proxy 子进程句柄(随 run 生命周期,避免被 GC)。
+_MOONCAKE_PD_PROXY_PROCS: list = []
+
 
 @dataclasses.dataclass
 class ServerGroup:
@@ -997,6 +1000,69 @@ def _start_router(
     return router_ip, router_port, router_args.prometheus_port
 
 
+def _start_mooncake_pd_proxy(args, router_ip, router_port, prefill_urls, decode_urls):
+    """起 mooncake PD 负载均衡 proxy(docs/design/pd_disaggregation_dev_plan.md W4)。
+
+    ``--disaggregation-backend=mooncake`` 时替代 Rust vllm-router:后者转发丢
+    ``return_token_ids``(task #3),我们的 Python proxy 对 ``/inference/v1/generate``
+    原样透传。它编排 prefill→P / decode→D 并在 2P+2D 引擎间负载均衡。返回 Popen 句柄。
+    """
+    import os
+    import subprocess
+    import sys
+    from urllib.parse import urlparse
+
+    def _hp(u: str):
+        parsed = urlparse(u if "://" in u else f"http://{u}")
+        return parsed.hostname, str(parsed.port)
+
+    p_hosts, p_ports, d_hosts, d_ports = [], [], [], []
+    for u, _ in prefill_urls:
+        h, po = _hp(u)
+        p_hosts.append(h)
+        p_ports.append(po)
+    for u in decode_urls:
+        h, po = _hp(u)
+        d_hosts.append(h)
+        d_ports.append(po)
+
+    if not p_hosts or not d_hosts:
+        raise RuntimeError(f"mooncake PD proxy needs ≥1 prefill and ≥1 decode url (P={prefill_urls}, D={decode_urls})")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    proxy_path = os.path.join(repo_root, "scripts", "pd_mooncake_proxy_server.py")
+
+    cmd = [
+        sys.executable,
+        proxy_path,
+        "--host",
+        str(router_ip).strip("[]"),
+        "--port",
+        str(router_port),
+        "--prefiller-hosts",
+        *p_hosts,
+        "--prefiller-ports",
+        *p_ports,
+        "--decoder-hosts",
+        *d_hosts,
+        "--decoder-ports",
+        *d_ports,
+    ]
+    logger.info("Launching mooncake PD proxy: %s", " ".join(cmd))
+    proc = subprocess.Popen(cmd)
+    time.sleep(3)
+    if proc.poll() is not None:
+        raise RuntimeError(f"mooncake PD proxy exited immediately (code {proc.returncode}); check proxy stderr")
+    logger.info(
+        "Mooncake PD proxy up at %s:%s (prefill=%s, decode=%s)",
+        router_ip,
+        router_port,
+        list(zip(p_hosts, p_ports)),
+        list(zip(d_hosts, d_ports)),
+    )
+    return proc
+
+
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
@@ -1162,13 +1228,22 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                         url = ray.get(e.get_url.remote())
                         if url:
                             decode_urls.append(url)
-            _, _, prom_port = _start_router(
-                args,
-                has_pd_disaggregation=True,
-                bind=(router_ip, router_port),
-                prefill_urls=prefill_urls,
-                decode_urls=decode_urls,
-            )
+            # [PD 后端] mooncake 用我们的 Python proxy(避开 vllm-router 的 #3 return_token_ids
+            #   丢弃,对 /inference/v1/generate 原样透传);nixl 仍走 vllm-router 的 PD 模式
+            #   (retro-compat)。见 docs/design/pd_disaggregation_dev_plan.md W4。
+            if getattr(args, "disaggregation_backend", "nixl") == "mooncake":
+                _MOONCAKE_PD_PROXY_PROCS.append(
+                    _start_mooncake_pd_proxy(args, router_ip, router_port, prefill_urls, decode_urls)
+                )
+                prom_port = None
+            else:
+                _, _, prom_port = _start_router(
+                    args,
+                    has_pd_disaggregation=True,
+                    bind=(router_ip, router_port),
+                    prefill_urls=prefill_urls,
+                    decode_urls=decode_urls,
+                )
 
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,
