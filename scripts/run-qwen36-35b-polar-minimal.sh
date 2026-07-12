@@ -268,9 +268,13 @@ if [ "${FEAT_KV_POOL:-0}" = "1" ]; then
    #   AscendStoreConnector 是 SupportsHMA → --no-vllm-disable-hybrid-kv-cache-manager 保 HMA、共存。
    #   (flag 形式:vime 前缀成 --vllm-...,BooleanOptional 负向在 -- 后插 no- → --no-vllm-disable-...。)
    # 注:不用 OffloadingConnector——off-reference 弯路,且撞 vllm-ascend↔vllm 0.21.0 的 kv_offload 版本坑。
+   # ⚠️ 键按我们这版:**lookup_rpc_port**(pool_scheduler.py:671 只认它/mooncake_rpc_port;ref 的 kvpool_rpc_port 无效)。
+   #   还需(mooncake 建好后):mooncake_master 进程 + MOONCAKE_CONFIG_PATH(protocol:"ascend"/master_server_address/
+   #   global_segment_size/local_buffer_size)+ LD_LIBRARY_PATH→mooncake。硬件 A2(910B2C):HCCL_INTRA_ROCE_ENABLE=1,
+   #   不用 A3 的 ASCEND_ENABLE_USE_FABRIC_MEM/1GB 对齐。prefix-caching 保持开(两级命中)。
    export PYTHONHASHSEED=0                          # ref env:池化/mooncake 需确定性 hash
    VLLM_ARGS+=(--no-vllm-disable-hybrid-kv-cache-manager)
-   VLLM_ARGS+=(--vllm-kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"mooncake","kvpool_rpc_port":"0"}}')
+   VLLM_ARGS+=(--vllm-kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"mooncake","lookup_rpc_port":"0"}}')
 fi
 # [可复现] ⚠️ 经查证 --vllm-enable-deterministic-inference 不适配 polar:其"每样本 seed"只在 vime
 #   原生 rollout(vllm_rollout.py:501/743)注入,polar 多轮 agent 自建请求(vime_bridge 只发任务
