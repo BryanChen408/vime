@@ -67,6 +67,15 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--resource-layout",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a YAML file explicitly pinning actor/rollout roles to (node, devices). "
+                    "When set, actor/rollout GPU counts are derived from the layout; incompatible with --colocate."
+                ),
+            )
+            parser.add_argument(
                 "--colocate",
                 action="store_true",
                 default=False,
@@ -642,6 +651,31 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "and should be set to a larger value than `max_tokens_per_gpu` if you want better performance. "
                 ),
             )
+            # --- polar / session-pool rollout args (vime+polar bridge) ---
+            # Consumed only by vime_bridge.config.resolve_polar_slime_config;
+            # vime core never reads them. Mirrors slime-ascend arguments.py:672-692.
+            parser.add_argument("--polar-url", type=str, default=None)
+            parser.add_argument("--polar-rollout-url", type=str, default=None)
+            parser.add_argument("--polar-run-id", type=str, default=None)
+            parser.add_argument("--polar-reward-key", type=str, default=None)
+            parser.add_argument("--polar-task-id-template", type=str, default="polar-slime-{rollout_id}-{sample.group_index}")
+            parser.add_argument("--polar-instruction-template", type=str, default=None)
+            parser.add_argument("--operator-tasks-dir", type=str, default=None)
+            parser.add_argument("--polar-tasks-dir", type=str, default=None)
+            parser.add_argument("--rollout-max-async-level", type=int, default=None)
+            parser.add_argument("--polar-max-async-level", type=int, default=None)
+            parser.add_argument("--rollout-request-timeout", type=float, default=None)
+            parser.add_argument("--polar-request-timeout", type=float, default=None)
+            parser.add_argument("--rollout-scheduler-mode", type=str, default=None)
+            parser.add_argument("--polar-scheduler-mode", type=str, default=None)
+            parser.add_argument("--rollout-max-active-sessions", type=int, default=None)
+            parser.add_argument("--polar-max-active-sessions", type=int, default=None)
+            parser.add_argument("--rollout-release-on-postrun", action=argparse.BooleanOptionalAction, default=None)
+            parser.add_argument("--rollout-min-complete-accept-fraction", type=float, default=None)
+            parser.add_argument("--polar-min-complete-accept-fraction", type=float, default=None)
+            parser.add_argument("--rollout-session-pool-pause-policy", type=str, default=None)
+            parser.add_argument("--polar-session-pool-pause-policy", type=str, default=None)
+            parser.add_argument("--polar-allow-weight-update-overlap", action=argparse.BooleanOptionalAction, default=None)
             return parser
 
         def add_eval_arguments(parser):
@@ -1735,6 +1769,33 @@ def vime_validate_args(args):
         args.offload_train = True
         args.offload_rollout = True
     del args.offload
+
+    # [resource-layout] Explicit node/card placement (single source of truth for
+    # actor/rollout GPU counts). Runs before the position-based colocate/debug
+    # derivations below so layout-derived counts take precedence. Retro-compat:
+    # without --resource-layout, resource_layout_spec stays None and nothing changes.
+    args.resource_layout_spec = None
+    # [stability] argparse 对 --resource-layout 偶发丢弃(megatron _megatron_parse_args 的
+    # ignore_unknown_args=True 下,该 arg 有时未被 megatron parser 认得 → 静默变 None,不稳定)。
+    # 故同时读 RESOURCE_LAYOUT env 兜底(启动脚本已设),保证 layout 稳定生效、与 argparse 结果一致。
+    _layout_path = getattr(args, "resource_layout", None) or os.environ.get("RESOURCE_LAYOUT") or None
+    if _layout_path:
+        from vime.ray.resource_layout import load_resource_layout
+
+        args.resource_layout = _layout_path
+        if args.colocate:
+            raise ValueError("--resource-layout cannot be used with --colocate")
+        if args.debug_train_only:
+            raise ValueError("--resource-layout cannot be used with --debug-train-only")
+        if args.debug_rollout_only:
+            raise ValueError("--resource-layout cannot be used with --debug-rollout-only")
+        layout = load_resource_layout(_layout_path)
+        args.resource_layout_spec = layout
+        args.actor_num_nodes = layout.actor_num_nodes
+        args.actor_num_gpus_per_node = layout.actor_num_gpus_per_node
+        args.rollout_num_gpus = layout.rollout_num_gpus
+        if layout.rollout_num_gpus_per_engine:
+            args.rollout_num_gpus_per_engine = layout.rollout_num_gpus_per_engine
 
     if args.debug_rollout_only:
         if args.colocate and (not args.rollout_num_gpus):
