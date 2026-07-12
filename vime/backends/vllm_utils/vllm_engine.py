@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
@@ -474,8 +475,27 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
 
     worker_type = server_args.get("worker_type", "regular")
     if worker_type in ("prefill", "decode") and topology.node_rank == 0:
-        env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = host_for_subprocess
-        env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(server_args["disaggregation_bootstrap_port"])
+        # [PD 后端] W1+W2,见 docs/design/pd_disaggregation_dev_plan.md。
+        #   nixl(默认,retro-compat):side-channel 握手。
+        #   mooncake:MooncakeHybridConnector —— GDN-hybrid/Mamba 必需(Nixl 无 hybrid
+        #     SSM-FA 支持,vllm RFC #36780 closed not-planned)。
+        disagg_backend = getattr(args, "disaggregation_backend", "nixl")
+        if disagg_backend == "mooncake":
+            # P=producer / D=consumer;kv_port = 每引擎 bootstrap 端口(mooncake 由它派生握手:
+            #   side_channel_port = kv_port + dp_rank*tp*pp,mooncake_hybrid_connector.py:1091)。
+            # 注入 --kv-transfer-config → _forward_vllm_cli_args 见 flag 已在 cmd 即跳过(:289/:295),
+            #   故优先于用户 --vllm-kv-transfer-config,且能按 worker_type 分设 kv_role。
+            # TODO(1P1D 冒烟核实):是否需 kv_connector_extra_config.{prefill,decode}.tp_size
+            #   (官方 MooncakeConnectorV1 教程带;Hybrid scheduler 从 parallel_config 取 tp,疑不需)。
+            _kv_cfg = {
+                "kv_connector": "MooncakeHybridConnector",
+                "kv_role": "kv_producer" if worker_type == "prefill" else "kv_consumer",
+                "kv_port": server_args["disaggregation_bootstrap_port"],
+            }
+            cmd += ["--kv-transfer-config", json.dumps(_kv_cfg)]
+        else:
+            env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = host_for_subprocess
+            env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(server_args["disaggregation_bootstrap_port"])
 
     _tp = os.environ.get("VLLM_TOOL_CALL_PARSER")
     if _tp and "--tool-call-parser" not in cmd:

@@ -239,6 +239,18 @@ def add_vllm_arguments(parser):
             "Mutually exclusive with --prefill-num-servers and --rollout-external."
         ),
     )
+    parser.add_argument(
+        "--disaggregation-backend",
+        type=str,
+        default="nixl",
+        choices=["nixl", "mooncake"],
+        dest="disaggregation_backend",
+        help=(
+            "PD 分离的 KV-transfer 后端:'nixl'(默认,VLLM_NIXL_SIDE_CHANNEL 握手)或 "
+            "'mooncake'(MooncakeHybridConnector,GDN-hybrid/Mamba 必需——Nixl 无 hybrid "
+            "SSM-FA 支持,见 vllm RFC #36780)。见 docs/design/pd_disaggregation_dev_plan.md。"
+        ),
+    )
 
     return parser
 
