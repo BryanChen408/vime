@@ -134,7 +134,9 @@ def distributed_masked_whiten(
     global_sum, global_sum_sq, global_mask_sum = stats_tensor
 
     if global_mask_sum.item() == 0:
-        raise ValueError("The global mask sum across all participating GPUs is zero.")
+        # polar 契约(对齐 slime slime_polar_async.patch):整组 DP shard 全被 mask
+        # (所有轨迹 ERROR/dummy,polar 路径常见)时优雅退化为零 advantage,而不是 raise 崩训练步。
+        return torch.zeros_like(values, dtype=torch.float32)
 
     global_mean = global_sum / global_mask_sum
     global_mean_sq = global_sum_sq / global_mask_sum

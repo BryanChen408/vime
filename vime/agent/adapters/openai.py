@@ -55,6 +55,7 @@ class OpenAIAdapter(BaseAdapter):
         )
         self.app.router.add_post("/v1/chat/completions", _handle_chat_completions)
         self.app.router.add_post("/v1/responses", _handle_responses)
+        self.app.router.add_get("/health", _ok)
         self.app.router.add_get("/healthz", _ok)
         self.app.router.add_get("/v1/models", _ok)
 
@@ -397,25 +398,48 @@ async def _handle_chat_completions(request: web.Request) -> web.StreamResponse:
     turn, parsed, in_tok, out_tok = await _run_turn(request, body, messages)
     if body.get("stream"):
         return await _stream_chat_completion(request, body, parsed, turn.finish_reason, in_tok, out_tok)
-    return web.json_response(_chat_completion_response(body, parsed, turn.finish_reason, in_tok, out_tok))
+    return web.json_response(
+        _chat_completion_response(body, parsed, turn, turn.finish_reason, in_tok, out_tok, request.app[TOKENIZER_KEY])
+    )
 
 
 def _chat_completion_response(
     body: dict,
     parsed: ParsedModelOutput,
+    turn: TurnRecord,
     finish: str,
     in_tok: int,
     out_tok: int,
+    tokenizer,
 ) -> dict[str, Any]:
+    message = _chat_message(parsed)
+    if isinstance(message, dict):
+        if turn.output_ids:
+            message["token_ids"] = list(turn.output_ids)
+        if turn.prompt_ids:
+            message["input_token_ids"] = list(turn.prompt_ids)
+
     return {
         "id": f"chatcmpl_{secrets.token_hex(12)}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": body.get("model", "vime-actor"),
+        "prompt_token_ids": list(turn.prompt_ids),
         "choices": [
             {
                 "index": 0,
-                "message": _chat_message(parsed),
+                "message": message,
+                "token_ids": list(turn.output_ids),
+                "logprobs": {
+                    "content": [
+                        {
+                            "token": tokenizer.decode([token_id], skip_special_tokens=False),
+                            "token_id": token_id,
+                            "logprob": float(logprob),
+                        }
+                        for token_id, logprob in zip(turn.output_ids, turn.output_log_probs, strict=False)
+                    ]
+                },
                 "finish_reason": _finish_reason(parsed, finish),
             }
         ],
@@ -449,20 +473,36 @@ async def _stream_chat_completion(
             "object": "chat.completion.chunk",
             "created": created,
             "model": body.get("model", "vime-actor"),
+            "prompt_token_ids": list(turn.prompt_ids),
             "choices": [{"index": 0, "delta": choice_delta, "finish_reason": finish_reason}],
         }
         if usage is not None:
             chunk["usage"] = usage
         await out.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
 
-    await emit({"role": "assistant"})
+    await emit({"role": "assistant", "input_token_ids": list(turn.prompt_ids)})
     if parsed.reasoning:
         await emit({"reasoning_content": parsed.reasoning})
     if parsed.text:
-        await emit({"content": parsed.text})
+        await emit({"content": parsed.text, "token_ids": list(turn.output_ids)})
     for idx, call in enumerate(_openai_tool_calls(parsed.tool_uses)):
         await emit({"tool_calls": [{**call, "index": idx}]})
-    await emit({}, finish_reason=_finish_reason(parsed, finish), usage=_usage(in_tok, out_tok))
+    await emit(
+        {
+            "logprobs": {
+                "content": [
+                    {
+                        "token": request.app[TOKENIZER_KEY].decode([token_id], skip_special_tokens=False),
+                        "token_id": token_id,
+                        "logprob": float(logprob),
+                    }
+                    for token_id, logprob in zip(turn.output_ids, turn.output_log_probs, strict=False)
+                ]
+            }
+        },
+        finish_reason=_finish_reason(parsed, finish),
+        usage=_usage(in_tok, out_tok),
+    )
     await out.write(b"data: [DONE]\n\n")
     return out
 

@@ -196,3 +196,8 @@ _examples_synced/
 runs/
 
 torch_compile_debug
+# Claude Code / agent session transcripts (not source)
+*-rllm-envdev-*.txt
+*-local-command-caveat*.txt
+*this-session-is-being-continued*.txt
+output/
