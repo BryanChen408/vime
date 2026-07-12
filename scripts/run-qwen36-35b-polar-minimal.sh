@@ -273,6 +273,13 @@ if [ "${FEAT_KV_POOL:-0}" = "1" ]; then
    #   global_segment_size/local_buffer_size)+ LD_LIBRARY_PATH→mooncake。硬件 A2(910B2C):HCCL_INTRA_ROCE_ENABLE=1,
    #   不用 A3 的 ASCEND_ENABLE_USE_FABRIC_MEM/1GB 对齐。prefix-caching 保持开(两级命中)。
    export PYTHONHASHSEED=0                          # ref env:池化/mooncake 需确定性 hash
+   # mooncake 现编 v0.3.9(USE_ASCEND_DIRECT):库分两处 → /usr/local/lib(libmooncake_store/transfer_engine/ascend_transport)
+   #   + CANN site-packages/mooncake(store/engine.so);少 /usr/local/lib 则 import 报 libmooncake_store.so not found。
+   #   (A2 片内 RoCE:HCCL_INTRA_ROCE_ENABLE 已在脚本头 L72 设=1,此处不重复。)
+   export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/Ascend/cann-9.0.0/python/site-packages/mooncake:${LD_LIBRARY_PATH:-}"
+   # mooncake.json 与本脚本同目录(P2PHANDSHAKE/protocol=ascend/master 127.0.0.1:30400/13GB per rank/SSD off)。
+   #   ⚠️ 需先另起:mooncake_master --eviction_high_watermark_ratio 0.9 --eviction_ratio 0.15 --port 30400 --default_kv_lease_ttl 11000
+   export MOONCAKE_CONFIG_PATH="${MOONCAKE_CONFIG_PATH:-${SCRIPT_DIR}/mooncake.json}"
    VLLM_ARGS+=(--no-vllm-disable-hybrid-kv-cache-manager)
    VLLM_ARGS+=(--vllm-kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"mooncake","lookup_rpc_port":"0"}}')
 fi

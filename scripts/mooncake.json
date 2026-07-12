@@ -1,0 +1,9 @@
+{
+  "metadata_server": "P2PHANDSHAKE",
+  "protocol": "ascend",
+  "device_name": "",
+  "master_server_address": "127.0.0.1:30400",
+  "global_segment_size": "13GB",
+  "local_buffer_size": "1GB",
+  "enable_ssd_offload": false
+}
