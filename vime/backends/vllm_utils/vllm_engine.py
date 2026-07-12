@@ -487,15 +487,18 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
             #   保留区 [20000,20000+npu*1000)(该保留区只坑官方教程硬编的 kv_port 20001/20002)。
             # 注入 --kv-transfer-config → _forward_vllm_cli_args 见 flag 已在 cmd 即跳过(:289/:295),
             #   故优先于用户 --vllm-kv-transfer-config,且能按 worker_type 分设 kv_role。
-            # ⚠️ kv_connector_extra_config.{prefill,decode}.tp_size 是连接器**硬需**(源码核实:
-            #   mooncake_hybrid_connector.py:1474 get_from_extra_config("prefill") + :1476
-            #   assert "tp_size" in prefill_parallel_config —— 从 extra_config 取、**不是** parallel_config;
-            #   缺则 init assert 崩)。--prefill-num-servers 路径两组同 per_engine → 对称 T_p=T_d;连接器
-            #   要求 P_tp>=D_tp 且 P_tp%D_tp==0(:1376),对称必然满足。dp_size=1(P/D 各自 DP 副本
-            #   是后续阶段 P2/P3;届时按每侧 DP 形状填)。非对称/DP-on-PD 需走 --vllm-config YAML 分组配。
+            # ⚠️ kv_connector_extra_config.{prefill,decode}.tp_size 是连接器**硬需**(参考指南
+            #   pd_disaggregation_mooncake_single_node.md L173-217 canonical config;缺则 init 崩)。
+            #   --prefill-num-servers 路径两组同 per_engine → 对称 T_p=T_d;要求 P_tp>=D_tp 且
+            #   P_tp%D_tp==0,对称必然满足。dp_size=1(P/D 各自 DP 是后续 P2/P3)。
+            # 🔑 连接器 = MooncakeConnectorV1(canonical:参考指南 + load_balance_proxy_server_example.py
+            #   这套 P2P PD 流程)。它本身处理 GDN-hybrid 多 KV 组(mooncake_connector.py:665 is_mamba_group /
+            #   :699 "MambaSpec num block P==D")。上个 session 误用 MooncakeHybridConnector(把 KV池化
+            #   AscendStore 的 scheduler-gap 错安到 PD 连接器)→ 协议与示例 proxy 不匹配 → P prefill 504
+            #   死锁。换回参考连接器(设计文档 §4/§8 本就推荐 V1),对齐 [[follow-ref-before-diverging]]。
             _pd_tp = int(getattr(args, "rollout_num_gpus_per_engine", 0)) or 1
             _kv_cfg = {
-                "kv_connector": "MooncakeHybridConnector",
+                "kv_connector": "MooncakeConnectorV1",
                 "kv_role": "kv_producer" if worker_type == "prefill" else "kv_consumer",
                 "kv_port": server_args["disaggregation_bootstrap_port"],
                 "kv_connector_extra_config": {
