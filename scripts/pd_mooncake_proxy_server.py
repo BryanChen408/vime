@@ -1204,6 +1204,14 @@ async def healthcheck():
     return get_runtime().scheduler.healthcheck()
 
 
+@app.get("/health")
+async def health():
+    # vllm 标准就绪探针路径。外部客户端(polar sglang_router_url、vllm-router)按 vllm worker 语义
+    # 探 /health;本 proxy 是该端点的 drop-in,必须应答 200,否则被判端点 down → 不发生成请求 → rollout 饿死。
+    # (原 vllm-ascend example 只暴露 /healthcheck,单机直连时无碍;接 polar 必须补 /health。)
+    return Response(status_code=200)
+
+
 @app.post("/instances/add")
 async def handle_add_instances(request: Request):
     return await adjust_instances_impl("add", request)
