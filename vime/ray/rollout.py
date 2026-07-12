@@ -1,4 +1,5 @@
 import dataclasses
+import importlib
 import itertools
 import logging
 import multiprocessing
@@ -507,6 +508,35 @@ class RolloutManager:
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
         _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+
+    def _call_rollout_function_hook(self, hook_name: str, *hook_args, raise_on_error: bool = False):
+        """Call a same-named module-level hook on the configured rollout function's
+        module, if it exists (e.g. vime_bridge's prepare/update/finish_policy_update
+        for off-policy staleness tracking). No-op for rollout functions with no such hook."""
+        if not getattr(self.args, "rollout_function_path", None):
+            return
+        try:
+            module_name, _ = self.args.rollout_function_path.rsplit(".", 1)
+            module = importlib.import_module(module_name)
+            hook = getattr(module, hook_name, None)
+            if callable(hook):
+                hook(self.args, *hook_args)
+        except Exception:
+            if raise_on_error:
+                raise
+            logger.warning("Failed to call rollout function hook %s", hook_name, exc_info=True)
+
+    def prepare_policy_update(self, policy_version: int):
+        """Notify a custom rollout function before serving weights advance."""
+        self._call_rollout_function_hook("prepare_policy_update", policy_version, raise_on_error=True)
+
+    def update_policy_version(self, policy_version: int):
+        """Notify a custom rollout function that serving weights advanced."""
+        self._call_rollout_function_hook("update_policy_version", policy_version)
+
+    def finish_policy_update(self, policy_version: int):
+        """Notify a custom rollout function after serving weights advance."""
+        self._call_rollout_function_hook("finish_policy_update", policy_version)
 
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
@@ -1218,13 +1248,17 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     log_dict = extra_metrics or {}
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        # polar 契约(对齐 slime slime_polar_async.patch):某 eval key 轨迹全 ERROR/被过滤时
+        # rewards/truncated 可能为空,加空列表守卫,避免 ZeroDivisionError 在 eval 边界拖垮整轮训练。
+        if rewards:
+            log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
-            log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
-        if args.log_passrate:
+            if truncated:
+                log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
+        if args.log_passrate and rewards:
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,

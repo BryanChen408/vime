@@ -27,6 +27,10 @@ def train(args):
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
+    # Advance the rollout manager's policy version so custom rollout functions
+    # that track off-policy staleness (e.g. vime_bridge) see the initial weights.
+    # No-op for rollout functions without an update_policy_version hook.
+    ray.get(rollout_manager.update_policy_version.remote(args.start_rollout_id))
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
@@ -67,10 +71,30 @@ def train(args):
                 ray.get(rollout_manager.save.remote(rollout_id))
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
-            # sync generate before update weights to prevent update weight in the middle of generation
-            rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
-            rollout_data_next_future = None
-            actor_model.update_weights()
+            # Overlap mode (polar_allow_weight_update_overlap): generation keeps
+            # running during the weight update, so prepare_policy_update pauses the
+            # polar gateway and drains/aborts in-flight sessions — those come back
+            # with trajectory.status=ERROR and are excluded from training so the
+            # weight boundary can't pollute the trainset. Non-overlap (default):
+            # sync the pending generation first so no session spans the update.
+            allow_weight_update_overlap = bool(getattr(args, "polar_allow_weight_update_overlap", False))
+            next_policy_version = rollout_id + 1
+            if not allow_weight_update_overlap:
+                rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+                rollout_data_next_future = None
+            if allow_weight_update_overlap:
+                # runs in the rollout_manager actor, where the polar async worker lives
+                ray.get(rollout_manager.prepare_policy_update.remote(next_policy_version))
+            try:
+                actor_model.update_weights()
+                # Advance policy version so off-policy staleness tracking (vime_bridge)
+                # stays live; a frozen version drops every group as stale and hangs.
+                version_ref = rollout_manager.update_policy_version.remote(next_policy_version)
+                if not allow_weight_update_overlap:
+                    ray.get(version_ref)
+            finally:
+                if allow_weight_update_overlap:
+                    ray.get(rollout_manager.finish_policy_update.remote(next_policy_version))
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

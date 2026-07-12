@@ -1,4 +1,5 @@
 import gc
+import json
 import os
 import shutil
 
@@ -20,6 +21,7 @@ from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_
 from megatron.training.training import get_model
 
 import vime_plugins.mbridge  # noqa: F401
+import vime_plugins.mbridge.qwen3_5  # noqa: F401
 from mbridge import AutoBridge
 from vime.backends.megatron_utils.arguments import set_default_megatron_args
 from vime.backends.megatron_utils.initialize import init
@@ -52,12 +54,75 @@ def add_convertion_args(parser):
         parser.add_argument("--padded-vocab-size", type=int, default=None)
     except Exception:
         pass
+    parser.add_argument(
+        "--no-moe-permute-fusion",
+        action="store_true",
+        help="Accept vime model arg bundles that explicitly disable MoE permute fusion during conversion.",
+    )
     return parser
+
+
+def _get_text_config_dict(hf_checkpoint: str) -> dict:
+    config_path = os.path.join(hf_checkpoint, "config.json")
+    with open(config_path) as f:
+        config = json.load(f)
+    return config.get("text_config", config)
+
+
+def _validate_qwen36_gdn_args(args) -> None:
+    text_config = _get_text_config_dict(args.hf_checkpoint)
+    required_keys = {
+        "linear_conv_kernel_dim",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+    }
+    if not required_keys.issubset(text_config):
+        return
+
+    expected = {
+        "linear_conv_kernel_dim": text_config["linear_conv_kernel_dim"],
+        "linear_key_head_dim": text_config["linear_key_head_dim"],
+        "linear_value_head_dim": text_config["linear_value_head_dim"],
+        "linear_num_key_heads": text_config["linear_num_key_heads"],
+        "linear_num_value_heads": text_config["linear_num_value_heads"],
+        "mtp_num_layers": text_config.get("mtp_num_hidden_layers", 0),
+    }
+    actual = {
+        "linear_conv_kernel_dim": args.linear_conv_kernel_dim,
+        "linear_key_head_dim": args.linear_key_head_dim,
+        "linear_value_head_dim": args.linear_value_head_dim,
+        "linear_num_key_heads": args.linear_num_key_heads,
+        "linear_num_value_heads": args.linear_num_value_heads,
+        "mtp_num_layers": args.mtp_num_layers or 0,
+    }
+    mismatches = [
+        f"{name}: expected {expected[name]}, got {actual[name]}"
+        for name in expected
+        if actual[name] != expected[name]
+    ]
+    if mismatches:
+        raise ValueError(
+            "Qwen3.6 config mismatch between HF checkpoint and Megatron args:\n- "
+            + "\n- ".join(mismatches)
+        )
+
+    layer_types = text_config.get("layer_types")
+    interval = text_config.get("full_attention_interval")
+    if layer_types is None and interval != 4:
+        raise ValueError(
+            f"Expected full_attention_interval=4 when layer_types is absent, got {interval!r}"
+        )
 
 
 def get_args():
     args = parse_args(add_convertion_args)
     args = set_default_megatron_args(args)
+
+    text_config = _get_text_config_dict(args.hf_checkpoint)
+    if getattr(args, "mtp_num_layers", None) is None and text_config.get("mtp_num_hidden_layers") is not None:
+        args.mtp_num_layers = text_config["mtp_num_hidden_layers"]
 
     # set to pass megatron validate_args
     args.save_interval = 1
@@ -95,6 +160,7 @@ def get_args():
     )
 
     validate_args(args)
+    _validate_qwen36_gdn_args(args)
     return args
 
 

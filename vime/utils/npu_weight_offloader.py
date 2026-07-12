@@ -294,14 +294,6 @@ def _release_ddp_buffers(model) -> None:
             released_size / (1024 * 1024),
             "yes" if offload_param else "no",
         )
-        if param_buf is not None and param_buf.param_data is not None:
-            sz = param_buf.param_data.numel() * param_buf.param_data.element_size()
-            param_buf.param_data = torch.empty(0, device="cpu")
-            logger.debug("Released DDP param_data (%.0f MiB)", sz / (1024 * 1024))
-        if grad_buf is not None:
-            sz = grad_buf.grad_data.numel() * grad_buf.grad_data.element_size()
-            grad_buf.grad_data = torch.empty(0, device="cpu")
-            logger.debug("Released DDP grad_data (%.0f MiB)", sz / (1024 * 1024))
 
 
 def _get_ddp_wrappers(model):

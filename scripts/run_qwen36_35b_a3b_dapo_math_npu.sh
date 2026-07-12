@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.6-35B-A3B (GDN/MoE, Route B port) DAPO-math RL — single node, 16 Ascend NPUs.
+# Qwen3.6-35B-A3B (GDN/MoE, Route B port) DAPO-math RL — single node, first 8 Ascend NPUs.
 #
 # Validation vehicle for the GDN port + converted checkpoint:
 #   - actor (policy/ref) = vime_plugins.models.qwen3_5 GDN model, loaded from the
@@ -7,7 +7,7 @@
 #   - rollout = vllm Qwen3_5MoeForConditionalGeneration on the same HF safetensors.
 #   - data = dapo-math-17k, reward = deepscaler (local \boxed{} checker, NO sandbox).
 #   - DAPO = grpo advantage + decoupled clip (eps 0.2 / 0.28), kl 0.
-# Disaggregated like scripts/run-qwen3-30B-A3B-npu.sh: 8 actor + 8 rollout = 16 NPUs.
+# Colocate mode on physical NPUs 0-7: actor count is authoritative, rollout shares the same 8 visible NPUs.
 
 pkill -9 -f "vllm serve" 2>/dev/null || true
 pkill -9 -f "VLLM::" 2>/dev/null || true
@@ -22,7 +22,7 @@ set -ex
 # ============ NPU / megatron env (mirrors run-qwen3-30B-A3B-npu.sh) ============
 export SLIME_SCRIPT_TRAIN_BACKEND=megatron
 export PYTHONPATH="/root/Megatron-Bridge/src:/root/Megatron-LM/:/workspace/vime:$PYTHONPATH"
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
@@ -56,9 +56,9 @@ mkdir -p "${RUN_ROOT}"
 python ${VIME_DIR}/train.py \
   --train-backend megatron \
   --actor-num-nodes 1 \
-  --actor-num-gpus-per-node 16 \
+  --actor-num-gpus-per-node 8 \
   --colocate \
-  --rollout-num-gpus 16 \
+  --rollout-num-gpus 8 \
   --rollout-num-gpus-per-engine 8 \
   ${MODEL_ARGS[@]} \
   --qwen-gdn-backend npu \
@@ -107,7 +107,7 @@ python ${VIME_DIR}/train.py \
   --overlap-cpu-optimizer-d2h-h2d \
   --use-precision-aware-optimizer \
   \
-  --tensor-model-parallel-size 2 \
+  --tensor-model-parallel-size 1 \
   --sequence-parallel \
   --pipeline-model-parallel-size 1 \
   --context-parallel-size 1 \

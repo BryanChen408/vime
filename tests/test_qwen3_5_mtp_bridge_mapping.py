@@ -128,7 +128,7 @@ def load_raw_export_module():
 
 
 @pytest.mark.unit
-def test_mtp_moe_expert_mapping_uses_individual_hf_weights():
+def test_mtp_moe_expert_mapping_uses_fused_hf_weights():
     module = load_bridge_module()
     bridge = module.Qwen3_5Bridge.__new__(module.Qwen3_5Bridge)
 
@@ -136,10 +136,9 @@ def test_mtp_moe_expert_mapping_uses_individual_hf_weights():
     fc2_names = bridge._convert_mtp_param("mtp.layers.0.transformer_layer.mlp.experts.linear_fc2.weight42")
 
     assert fc1_names == [
-        "mtp.layers.0.mlp.experts.42.gate_proj.weight",
-        "mtp.layers.0.mlp.experts.42.up_proj.weight",
+        "mtp.layers.0.mlp.experts.gate_up_proj",
     ]
-    assert fc2_names == ["mtp.layers.0.mlp.experts.42.down_proj.weight"]
+    assert fc2_names == ["mtp.layers.0.mlp.experts.down_proj"]
 
 
 @pytest.mark.unit

@@ -477,6 +477,12 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
         env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = host_for_subprocess
         env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(server_args["disaggregation_bootstrap_port"])
 
+    _tp = os.environ.get("VLLM_TOOL_CALL_PARSER")
+    if _tp and "--tool-call-parser" not in cmd:
+        cmd += ["--enable-auto-tool-choice", "--tool-call-parser", _tp]
+    _rp = os.environ.get("VLLM_REASONING_PARSER")
+    if _rp and "--reasoning-parser" not in cmd:
+        cmd += ["--reasoning-parser", _rp]
     _forward_vllm_cli_args(args, cmd)
     logger.info("Launching vLLM server: %s", redact_cmd_for_log(cmd))
     return cmd, env

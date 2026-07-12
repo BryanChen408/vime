@@ -38,6 +38,13 @@ MODEL_ARGS=(
 
    --rotary-base 10000000
 
+   # qwen3.6 GDN / linear attention
+   --linear-key-head-dim 128
+   --linear-value-head-dim 128
+   --linear-num-key-heads 16
+   --linear-num-value-heads 32
+   --linear-conv-kernel-dim 4
+
    # moe
    --moe-ffn-hidden-size 512
    --moe-shared-expert-intermediate-size 512
