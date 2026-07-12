@@ -312,6 +312,14 @@ PD_ARGS=()
 if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
    PD_ARGS+=(--prefill-num-servers "${PD_PREFILL_NUM_SERVERS:-1}")
    PD_ARGS+=(--disaggregation-backend "${PD_BACKEND:-mooncake}")
+   if [ "${PD_BACKEND:-mooncake}" = "mooncake" ]; then
+      # mooncake PD(P2P KV 直传)只需 mooncake 库在 LD_LIBRARY_PATH(vllm-ascend 参考指南
+      #   pd_disaggregation_mooncake_single_node.md §138/141)——**不需** mooncake_master、也**不需**
+      #   MOONCAKE_CONFIG_PATH(那是 KV 池化 AscendStore 的中心池才要;PD 连接器只设 ASCEND_TRANSFER_TIMEOUT)。
+      #   库分两处:/usr/local/lib(+lib64)与 CANN site-packages/mooncake;在 ray start 前 export → raylet
+      #   继承 → 引擎子进程可 import mooncake(缺则 ModuleNotFoundError,PD 引擎秒崩)。
+      export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:/usr/local/Ascend/cann-9.0.0/python/site-packages/mooncake:${LD_LIBRARY_PATH:-}"
+   fi
 fi
 echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} pd_disagg=${FEAT_PD_DISAGG:-0}(P=${PD_PREFILL_NUM_SERVERS:-1},be=${PD_BACKEND:-mooncake}) | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
 

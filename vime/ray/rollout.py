@@ -1139,7 +1139,10 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         use_static_pd_router = has_pd
         if use_static_pd_router:
             router_ip = _wrap_ipv6(get_host_info()[1])
-            router_port = find_available_port(random.randint(3000, 4000))
+            # PD 的 router/proxy 必须绑**确定端口**,外部客户端(polar sglang_router_url)才能定向;
+            # 用 vllm_router_port(脚本 --vllm-router-port,默认 8001),回退随机口仅当未配。
+            # 单引擎旁路 worker :15000 拿 return_token_ids;PD 多引擎经我们的 proxy(原样透传)→ 切 :8001。
+            router_port = getattr(args, "vllm_router_port", None) or find_available_port(random.randint(3000, 4000))
             prom_port = None  # assigned when the router actually launches, after URL collection
             engine_router_ip, engine_router_port = None, None
         else:
