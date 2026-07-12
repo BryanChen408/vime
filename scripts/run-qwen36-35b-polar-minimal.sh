@@ -259,6 +259,19 @@ fi
 if [ "${FEAT_HCCL_AIV:-0}" = "1" ]; then
    export HCCL_OP_EXPANSION_MODE=AIV               # batch5:CANN 层通信优化(HCCL 算子 offload→AIV 核),低风险 env
 fi
+if [ "${FEAT_KV_POOL:-0}" = "1" ]; then
+   # KV 池化(对齐 ref.md §2.8 / ref2:AscendStoreConnector + mooncake;片上+DRAM 统一池、前缀跨节点可见)。
+   # 🚫 前置:mooncake 库(现编 v0.3.9)+ mooncake_master 进程 + MOONCAKE_CONFIG_PATH 指向 mooncake.json
+   #   (ref.md §3.2:global_segment_size 13GB/卡);未装 mooncake → 引擎 init ImportError。
+   # ⚠️ GDN-hybrid 硬需 HMA:kv-transfer 默认强关 hybrid KV manager(vllm config/vllm.py:1342),
+   #   但 GDN+full-attn 有两种 KV spec、必须 HMA(否则 "failed to convert KV cache specs" 崩)。
+   #   AscendStoreConnector 是 SupportsHMA → --no-vllm-disable-hybrid-kv-cache-manager 保 HMA、共存。
+   #   (flag 形式:vime 前缀成 --vllm-...,BooleanOptional 负向在 -- 后插 no- → --no-vllm-disable-...。)
+   # 注:不用 OffloadingConnector——off-reference 弯路,且撞 vllm-ascend↔vllm 0.21.0 的 kv_offload 版本坑。
+   export PYTHONHASHSEED=0                          # ref env:池化/mooncake 需确定性 hash
+   VLLM_ARGS+=(--no-vllm-disable-hybrid-kv-cache-manager)
+   VLLM_ARGS+=(--vllm-kv-transfer-config '{"kv_connector":"AscendStoreConnector","kv_role":"kv_both","kv_connector_extra_config":{"backend":"mooncake","kvpool_rpc_port":"0"}}')
+fi
 # [可复现] ⚠️ 经查证 --vllm-enable-deterministic-inference 不适配 polar:其"每样本 seed"只在 vime
 #   原生 rollout(vllm_rollout.py:501/743)注入,polar 多轮 agent 自建请求(vime_bridge 只发任务
 #   payload)→ seed 够不到 polar;仅 VLLM_BATCH_INVARIANT=1(engine 级)生效。且 polar 轨迹含环境非
@@ -268,7 +281,7 @@ fi
 if [ "${REPRO_DETERMINISTIC:-0}" = "1" ]; then
    VLLM_ARGS+=(--vllm-enable-deterministic-inference)
 fi
-echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
+echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
 
 MISC_ARGS=(
    --attention-dropout 0.0
