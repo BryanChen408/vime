@@ -385,7 +385,11 @@ class RolloutManager:
 
         init_tracking(args, primary=False)
         device_name = "NPU" if is_npu() else "GPU"
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0, resources={device_name:0}).remote()
+        # [resource-layout] num_cpus=0:Lock 是纯 mutex(ray/utils.py),无需预留 CPU。resource_layout 路径下
+        # RolloutManager 以 capture_child_tasks=True 建 child,会捕获这个未钉 bundle 的 Lock;num_cpus=1 时它
+        # 吃掉某 actor bundle 的 CPU:1 → 那个 actor 调度不出来 → dist-init 只起 7/8、TCPStore rendezvous 挂。
+        # 非 layout 路径无影响(mutex 行为不变、只是不再占 CPU 槽)。根因见 docs/design/vime_resource_layout_and_dp.md。
+        self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0, resources={device_name:0}).remote()
         self.rollout_id = -1
 
         self._health_monitors = []
