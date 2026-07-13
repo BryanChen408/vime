@@ -333,6 +333,11 @@ if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
       if [ "${PD_DEBUG:-0}" = "1" ]; then
          export VLLM_LOGGING_LEVEL=DEBUG
          export MC_TE_METRIC=1
+         # mooncake C++(glog)运行时传输日志:提级 GLOG_v + 输出 stderr(被 ray 捕获进 train log),
+         #   看 D 的 transferSync 到底 hang 在 openSegment 握手还是 RDMA 读(默认只打 INFO 级 init 日志,
+         #   运行时 transfer 在 VLOG 级不显)。定位后连 PD_DEBUG gate 一起删。
+         export GLOG_v=2
+         export GLOG_logtostderr=1
       fi
    fi
 fi

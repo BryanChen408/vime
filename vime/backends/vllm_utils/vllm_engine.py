@@ -518,8 +518,32 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     if _rp and "--reasoning-parser" not in cmd:
         cmd += ["--reasoning-parser", _rp]
     _forward_vllm_cli_args(args, cmd)
+    _apply_pd_role_overrides(cmd, server_args.get("worker_type", "regular"))
     logger.info("Launching vLLM server: %s", redact_cmd_for_log(cmd))
     return cmd, env
+
+
+def _apply_pd_role_overrides(cmd: list[str], worker_type: str) -> None:
+    """[PD 架构] vLLM PD 分离本意=prefill/decode 各起一套**独立参数**(参考指南是两个 vllm serve、
+    不同 flag)。vime 对所有 rollout 引擎灌同一套 VLLM_ARGS,PD 时须按 worker_type 覆盖角色专属项。
+
+    - **PD 两侧(P 和 D)都关 prefix-cache**:vllm-ascend 已知 bug #7944(D 节点 PD + prefix-cache),
+      且 P/D 的 prefix-cache 命中必须一致(P 有命中 → D 要走 #7944 那条 buggy 对账路径 → kv_recv_thread
+      transferSync 死等,实测 done_recving 恒 0、无错无超时、e2e hang)。P 也关 → P 无命中 → D 干净地拉
+      全部块,绕开 #7944。参考指南 pd_disaggregation_mooncake_single_node.md 的 **Prefiller(L164)和
+      Decoder(L205)都是** `--no-enable-prefix-caching`。上游修 #7944 后可放开(连接器 :624 已有 full-hit
+      skip 逻辑)。⚠️ 这是不得已关一个已验特性,因触及不可解决的上游 bug——非叠加期常规操作。
+    """
+    if worker_type not in ("prefill", "decode"):
+        return
+    if "--enable-prefix-caching" in cmd:
+        cmd.remove("--enable-prefix-caching")
+        if "--no-enable-prefix-caching" not in cmd:
+            cmd.append("--no-enable-prefix-caching")
+        logger.info(
+            "[PD role] %s 引擎覆盖:关闭 prefix-cache(--no-enable-prefix-caching,PD 已知 bug #7944)",
+            worker_type,
+        )
 
 
 def _exec_vllm_cmd(cmd: list[str], env: dict[str, str]) -> None:
