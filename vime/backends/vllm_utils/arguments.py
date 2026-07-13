@@ -251,6 +251,18 @@ def add_vllm_arguments(parser):
             "SSM-FA 支持,见 vllm RFC #36780)。见 docs/design/pd_disaggregation_dev_plan.md。"
         ),
     )
+    parser.add_argument(
+        "--rollout-dp-proxy",
+        action="store_true",
+        default=False,
+        dest="rollout_dp_proxy",
+        help=(
+            "分布式 DP:起 N 个常规 rollout 引擎(每引擎 TP=num_gpus_per_engine),用 "
+            "scripts/dp_load_balance_proxy_server.py 按 active_tokens 最小负载外部分发,替代 "
+            "Rust vllm-router(原样透传 /inference/v1/generate,避 #3 return_token_ids 丢弃)。"
+            "与 PD 分离(--prefill-num-servers)互斥。见 docs/design/vime_dp_pd_kv_impl_design.md §3/§9 P0。"
+        ),
+    )
 
     return parser
 
@@ -274,6 +286,10 @@ def validate_args(args):
     assert not (
         getattr(args, "vllm_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None
     ), "vllm_config and prefill_num_servers are mutually exclusive. Use server_groups in the YAML config instead."
+
+    assert not (
+        getattr(args, "rollout_dp_proxy", False) and getattr(args, "prefill_num_servers", None) is not None
+    ), "--rollout-dp-proxy (DP external-LB) and --prefill-num-servers (PD disaggregation) are mutually exclusive."
 
 
 def _sanitize_non_primitive_defaults(args, user_provided: set[str]) -> None:

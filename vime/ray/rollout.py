@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 # [PD-mooncake W4] 存活的 mooncake PD proxy 子进程句柄(随 run 生命周期,避免被 GC)。
 _MOONCAKE_PD_PROXY_PROCS: list = []
 
+# [DP P0] 存活的 DP 外部负载均衡 proxy 子进程句柄(同上,避免被 GC)。
+_DP_PROXY_PROCS: list = []
+
 
 @dataclasses.dataclass
 class ServerGroup:
@@ -1093,6 +1096,61 @@ def _start_mooncake_pd_proxy(args, router_ip, router_port, prefill_urls, decode_
     return proc
 
 
+def _start_dp_proxy(args, router_ip, router_port, dp_urls):
+    """起 DP 外部负载均衡 proxy(docs/design/vime_dp_pd_kv_impl_design.md §3/§9 P0)。
+
+    ``--rollout-dp-proxy`` 时替代 Rust vllm-router:后者转发丢 ``return_token_ids``
+    (task #3),我们的 Python proxy(scripts/dp_load_balance_proxy_server.py)对
+    ``/inference/v1/generate`` 原样透传(StreamingResponse),并按 active_tokens 最小负载
+    在 N 个常规引擎间分发。返回 Popen 句柄。
+    """
+    import os
+    import subprocess
+    import sys
+    from urllib.parse import urlparse
+
+    def _hp(u: str):
+        parsed = urlparse(u if "://" in u else f"http://{u}")
+        return parsed.hostname, str(parsed.port)
+
+    hosts, ports = [], []
+    for u in dp_urls:
+        h, po = _hp(u)
+        hosts.append(h)
+        ports.append(po)
+
+    if not hosts:
+        raise RuntimeError(f"DP proxy needs ≥1 engine url (got {dp_urls})")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    proxy_path = os.path.join(repo_root, "scripts", "dp_load_balance_proxy_server.py")
+
+    cmd = [
+        sys.executable,
+        proxy_path,
+        "--host",
+        str(router_ip).strip("[]"),
+        "--port",
+        str(router_port),
+        "--dp-hosts",
+        *hosts,
+        "--dp-ports",
+        *ports,
+    ]
+    logger.info("Launching DP proxy: %s", " ".join(cmd))
+    proc = subprocess.Popen(cmd)
+    time.sleep(3)
+    if proc.poll() is not None:
+        raise RuntimeError(f"DP proxy exited immediately (code {proc.returncode}); check proxy stderr")
+    logger.info(
+        "DP proxy up at %s:%s (engines=%s)",
+        router_ip,
+        router_port,
+        list(zip(hosts, ports)),
+    )
+    return proc
+
+
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
@@ -1137,11 +1195,15 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
 
         has_pd = model_cfg.has_pd_disaggregation
         use_static_pd_router = has_pd
-        if use_static_pd_router:
+        use_dp_proxy = getattr(args, "rollout_dp_proxy", False) and not has_pd
+        # PD(mooncake/nixl proxy)与 DP(dp_load_balance proxy)都要:预留**确定端口**
+        # (外部客户端 polar sglang_router_url 才能定向)+ 引擎不注册 Rust router 的 /workers
+        # (Python proxy 独占 router_ip:router_port,引擎 URL 显式收集后下传)。
+        # 单引擎旁路仍走 Rust router(worker :15000 直取 return_token_ids)。
+        use_external_proxy = use_static_pd_router or use_dp_proxy
+        if use_external_proxy:
             router_ip = _wrap_ipv6(get_host_info()[1])
-            # PD 的 router/proxy 必须绑**确定端口**,外部客户端(polar sglang_router_url)才能定向;
-            # 用 vllm_router_port(脚本 --vllm-router-port,默认 8001),回退随机口仅当未配。
-            # 单引擎旁路 worker :15000 拿 return_token_ids;PD 多引擎经我们的 proxy(原样透传)→ 切 :8001。
+            # 确定端口:vllm_router_port(脚本 --vllm-router-port,默认 8001),回退随机口仅当未配。
             router_port = getattr(args, "vllm_router_port", None) or find_available_port(random.randint(3000, 4000))
             prom_port = None  # assigned when the router actually launches, after URL collection
             engine_router_ip, engine_router_port = None, None
@@ -1277,6 +1339,20 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                     prefill_urls=prefill_urls,
                     decode_urls=decode_urls,
                 )
+        elif use_dp_proxy:
+            # [DP P0] N 个常规引擎 → 我们的 Python DP proxy(dp_load_balance_proxy_server.py)
+            #   按 active_tokens 最小负载分发,替代 Rust vllm-router(避 #3 return_token_ids 丢弃 +
+            #   原生 DP external-LB 语义)。见 docs/design/vime_dp_pd_kv_impl_design.md §3/§9 P0。
+            dp_urls: list[str] = []
+            for g in server_groups:
+                for e in g.engines:
+                    if e is None:
+                        continue
+                    url = ray.get(e.get_url.remote())
+                    if url:
+                        dp_urls.append(url)
+            _DP_PROXY_PROCS.append(_start_dp_proxy(args, router_ip, router_port, dp_urls))
+            prom_port = None
 
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,

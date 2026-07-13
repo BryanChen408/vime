@@ -36,10 +36,11 @@ RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_qwen36_vime_polar}
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
 ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-8}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-4}
-# [PD 分离 #5] PD 要求 rollout 卡拆 ≥2 引擎(P/D 各 ≥1)。per-engine 默认:FEAT_PD_DISAGG=1 时压到 2
-# (4 卡 rollout→1P1D 两引擎、各 TP2);单引擎默认 4。P/D 的 TP 必须相等(MooncakeHybridConnector 约束),
-# 全引擎共用同一 per-engine 即满足。2P2D 见下方 PD 块注释(需扩 rollout 到 8 卡)。
-if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
+# [PD 分离 #5 / DP #4] PD 要求 rollout 卡拆 ≥2 引擎(P/D 各 ≥1);DP 要 ≥2 副本引擎才有 external-LB 意义。
+# per-engine 默认:FEAT_PD_DISAGG=1 或 FEAT_DP=1 时压到 2(4 卡 rollout→2 引擎各 TP2:PD=1P1D、DP=DP2TP2);
+# 单引擎默认 4。PD 的 P/D TP 须相等(MooncakeHybridConnector 约束),全引擎共用同一 per-engine 即满足。
+# 2P2D / DP4 见下方块注释(需扩 rollout 到 8 卡)。
+if [ "${FEAT_PD_DISAGG:-0}" = "1" ] || [ "${FEAT_DP:-0}" = "1" ]; then
    ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}
 else
    ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
@@ -341,7 +342,21 @@ if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
       fi
    fi
 fi
-echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} pd_disagg=${FEAT_PD_DISAGG:-0}(P=${PD_PREFILL_NUM_SERVERS:-1},be=${PD_BACKEND:-mooncake}) | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
+# [DP #4] 分布式 DP external-LB:N 个常规副本引擎(每引擎 TP=per-engine),用我们的 Python DP proxy
+#   (dp_load_balance_proxy_server.py)按 active_tokens 最小负载分发,替 Rust vllm-router(避 #3
+#   return_token_ids 丢弃 + 原生 DP external-LB 语义)。rollout.py:use_dp_proxy→_start_dp_proxy。
+#   引擎数=ROLLOUT_NUM_GPUS/per-engine(上方 FEAT_DP=1 已压 per-engine=2 → 4 卡=DP2TP2 两副本)。
+#   DP 不跨引擎搬 KV(绕开 PD 的 GDN-hybrid D 侧拉取 bug),权重更新走各引擎既有广播。
+#   默认 OFF=零回归(不传 --rollout-dp-proxy)。与 FEAT_PD_DISAGG 互斥。DP4=ROLLOUT_NUM_GPUS=8+缩 actor。
+#   见 docs/design/vime_dp_pd_kv_impl_design.md §3/§9 P0。
+if [ "${FEAT_DP:-0}" = "1" ]; then
+   if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
+      echo "[FATAL] FEAT_DP 与 FEAT_PD_DISAGG 互斥(DP=副本 external-LB / PD=P/D 分离),二选一" >&2
+      exit 1
+   fi
+   PD_ARGS+=(--rollout-dp-proxy)
+fi
+echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} pd_disagg=${FEAT_PD_DISAGG:-0}(P=${PD_PREFILL_NUM_SERVERS:-1},be=${PD_BACKEND:-mooncake}) dp=${FEAT_DP:-0} | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
 
 MISC_ARGS=(
    --attention-dropout 0.0
