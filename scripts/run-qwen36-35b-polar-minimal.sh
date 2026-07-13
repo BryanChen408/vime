@@ -303,6 +303,10 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
          # [拓扑] RESOURCE_LAYOUT 设了则显式钉位(actor→8-15/rollout→4-7,免跨域 EI0013)
          EXTRA_ARGS=()
          [ -n "${RESOURCE_LAYOUT:-}" ] && EXTRA_ARGS+=(--resource-layout "${RESOURCE_LAYOUT}")
+         # [ITEM 1 / DP #4 B+] FEAT_LB_PROXY=1:用 Python 透传 LB proxy 替 Rust router(保 return_token_ids
+         #   + x-session-id 会话亲和)。需把 polar sglang_router_url 指向 :8001(=vllm_router_port)。单引擎即可
+         #   验透传;默认 OFF=原行为(单引擎旁路 :15000 / 多引擎 Rust router)。见 docs/design/router_return_token_ids_passthrough.md §10。
+         [ "${FEAT_LB_PROXY:-0}" = "1" ] && EXTRA_ARGS+=(--rollout-lb-proxy)
          python3 train_async.py \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             ${TOPO_ARGS[@]} \

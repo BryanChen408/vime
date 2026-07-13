@@ -112,6 +112,18 @@ def add_vllm_router_arguments(parser):
             "session-affinity routing replay via the x-session-id header."
         ),
     )
+    parser.add_argument(
+        "--rollout-lb-proxy",
+        action="store_true",
+        default=False,
+        dest="rollout_lb_proxy",
+        help=(
+            "用我们的 Python 透传 LB proxy(scripts/dp_load_balance_proxy_server.py)替 Rust vllm-router:"
+            "原样 dict 转发保 return_token_ids(Rust router 的 typed 解析会丢)+ x-session-id 会话亲和 + "
+            "active_tokens 负载均衡。绑 --vllm-router-port(:8001),polar 指向它。N≥1 引擎皆可(单引擎验"
+            "透传、多引擎兼做 DP LB)。见 docs/design/router_return_token_ids_passthrough.md §10。"
+        ),
+    )
     return parser
 
 

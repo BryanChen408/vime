@@ -40,6 +40,9 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# [ITEM 1 / DP #4 B+] 存活的 Python LB proxy 子进程句柄(随 run 生命周期,避免被 GC)。
+_LB_PROXY_PROCS: list = []
+
 
 @dataclasses.dataclass
 class ServerGroup:
@@ -1031,6 +1034,62 @@ def _start_router(
     return router_ip, router_port, router_args.prometheus_port
 
 
+def _start_lb_proxy(args, router_ip, router_port, engine_urls):
+    """起 Python 透传 LB proxy 替 Rust vllm-router(ITEM 1 + DP #4 B+;见
+    docs/design/router_return_token_ids_passthrough.md §10)。
+
+    Rust router 的 typed 解析丢 ``return_token_ids`` → token 保真崩;我们的 proxy
+    (scripts/dp_load_balance_proxy_server.py)对 /v1/chat|completions 原样 dict 转发(保
+    return_token_ids)+ x-session-id 会话亲和 + active_tokens 负载均衡。N≥1 引擎皆可
+    (单引擎验透传、多引擎兼做 DP LB)。返回 Popen 句柄。
+    """
+    import os
+    import subprocess
+    import sys
+    from urllib.parse import urlparse
+
+    def _hp(u: str):
+        parsed = urlparse(u if "://" in u else f"http://{u}")
+        return parsed.hostname, str(parsed.port)
+
+    hosts, ports = [], []
+    for u in engine_urls:
+        h, po = _hp(u)
+        hosts.append(h)
+        ports.append(po)
+
+    if not hosts:
+        raise RuntimeError(f"LB proxy needs ≥1 engine url (got {engine_urls})")
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    proxy_path = os.path.join(repo_root, "scripts", "dp_load_balance_proxy_server.py")
+
+    cmd = [
+        sys.executable,
+        proxy_path,
+        "--host",
+        str(router_ip).strip("[]"),
+        "--port",
+        str(router_port),
+        "--dp-hosts",
+        *hosts,
+        "--dp-ports",
+        *ports,
+    ]
+    logger.info("Launching LB proxy: %s", " ".join(cmd))
+    proc = subprocess.Popen(cmd)
+    time.sleep(3)
+    if proc.poll() is not None:
+        raise RuntimeError(f"LB proxy exited immediately (code {proc.returncode}); check proxy stderr")
+    logger.info(
+        "LB proxy up at %s:%s (engines=%s)",
+        router_ip,
+        router_port,
+        list(zip(hosts, ports)),
+    )
+    return proc
+
+
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
@@ -1075,10 +1134,19 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
 
         has_pd = model_cfg.has_pd_disaggregation
         use_static_pd_router = has_pd
+        use_lb_proxy = getattr(args, "rollout_lb_proxy", False) and not has_pd
         if use_static_pd_router:
             router_ip = _wrap_ipv6(get_host_info()[1])
             router_port = find_available_port(random.randint(3000, 4000))
             prom_port = None  # assigned when the router actually launches, after URL collection
+            engine_router_ip, engine_router_port = None, None
+        elif use_lb_proxy:
+            # [ITEM 1 / DP #4 B+] Python 透传 LB proxy 替 Rust router:绑**确定端口**
+            #   (vllm_router_port=:8001,polar sglang_router_url 定向)+ 引擎不注册 Rust router 的
+            #   /workers(proxy 拿显式收集的引擎 URL)。见 docs/design/router_return_token_ids_passthrough.md §10。
+            router_ip = _wrap_ipv6(get_host_info()[1])
+            router_port = getattr(args, "vllm_router_port", None) or find_available_port(random.randint(3000, 4000))
+            prom_port = None  # assigned when the proxy launches, after URL collection
             engine_router_ip, engine_router_port = None, None
         else:
             router_ip, router_port, prom_port = _start_router(
@@ -1203,6 +1271,19 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 prefill_urls=prefill_urls,
                 decode_urls=decode_urls,
             )
+        elif use_lb_proxy:
+            # [ITEM 1 / DP #4 B+] 收集所有引擎 URL,起 Python LB proxy 替 Rust router
+            #   (原样透传 return_token_ids + x-session-id 会话亲和;单引擎也可验透传,多引擎兼做 DP LB)。
+            lb_urls: list[str] = []
+            for g in server_groups:
+                for e in g.engines:
+                    if e is None:
+                        continue
+                    url = ray.get(e.get_url.remote())
+                    if url:
+                        lb_urls.append(url)
+            _LB_PROXY_PROCS.append(_start_lb_proxy(args, router_ip, router_port, lb_urls))
+            prom_port = None
 
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,
