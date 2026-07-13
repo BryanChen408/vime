@@ -326,6 +326,14 @@ if [ "${FEAT_PD_DISAGG:-0}" = "1" ]; then
       if [[ ! " ${VLLM_ARGS[*]} " == *" --no-vllm-disable-hybrid-kv-cache-manager "* ]]; then
          VLLM_ARGS+=(--no-vllm-disable-hybrid-kv-cache-manager)
       fi
+      # [PD DEBUG,定位后删] PD_DEBUG=1 开连接器 DEBUG 日志,定位 D 侧 KV 拉取卡在哪:
+      #   看 get_num_new_matched_tokens(认出 remote_prefill)→ update_state_after_alloc(加入待收 /
+      #   :1467 "Got invalid KVTransferParams" 警告)→ "KV cache transfer for request took X ms"(传输成功才打)。
+      #   ADXL 机内卡间传输层已独立验证通(卡4→6,0.08s,数据一致),问题在 vLLM 连接器集成层。
+      if [ "${PD_DEBUG:-0}" = "1" ]; then
+         export VLLM_LOGGING_LEVEL=DEBUG
+         export MC_TE_METRIC=1
+      fi
    fi
 fi
 echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} kv_pool=${FEAT_KV_POOL:-0} pd_disagg=${FEAT_PD_DISAGG:-0}(P=${PD_PREFILL_NUM_SERVERS:-1},be=${PD_BACKEND:-mooncake}) | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
