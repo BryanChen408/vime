@@ -47,7 +47,7 @@ export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}   # NPU 邻近 NUMA 绑核,降�
 export QWEN36_CP_MODE=ulysses
 export QWEN36_CAUSAL_CONV1D_IMPL=triton
 export QWEN36_CHUNK_LMHEAD=${QWEN36_CHUNK_LMHEAD:-0}   # =1 chunked LM-head logprob,长序列免 OOM
-export VLLM_ASCEND_ENABLE_NZ=0
+export VLLM_ASCEND_ENABLE_NZ=0                         # 必须 0:vllm-ascend wake_up 对 NZ+RL 硬 raise、weight-sync 每步换权重与 NZ 格式冲突(精度崩);推理加速收益 RL 下无法安全兑现
 export VLLM_TOOL_CALL_PARSER=qwen3_coder
 export VLLM_REASONING_PARSER=qwen3
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
