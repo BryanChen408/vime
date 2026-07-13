@@ -133,12 +133,21 @@ def _resolve_vllm_parallel_sizes(args, *, gpus_per_engine: int) -> tuple[int, in
     # desyncing the weight-transfer rendezvous (the 300s "3/4 clients joined" hang).
     pp = _get_vllm_pp_size(args)
     dp = _get_vllm_dp_size(args)
-    if gpus_per_engine % (pp * dp) != 0:
+    # [DP #4 P1 / external-LB] each engine slot IS one DP rank (occupies tp*pp cards); the
+    #   DP width lives across the N slots, not inside one slot, so tp must NOT divide by dp
+    #   here — dp is emitted as --data-parallel-size on each slot (§19). This restores
+    #   slime's sglang_engine ``tp = gpus_per_engine // pp``. Non-external-LB (single engine
+    #   / ③ replica dp_size=1) keeps ``// (pp*dp)`` and is byte-identical to before.
+    if getattr(args, "vllm_data_parallel_external_lb", False):
+        divisor, divisor_desc = pp, f"vllm_pipeline_parallel_size ({pp})"
+    else:
+        divisor = pp * dp
+        divisor_desc = f"vllm_pipeline_parallel_size * vllm_data_parallel_size ({pp} * {dp} = {pp * dp})"
+    if gpus_per_engine % divisor != 0:
         raise ValueError(
-            f"num_gpus_per_engine ({gpus_per_engine}) must be divisible by "
-            f"vllm_pipeline_parallel_size * vllm_data_parallel_size ({pp} * {dp} = {pp * dp})"
+            f"num_gpus_per_engine ({gpus_per_engine}) must be divisible by {divisor_desc}"
         )
-    tp = gpus_per_engine // (pp * dp)
+    tp = gpus_per_engine // divisor
     return tp, pp
 
 

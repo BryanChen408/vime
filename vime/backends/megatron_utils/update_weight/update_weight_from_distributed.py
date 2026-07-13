@@ -383,11 +383,20 @@ def connect_rollout_engines_from_distributed(
         cumulative.append(cumulative[-1] + c)
 
     backend = "hccl" if is_npu() else "nccl"
+    # [DP #4 P1 / external-LB] vllm-ascend HCCL client 的 rank 公式已自带 DP 偏移
+    #   (worker_rank = data_parallel_index * world_size_per_dp + rank_within_dp;
+    #    hccl_engine.py:74-78,data_parallel_index=data_parallel_rank per parallel.py:825)。
+    #   external-LB 下同一 DP 组的 N 个 rank-engine 各自 data_parallel_index=r,故 rank_offset
+    #   须全组统一为 1(靠 client 的 data_parallel_index 区分组内偏移);沿用 per-engine
+    #   cumulative 会与 client 的 dp 偏移双重计,rank 越界(见 docs vime_vllm_native_dp_rollout
+    #   §18.2 演算)。非 external-LB(单引擎 / ③副本 dp_size=1 → data_parallel_index=0)走
+    #   cumulative,与今天字节一致。默认 OFF,须与 P1 拉起(§19 #2/#3/#4)一起启用。
+    external_lb = getattr(args, "vllm_data_parallel_external_lb", False)
     refs = [
         engine.init_weights_update_group.remote(
             master_address=master_address,
             master_port=master_port,
-            rank_offset=cumulative[i] + 1,
+            rank_offset=(1 if external_lb else cumulative[i] + 1),
             world_size=world_size,
             group_name=group_name,
             backend=backend,
