@@ -1,0 +1,15 @@
+# [多节点 layout] 双机:actor 训练全在 node-88 的卡 0-7;rollout 推理全在 node-64 的卡 8-15。
+# 每角色独占一节点 → 所有 HCCL 集合通信都在节点内(无需 per-rank HCCL 端口;固定 range 足够)。
+# 对应启动(照 slime 双机):
+#   head@88:   ASCEND_RT_VISIBLE_DEVICES=0-7  CURRENT_IP=80.48.5.88 SOCKET_IFNAME=ens1f3  (=MASTER_ADDR → head 分支)
+#   worker@64: ASCEND_RT_VISIBLE_DEVICES=8-15 CURRENT_IP=80.48.5.64 SOCKET_IFNAME=ens3f3  (≠MASTER_ADDR → worker 分支)
+#   两节点都: NNODES=2 NPUS_PER_NODE=8 MASTER_ADDR=80.48.5.88
+# layout 的 device 号必须对上各节点 ASCEND_RT_VISIBLE_DEVICES 暴露的物理卡(node64 暴露 8-15 → 这里写 8-15)。
+# 迁自 slime configs/polar_bridge/resource_layout.dual88train64infer.yaml,去掉 sglang_dp_size(vime 用 vllm)。
+roles:
+  actor:
+    - {node: 80.48.5.88, devices: "0-7"}
+  rollout:
+    - {node: 80.48.5.64, devices: "8-15"}
+rollout:
+  num_gpus_per_engine: 4
