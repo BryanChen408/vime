@@ -1,18 +1,7 @@
 #!/bin/bash
-# vime + polar 算子 RL 启动脚本 —— 逐段对齐 slime 的 run-qwen36-35b-polar-minimal.sh。
-# 与 slime 版的**全部**差异只有以下几处(其余分组/参数一字不差):
-#   1. 推理引擎块  SGLANG_ARGS -> VLLM_ARGS   (vime 用 vllm/vllm-ascend)
-#   2. bridge      slime_bridge -> vime_bridge
-#   3. 拓扑        vime 无 --resource-layout,用 TOPO_ARGS(--actor-num-gpus/--rollout-num-gpus)
-#   4. PYTHONPATH  sglang -> vllm/vllm-ascend
-#   5. GRPO 里 **不设** --custom-pg-loss-reducer(Option A:vime 原生按-rollout 均权;
-#      精确对齐 slime 的 per-trace 等权需 Option B 的 vime-core 改动,见
-#      docs/design/vime_polar_integration.md §G1)
-#
-# polar 对本脚本的暴露 = 只有 --polar-url + 通用 --rollout-* 调度参数(与 slime 一致,无多余 YAML)。
-# 前置:宿主机先用 profile.vime.yaml 起 polar(推理端点指向 vime 的 vllm:${VLLM_ROUTER_PORT})。
-# 卡:polar 算子 agent 占 0-3(profile npu_lease),vime rollout+train 用 4-15。
-
+# vime + polar 算子 RL 启动(qwen3.6-35B-A3B / NPU)。
+# 前置:宿主机先用 profile.vime.yaml 起 polar,其推理端点指向 vime vllm 的 :${VLLM_ROUTER_PORT}。
+# 卡位:polar agent 占 0-3;vime rollout(4-7)+ train(8-15)用 4-15。
 set -ex
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -22,71 +11,62 @@ cd "${VIME_ROOT}"
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 
+# ─── 运行标识 / 多节点 ───
 RUN_ID=${RUN_ID:-qwen36_polar_$(date +%Y%m%d-%H%M%S)}
-SOCKET_IFNAME=${SOCKET_IFNAME:-}
 MASTER_ADDR=${MASTER_ADDR:-80.48.5.88}
 CURRENT_IP=${CURRENT_IP:-}
+SOCKET_IFNAME=${SOCKET_IFNAME:-}
 NNODES=${NNODES:-1}
-NPUS_PER_NODE=${NPUS_PER_NODE:-12}          # vime 单机:rollout 4 + train 8 = 12 卡(4-15)
+NPUS_PER_NODE=${NPUS_PER_NODE:-12}            # 单机:rollout 4 + train 8 = 卡 4-15
 RAY_PORT=${RAY_PORT:-6460}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8290}
 RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_qwen36_vime_polar}
 
-# 拓扑(vime 用 gpu 计数替代 slime 的 resource-layout)。TP2*CP4=8=actor;rollout 1 engine * 4 卡。
+# ─── 拓扑(gpu 计数;或设 RESOURCE_LAYOUT 走显式钉位)───
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
 ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-8}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-4}
 ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
 
+# ─── polar 数据 / 端点 ───
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
 OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
 OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.jsonl}
 OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
-VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}  # vime serve OpenAI 的端口;profile.vime.yaml 指向它
+VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # profile.vime.yaml 推理端点指向它
 
+# ─── 环境 ───
 export PYTHONBUFFERED=16
 export PYTHONPATH="/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${PYTHONPATH:-}"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export TASK_QUEUE_ENABLE=0
-# [CPU 绑核] 把 NPU 邻近 NUMA 核绑给 IRQ/worker/acl/release 线程,降延迟抖动、稳吞吐(torch_npu
-# affinity.py 消费)。与训练数值正交、独立于 TASK_QUEUE;直接 bash 起不过 entrypoint.sh(其 :-1 默认
-# 失效)故此处显式设。默认 on、可 CPU_AFFINITY_CONF=0 关;只加绑核不改数值,retro-compat。
-export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}
-# Inductor 在昇腾 get_gpu_type() 断言(assert len(avail_gpus)<=1)崩溃:训练侧 Megatron 会触发
-# torch.compile;禁用 dynamo 走 eager(对齐已验证的 run_qwen36_35b_a3b_polar_npu.sh:136)。
-export TORCHDYNAMO_DISABLE=1
+export TASK_QUEUE_ENABLE=0                     # 必须 0:=1 会让 GDN/ring-attn 训练出 NaN
+export TORCHDYNAMO_DISABLE=1                   # 昇腾 inductor get_gpu_type() 断言 → 走 eager
+export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}   # NPU 邻近 NUMA 绑核,降延迟抖动
 export QWEN36_CP_MODE=ulysses
 export QWEN36_CAUSAL_CONV1D_IMPL=triton
-# [chunk LM-head] =1 时 patch GPTModel.forward 返回 hidden,loss 走 chunked logprob → logits
-# 峰值 [chunk,V/tp] 脱离序列长 → 长 operator 序列不 OOM(修 loss.py get_log_probs OOM 根因)。
-# 默认 0(retro-compat:与现状逐位一致)。验证:QWEN36_CHUNK_LMHEAD=1 MAX_TOKENS_PER_GPU=32768 拉起。
-export QWEN36_CHUNK_LMHEAD=${QWEN36_CHUNK_LMHEAD:-0}
+export QWEN36_CHUNK_LMHEAD=${QWEN36_CHUNK_LMHEAD:-0}   # =1 chunked LM-head logprob,长序列免 OOM
 export VLLM_ASCEND_ENABLE_NZ=0
+export VLLM_TOOL_CALL_PARSER=qwen3_coder
+export VLLM_REASONING_PARSER=qwen3
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=1
+# HCCL(节点内 RoCE;长跑 EI0013 容错 + 35B 权重广播大 buffer)
 export HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-60000-60050}
 export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-600}
-export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
-# [EI0013 抗抖] slime BASELINE_SPEC 已验证的 HCCL 长跑容错(EI0013 ROCE CQE 是已知偶发问题):
-# 更长 exec 超时容忍瞬态 + 512 大 buffer 利于 35B 权重广播 + 关 PCIe 内通(本拓扑 RoCE 为唯一节点内路径)。
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-2400}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}
+export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
 export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
-# [拓扑] ⚠️ Ascend 要求 ASCEND_RT_VISIBLE_DEVICES 必须升序(乱序→torch_npu 见 0 卡)。故无法靠 env
-# 乱序把 actor 钉到后八卡域 8-15;actor 只能=升序首 8=4-11(跨 7/8 域)。EI0013 跨域抖动靠上面
-# HCCL 容错 env(EXEC_TIMEOUT/retry)兜(=slime 做法)。真要 actor 独占 8-15 需走 resource_layout 显式钉位(task-4 P1)。
+# Ascend 要求 ASCEND_RT_VISIBLE_DEVICES 升序(乱序 → torch_npu 见 0 卡)
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-4,5,6,7,8,9,10,11,12,13,14,15}
 export POLAR_KEEP_SESSION_DIR=${POLAR_KEEP_SESSION_DIR:-1}
 export POLAR_TRAJECTORY_PG_STRICT=${POLAR_TRAJECTORY_PG_STRICT:-1}
 export POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS=${POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS:-12288}
 
-export VLLM_TOOL_CALL_PARSER=qwen3_coder
-export VLLM_REASONING_PARSER=qwen3
-
-source "${VIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh"     # -> MODEL_ARGS(vime_plugins spec)
+source "${VIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh"     # → MODEL_ARGS
 
 CURRENT_IP=${CURRENT_IP:-$(hostname -I | awk '{print $1}')}
 export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${CURRENT_IP}${no_proxy:+,${no_proxy}}"
@@ -97,10 +77,10 @@ if [ -n "${SOCKET_IFNAME}" ]; then
 fi
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
-LOG_FILE=${LOG_FILE:-${POLAR_OUTPUT_DIR}/train_${RUN_ID}.log}
-LOG_FILE="/home/docker/logs/train_${RUN_ID}.log"
-mkdir -p logs "${POLAR_OUTPUT_DIR}"
+LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
+mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
 
+# ─── 参数分组 ───
 CKPT_ARGS=(
    --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
    --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
@@ -158,7 +138,7 @@ POLAR_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"
    --pipeline-model-parallel-size "${PP:-1}"
-   --context-parallel-size "${CP:-4}"       # 首次冒烟建议 export CP=1(vime 异步+CP>1 未验证);链路+G2-1 通了再切 4
+   --context-parallel-size "${CP:-4}"
    --expert-model-parallel-size "${EP:-8}"
    --expert-tensor-parallel-size 1
    --sequence-parallel
@@ -180,8 +160,6 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --use-tis
-   # Option A:不设 --custom-pg-loss-reducer(vime 原生按-rollout 均权)。
-   # 对齐 slime 的 slime_bridge.trajectory_loss(per-trace 等权)需 Option B,见 §G1。
 )
 
 OPTIMIZER_ARGS=(
@@ -196,7 +174,6 @@ OPTIMIZER_ARGS=(
    --use-precision-aware-optimizer
 )
 
-# 推理引擎块(对应 slime 的 SGLANG_ARGS)—— 这是两份脚本唯一的实质引擎差异。
 VLLM_ARGS=(
    --rollout-backend vllm
    --qwen-gdn-backend npu
@@ -214,62 +191,6 @@ VLLM_ARGS=(
    --no-offload-rollout
 )
 
-# ─── 特性叠加开关(§4.B,源码核实版;默认全 0 = baseline 逐位不变,retro-compat)───
-# 叠加=已验特性只增不减(过闸即留,**不因 debug-bs 吞吐降而关**——debug bs 吞吐不准)。
-# 闸=token-faith 正确性(TIS≈1 / logprob_abs_diff≲0.05 / session COMPLETED / 无崩 / step0+1)。
-# 吞吐收益改到 realistic batch 另测,**不作叠加期门槛**。
-# 全栈(待验全叠):EP + FlashComm1 + prefix-cache + multistream_overlap_shared_expert + static_kernel。
-#   已验:EP(TIS1.0018)/ FlashComm1(1.0006)/ prefix-cache(step0+1)。新验:multistream / static_kernel。
-# 不接线(审计):TOPK_OPTIMIZE=本分支死代码 no-op;CPU_AFFINITY 已容器默认=1;
-#   TASK_QUEUE_ENABLE 保持 0 —— =1 让 GDN/ring-attn 训练出 NaN(进程级砸训练),严禁翻。
-if [ "${FEAT_ASYNC_SCHED:-0}" = "1" ]; then
-   VLLM_ARGS+=(--vllm-async-scheduling)
-fi
-# [rollout EP] FlashComm1 对 MoE 硬需 rollout 引擎开 EP(vllm-ascend platform.py:693 断言)→ FEAT_FLASHCOMM1
-# 自动带上 EP。FEAT_ROLLOUT_EP=1 可单独开 EP(隔离验权重同步)。注:这是 vLLM ROLLOUT 的 EP(独立于
-# actor 侧 --expert-model-parallel-size 8)。vime 既有支持(run-glm4.7-355B/minimax-m2 用过、update_weight
-# 有 ep 逻辑),但 qwen3.6 首次用 → 须验权重同步 EP 分片正确(TIS≈1);错则查 update_weight/mbridge。
-EP_ON=0
-if [ "${FEAT_ROLLOUT_EP:-0}" = "1" ] || [ "${FEAT_FLASHCOMM1:-0}" = "1" ]; then
-   VLLM_ARGS+=(--vllm-enable-expert-parallel); EP_ON=1
-fi
-if [ "${FEAT_FLASHCOMM1:-0}" = "1" ]; then
-   export VLLM_ASCEND_ENABLE_FLASHCOMM1=1          # env,经 os.environ.copy() 传 vllm serve 子进程
-fi
-if [ "${FEAT_PREFIX_CACHE:-0}" = "1" ]; then
-   # align 模式硬依赖 chunked-prefill(vllm config.py:384 否则 AssertionError);显式 pin 保前置。
-   VLLM_ARGS+=(--vllm-enable-prefix-caching --vllm-enable-chunked-prefill)
-fi
-# [additional-config 合并] 多个特性各自贡献 additional-config 顶层键 → 必须合并成单个
-# --vllm-additional-config JSON;否则重复 flag 后者覆盖前者、静默丢特性(叠加正确性硬要求)。
-ADDCFG_PARTS=()
-if [ "${FEAT_MULTISTREAM_SHARED_EXPERT:-0}" = "1" ]; then
-   # shared-expert 计算放独立 stream 与 MoE dispatch/combine overlap(vllm-ascend fused_moe.py:386/748)。
-   # 本模型有 shared expert(qwen3_next.py:157 shared_experts= 传入 FusedMoE)→ 激活非 no-op;
-   # 开启时自带 _validate_shared_expert_consistency(验拆分==整体);无 mix_placement 冲突。
-   ADDCFG_PARTS+=('"multistream_overlap_shared_expert":true')
-fi
-if [ "${FEAT_STATIC_KERNEL:-0}" = "1" ]; then
-   ADDCFG_PARTS+=('"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":true}')
-fi
-if [ "${#ADDCFG_PARTS[@]}" -gt 0 ]; then
-   ADDCFG_JSON="{$(IFS=,; echo "${ADDCFG_PARTS[*]}")}"
-   VLLM_ARGS+=(--vllm-additional-config "$ADDCFG_JSON")
-fi
-if [ "${FEAT_HCCL_AIV:-0}" = "1" ]; then
-   export HCCL_OP_EXPANSION_MODE=AIV               # batch5:CANN 层通信优化(HCCL 算子 offload→AIV 核),低风险 env
-fi
-# [可复现] ⚠️ 经查证 --vllm-enable-deterministic-inference 不适配 polar:其"每样本 seed"只在 vime
-#   原生 rollout(vllm_rollout.py:501/743)注入,polar 多轮 agent 自建请求(vime_bridge 只发任务
-#   payload)→ seed 够不到 polar;仅 VLLM_BATCH_INVARIANT=1(engine 级)生效。且 polar 轨迹含环境非
-#   确定性(agent 编译/跑/评测算子)→ 轨迹级复现不可得。故**默认 OFF**(batch-invariant 拖慢推理、
-#   对 polar 只换前向 bit 确定,不抵成本)。polar 可复现靠"固定 seed(下 --seed + rollout-seed 42)+
-#   聚合指标"。REPRO_DETERMINISTIC=1 仅在跑 vime 原生 rollout 时才值得开。
-if [ "${REPRO_DETERMINISTIC:-0}" = "1" ]; then
-   VLLM_ARGS+=(--vllm-enable-deterministic-inference)
-fi
-echo "[feature-stacking] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} rollout_ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} | addcfg=${ADDCFG_JSON:-none} | deterministic=${REPRO_DETERMINISTIC:-0} seed=${SEED:-1234} | TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE} (kept)"
-
 MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
@@ -282,43 +203,49 @@ MISC_ARGS=(
    --seed "${SEED:-1234}"
 )
 
-# Ray(对齐 slime;单机 NNODES=1 走 head 分支。注意 ray stop --force 会停本机 ray)
+# ─── 特性开关(默认全 OFF = baseline 逐位不变)───
+[ "${FEAT_ASYNC_SCHED:-0}" = "1" ] && VLLM_ARGS+=(--vllm-async-scheduling)
+EP_ON=0
+if [ "${FEAT_ROLLOUT_EP:-0}" = "1" ] || [ "${FEAT_FLASHCOMM1:-0}" = "1" ]; then
+   VLLM_ARGS+=(--vllm-enable-expert-parallel); EP_ON=1     # FlashComm1 硬需 rollout EP
+fi
+[ "${FEAT_FLASHCOMM1:-0}" = "1" ] && export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+[ "${FEAT_PREFIX_CACHE:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-prefix-caching --vllm-enable-chunked-prefill)   # align 模式硬依赖 chunked-prefill
+# 多特性各自贡献 additional-config 顶层键 → 合并成单个 JSON(否则重复 flag 后者覆盖前者)
+ADDCFG_PARTS=()
+[ "${FEAT_MULTISTREAM_SHARED_EXPERT:-0}" = "1" ] && ADDCFG_PARTS+=('"multistream_overlap_shared_expert":true')
+[ "${FEAT_STATIC_KERNEL:-0}" = "1" ] && ADDCFG_PARTS+=('"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":true}')
+[ "${#ADDCFG_PARTS[@]}" -gt 0 ] && VLLM_ARGS+=(--vllm-additional-config "{$(IFS=,; echo "${ADDCFG_PARTS[*]}")}")
+[ "${FEAT_HCCL_AIV:-0}" = "1" ] && export HCCL_OP_EXPANSION_MODE=AIV
+[ "${REPRO_DETERMINISTIC:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-deterministic-inference)
+echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0}"
+
+# ─── Ray(单机 NNODES=1 走 head 分支)+ 启动 ───
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
    ray stop --force
    rm -rf "${RAY_TEMP_DIR}"
    ray start --head --port "${RAY_PORT}" --dashboard-host=0.0.0.0 --node-ip-address="${CURRENT_IP}" --dashboard-port="${RAY_DASHBOARD_PORT}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
 
    while true; do
-      ray_status_output=$(ray status)
-      active_node_count=$(echo "$ray_status_output" | awk '
+      active_node_count=$(ray status | awk '
          /^Active:/ {in_active=1; next}
          /^Pending:/ {in_active=0}
          in_active && $1 == "1" && $2 ~ /^node_/ {count++}
-         END {print count + 0}
-      ')
+         END {print count + 0}')
       echo "[stage] wait Ray nodes active=${active_node_count}/${NNODES}"
       if [ "$active_node_count" -eq "$NNODES" ]; then
-         ray status
+         # layout 路径:清全局可见卡,交给 Ray 按 actor 钉卡
          unset ASCEND_RT_VISIBLE_DEVICES HCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME
-         # [拓扑] RESOURCE_LAYOUT 设了则显式钉位(actor→8-15/rollout→4-7,免跨域 EI0013)
          EXTRA_ARGS=()
          [ -n "${RESOURCE_LAYOUT:-}" ] && EXTRA_ARGS+=(--resource-layout "${RESOURCE_LAYOUT}")
-         # [ITEM 1 / DP #4 B+] FEAT_LB_PROXY=1:用 Python 透传 LB proxy 替 Rust router(保 return_token_ids
-         #   + x-session-id 会话亲和)。需把 polar sglang_router_url 指向 :8001(=vllm_router_port)。单引擎即可
-         #   验透传;默认 OFF=原行为(单引擎旁路 :15000 / 多引擎 Rust router)。见 docs/design/router_return_token_ids_passthrough.md §10。
+         # FEAT_LB_PROXY=1:Python 透传 LB proxy 替 Rust router(保 return_token_ids + 会话亲和);
+         #   需把 polar 推理端点指向 :${VLLM_ROUTER_PORT}。见 docs/design/router_return_token_ids_passthrough.md §10。
          [ "${FEAT_LB_PROXY:-0}" = "1" ] && EXTRA_ARGS+=(--rollout-lb-proxy)
          python3 train_async.py \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
-            ${TOPO_ARGS[@]} \
-            ${MODEL_ARGS[@]} \
-            ${ROLLOUT_ARGS[@]} \
-            ${POLAR_ARGS[@]} \
-            ${OPTIMIZER_ARGS[@]} \
-            ${GRPO_ARGS[@]} \
-            ${PERF_ARGS[@]} \
-            ${VLLM_ARGS[@]} \
-            ${MISC_ARGS[@]} \
-            ${CKPT_ARGS[@]} \
+            ${TOPO_ARGS[@]} ${MODEL_ARGS[@]} ${ROLLOUT_ARGS[@]} ${POLAR_ARGS[@]} \
+            ${OPTIMIZER_ARGS[@]} ${GRPO_ARGS[@]} ${PERF_ARGS[@]} ${VLLM_ARGS[@]} \
+            ${MISC_ARGS[@]} ${CKPT_ARGS[@]} \
             2>&1 | tee "${LOG_FILE}"
          break
       fi
