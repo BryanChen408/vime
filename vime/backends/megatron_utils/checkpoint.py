@@ -104,6 +104,19 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if _is_megatron_checkpoint(load_path):
+        # [GDN 校验 fail-loud] GDN verify(_verify_gdn_load)只挂在 HF-load 路径 _load_checkpoint_hf,
+        #   与 slime 一致(slime 的 verify 只在 mbridge HF-online-load,torch_dist 路径无 verify)。
+        #   torch_dist/megatron ckpt 走这里 → verify 不触发。若设了 QWEN36_VERIFY_LOAD 却走本路径,
+        #   大声提示,避免静默空跑(曾误导:env 设了但 log 无校验输出)。
+        if os.environ.get("QWEN36_VERIFY_LOAD"):
+            hf_hint = getattr(args, "hf_checkpoint", None) or "<HF 目录>"
+            print(
+                f"[VERIFY_LOAD][WARN] QWEN36_VERIFY_LOAD 已设,但 --load={load_path} 是 megatron/torch_dist ckpt "
+                f"→ 走 _load_checkpoint_megatron,GDN verify **不触发**(verify 仅在 HF-load 路径 _load_checkpoint_hf)。"
+                f"要跑校验:临时把 --load 指向 HF 目录(如 {hf_hint})再设 QWEN36_VERIFY_LOAD=1;"
+                f"该校验验的是 bridge 的 HF↔megatron GDN 映射,即产出此 torch_dist 的同一套转换逻辑。",
+                flush=True,
+            )
         return _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,
