@@ -167,6 +167,15 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--chunked-lm-head",
+                action="store_true",
+                default=False,
+                help="[对齐 slime arguments:181,vime 原移植漏此定义]分块 LM-head:不材料化完整 logits,"
+                "per-chunk 算 logprob/entropy,峰值脱离序列长(长上下文 32k+ 必需;否则 vocab 248320 满 "
+                "logits → compute_log_prob OOM)。漏定义时命令行 --chunked-lm-head 被 parse_known_args "
+                "静默吞掉 → args.chunked_lm_head 不存在 → model.py 桥接恒 False → chunked 永不生效。",
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
