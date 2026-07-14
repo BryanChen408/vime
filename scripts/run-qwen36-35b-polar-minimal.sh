@@ -75,6 +75,12 @@ export POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS=${POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS:-
 
 source "${VIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh"     # → MODEL_ARGS
 
+# [双机修复 2026-07-14] CURRENT_IP 优先从 SOCKET_IFNAME 指定的网卡取(对齐 slime polar-minimal:56),
+#   避免 hostname -I 首个 IP 命中 docker/bridge/别的网卡 → 跨机 HCCL ranktable 检测拿错 IP → EI0015。
+if [ -n "${SOCKET_IFNAME}" ]; then
+   CURRENT_IP=${CURRENT_IP:-$(ip -o -4 addr show "${SOCKET_IFNAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)}
+   CURRENT_IP=${CURRENT_IP:-$(ifconfig "${SOCKET_IFNAME}" 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')}
+fi
 CURRENT_IP=${CURRENT_IP:-$(hostname -I | awk '{print $1}')}
 export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${CURRENT_IP}${no_proxy:+,${no_proxy}}"
 export NO_PROXY="${no_proxy}"
