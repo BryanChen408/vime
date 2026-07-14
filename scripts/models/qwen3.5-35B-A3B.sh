@@ -56,7 +56,13 @@ MODEL_ARGS=(
    --moe-grouped-gemm
    --moe-token-drop-policy probs
    --moe-router-dtype fp32
-   --moe-permute-fusion
+   # [复核-A 回退 2026-07-14] vime 全局跑 --optimization-level 0(见 run-*.sh:97),
+   #   而 MindSpeed FusedMoEPermuteFeature 是 optimization_level=2:opt-level 0 时
+   #   is_need_apply=False → 不注册 pre_register_patches 的 dummy-TE →
+   #   Megatron transformer_config.py:1810 硬 raise "fused permutation is not available. TE>=2.1.0"。
+   #   slime 能开是因为它跑 MindSpeed 默认 opt-level 2(arguments.py:415 default=2)。
+   #   要在 vime 开此特性需整体上到 opt-level 2(blast radius,单列待决)。此处保持关闭。
+   --no-moe-permute-fusion
    --moe-aux-loss-coeff 0
 
    # qwen3.5 specific

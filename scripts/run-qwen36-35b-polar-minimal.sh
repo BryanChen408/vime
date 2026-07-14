@@ -38,8 +38,9 @@ VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # profile.vime.yaml 推理端点�
 # ─── 环境 ───
 export PYTHONBUFFERED=16
 export PYTHONPATH="/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${PYTHONPATH:-}"
-# [复核-D 2026-07-14] Ascend 自定义 MoE 训练算子库(moe_grouped_matmul/grouped_matmul_swiglu/swiglu),对齐 slime。
-#   --moe-grouped-gemm 用它;缺此路径则回退较慢的原生实现(不崩,仅性能)。库存在于 vllm-ascend/Ascend-toolkit。
+# [复核-D 保留 2026-07-14] Ascend 自定义 MoE 训练算子库(moe_grouped_matmul/grouped_matmul_swiglu/swiglu)。
+#   slime 在同名脚本 run-qwen36-35b-polar-minimal.sh:52 设的就是这条 identical 路径 → 参考正确,保留。
+#   --moe-grouped-gemm 用它;此路径在本容器不存在时被 ld 直接跳过 → 回退原生实现(不崩,仅性能),故当前 inert。
 export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH:-}"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
@@ -205,10 +206,10 @@ MISC_ARGS=(
    --attention-backend flash
    --use-flash-attn
    --moe-token-dispatcher-type alltoall
-   # [复核-B 2026-07-14] 去掉 --no-gradient-accumulation-fusion,开 grad-fusion 对齐 slime。
-   #   MindSpeed 有 NPU 版实现(weight_grad_store/grouped_mlp,非 fused_weight_gradient_mlp_cuda),
-   #   slime 同 Megatron 开着跑通。若某 linear 路径未被 MindSpeed patch → import 该 CUDA 扩展崩,
-   #   则恢复此行:--no-gradient-accumulation-fusion。
+   # [复核-B 回退 2026-07-14] slime 在**所有** NPU 脚本都用 --no-gradient-accumulation-fusion
+   #   (grad-fusion 依赖 CUDA-only 的 fused_weight_gradient_mlp_cuda,NPU 无)。
+   #   之前注释里"slime 开着跑通"是错的,已回退对齐 slime。
+   --no-gradient-accumulation-fusion
    --seed "${SEED:-1234}"
 )
 
