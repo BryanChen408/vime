@@ -30,7 +30,7 @@ ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
 
 # ─── polar 数据 / 端点 ───
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
-OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
+OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189}
 OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.jsonl}
 OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
 VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # profile.vime.yaml 推理端点指向它
@@ -38,6 +38,9 @@ VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # profile.vime.yaml 推理端点�
 # ─── 环境 ───
 export PYTHONBUFFERED=16
 export PYTHONPATH="/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${PYTHONPATH:-}"
+# [复核-D 2026-07-14] Ascend 自定义 MoE 训练算子库(moe_grouped_matmul/grouped_matmul_swiglu/swiglu),对齐 slime。
+#   --moe-grouped-gemm 用它;缺此路径则回退较慢的原生实现(不崩,仅性能)。库存在于 vllm-ascend/Ascend-toolkit。
+export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH:-}"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -52,7 +55,7 @@ export VLLM_TOOL_CALL_PARSER=qwen3_coder
 export VLLM_REASONING_PARSER=qwen3
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=1
-# HCCL(节点内 RoCE;长跑 EI0013 容错 + 35B 权重广播大 buffer)
+# HCCL(节点内 HCCS + 跨机 socket;长跑 EI0013 容错 + 35B 权重广播大 buffer)
 export HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-60000-60050}
 export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-600}
@@ -60,6 +63,9 @@ export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-2400}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}
 export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
 export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
+# 跨机 HCCL 必需(对齐 slime;缺则双机权重同步 world>N 卡死在 rendezvous):
+export HCCL_SOCKET_FAMILY=${HCCL_SOCKET_FAMILY:-AF_INET}       # 强制 IPv4(网卡带 IPv6 地址会 socket family mismatch)
+export HCCL_WHITELIST_DISABLE=${HCCL_WHITELIST_DISABLE:-1}     # 禁 IP 白名单(否则跨机对端 IP 不在白名单→连接被拒→卡死)
 # Ascend 要求 ASCEND_RT_VISIBLE_DEVICES 升序(乱序 → torch_npu 见 0 卡)
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-4,5,6,7,8,9,10,11,12,13,14,15}
 export POLAR_KEEP_SESSION_DIR=${POLAR_KEEP_SESSION_DIR:-1}
@@ -130,9 +136,9 @@ POLAR_ARGS=(
    --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
    --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
    --rollout-scheduler-mode session_pool
-   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-8}"
+   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
    --rollout-release-on-postrun
-   --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6}"
+   --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
 )
 
 PERF_ARGS=(
@@ -164,7 +170,7 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr 2e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
@@ -199,7 +205,10 @@ MISC_ARGS=(
    --attention-backend flash
    --use-flash-attn
    --moe-token-dispatcher-type alltoall
-   --no-gradient-accumulation-fusion
+   # [复核-B 2026-07-14] 去掉 --no-gradient-accumulation-fusion,开 grad-fusion 对齐 slime。
+   #   MindSpeed 有 NPU 版实现(weight_grad_store/grouped_mlp,非 fused_weight_gradient_mlp_cuda),
+   #   slime 同 Megatron 开着跑通。若某 linear 路径未被 MindSpeed patch → import 该 CUDA 扩展崩,
+   #   则恢复此行:--no-gradient-accumulation-fusion。
    --seed "${SEED:-1234}"
 )
 
