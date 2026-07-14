@@ -1036,7 +1036,7 @@ def policy_loss_function(
                 "old_log_probs": old_log_probs.detach().cpu(),
                 "rollout_log_probs": rollout_log_probs.detach().cpu(),
             }, _save_path)
-            logger.info(f"Saved TIS logprobs to {_save_path}")
+            print(f"[VIME_SAVE_TIS_LOGPROBS] rank{dist.get_rank()} saved TIS logprobs to {_save_path}", flush=True)
 
     reported_loss = {
         "loss": loss.clone().detach(),
