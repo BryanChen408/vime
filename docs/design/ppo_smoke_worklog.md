@@ -80,4 +80,22 @@
     - F-PPO-2 Lock fix **已在 LIVE**(rollout.py:395 num_cpus=0)。
     - A1(layout 加 critic placement + 删 "does not support critic" raise + A3 critic save 分目录)= `/home/docker/ppo_adapt_dev/A1-A3_placement_critic.patch`(非 git 格式,手工应用 placement_group.py:171/180/276)。
   - **下一步**:应用 A1 → 跑 smoke3(RESOURCE_LAYOUT=resource_layout_actor_domain2.yaml,对齐 GRPO 配置+PPO)。避 EI0013 后若仍卡 → 才是 F-PPO-3 offload 真问题,再 py-spy。**注:route-b 是 doc 标注"需用户协调"的深水项;已授权"较大改动",继续推进。**
-- 观察待填 →
+- **[19:41 · ✅ route-b 生效 · F-PPO-2 已解]**(smoke3)
+  - **actor 真钉 8-15 同 HCCS 域**、rollout 4-7(placement_group.py:133 逐 bundle 证实);A1 layout critic placement 生效、无 "does not support critic" raise。
+  - **dist-init WORLD_SIZE=8(8/8)** —— F-PPO-2 step1 Lock fix(num_cpus=0)生效,无 7/8 抢占。
+  - **EI0013=0**(smoke2 同期 6min 已崩;smoke3 过关)—— 同域训练 collective 避开跨域 RoCE。critic value reinit 触发。
+  - **待验(下一判别点 update_weights ~19:47)**:weight-sync=actor 8-15↔rollout 4-7 跨域(会否 EI0013?)+ F-PPO-3 offload(会否 smoke1 那种引擎不服务?)。注:vLLM worker 19:37 有 decorators.py:321 WARNING traceback(疑良性,待观察)。
+- **[19:47 · 🎯 F-PPO-3 根因完全定位 + 单机 PPO 功能测试总结]**
+  - **smoke3 判别铁定**:route-b(干净 layout,EI0013 已解、dist-init 8/8)**仍 148+ traces=0、504** → "引擎不服务"是真 F-PPO-3,非 position/config confound。
+  - **py-spy(pre-kill,干净)**:EngineCore + TP workers 全 **IDLE**(EngineCore `queue.get`、worker `shm_broadcast dequeue`),**非 HCCL 死锁**;API server 在 uvloop 事件循环。→ 引擎健康但收不到请求。
+  - **根因铁证**:`/pause`=1 但 `/resume`=**0**(GRPO 是 46/44 配对);update_weights 窗口有 **`ray.exceptions.ActorUnavailableError: RpcError: Socket closed (rpc_code 14)`**。→ **offload 权重同步期间 rollout 引擎 Ray actor RPC socket 断了 → 打断 pause→resume → 引擎永久停在 abort-pause 态 → 504 → 全 traces=0 → rollout 攒不出 → 卡死。** GRPO 无 offload、RPC 稳定,故正常。
+  - **修复方向(深水,待用户拍板)**:①resume(continue_generation)放 finally/加重试,pause 后必 resume;②查 offload 的 reconnect_rollout_engines(每 update_weights connect/disconnect HCCL 组)为何断 rollout 引擎的 Ray RPC;③abort→keep 模式(但那是 option-3 设计)。
+
+  ### ★ 单机 PPO 功能测试总结(截至 2026-07-15 19:47)
+  | 项 | 结论 |
+  |---|---|
+  | **F-PPO-1** chunk-lmhead 掐 critic value head | ✅ gate 生效(init 不崩、critic value head reinit [1,2048] 正确) |
+  | **F-PPO-2** 单机跨域 EI0013 | ✅ **route-b 解决**:A1(layout critic 共卡,已应用+提交)+ `resource_layout_actor_domain2.yaml`(actor 钉 8-15 同域)→ dist-init 8/8、EI0013=0 |
+  | **F-PPO-3** offload 权重同步后引擎不服务 | 🔴 **真 blocker,根因=pause 无 resume(ActorUnavailableError 断 RPC)**,已精确定位,修复待拍板 |
+  | OOM 修复 | ✅ 携带正常(smoke 全程 expandable 2/2) |
+  - **净结果**:PPO 端到端在单机跑通了 init/critic/EI0013,**唯一剩 F-PPO-3(offload×rollout-RPC)一个精确 blocker**。三 smoke run 全停,卡空,polar 未动。
