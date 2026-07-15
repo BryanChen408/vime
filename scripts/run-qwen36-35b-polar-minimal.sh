@@ -101,7 +101,9 @@ CKPT_ARGS=(
    --save-interval 10
    --no-save-optim
    --megatron-to-hf-mode raw
-   --optimization-level 0
+   # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
+   #   的 dummy-TE 桩 + NPU 融合算子);默认 0 = 现 proven-healthy 态。opt2 是 blast-radius 项,须验 token-faith+GDN。
+   --optimization-level "$([ "${FEAT_OPT2:-0}" = "1" ] && echo 2 || echo 0)"
 )
 
 TOPO_ARGS=(
@@ -222,19 +224,49 @@ MISC_ARGS=(
 # ─── 特性开关(默认全 OFF = baseline 逐位不变)───
 [ "${FEAT_ASYNC_SCHED:-0}" = "1" ] && VLLM_ARGS+=(--vllm-async-scheduling)
 EP_ON=0
-if [ "${FEAT_ROLLOUT_EP:-0}" = "1" ] || [ "${FEAT_FLASHCOMM1:-0}" = "1" ]; then
-   VLLM_ARGS+=(--vllm-enable-expert-parallel); EP_ON=1     # FlashComm1 硬需 rollout EP
+# FEAT_CROSS_DP_EP=1:跨 DP EP —— DP(external-LB)+ EP 同开,EP world=dp×tp。vLLM 自动 flatten
+#   ep_size=dp×tp(config.py:1179/1202),FusedMoE loader 按 dp×tp 分片(复用已验 c04b1dea4,无需新补丁)。
+#   硬需 FEAT_DP_EXTERNAL_LB=1(否则只是引擎内 EP);建议同开 FEAT_BALANCE_SCHED(防跨 DP EP batch 拖尾,§20)。
+if [ "${FEAT_ROLLOUT_EP:-0}" = "1" ] || [ "${FEAT_FLASHCOMM1:-0}" = "1" ] || [ "${FEAT_CROSS_DP_EP:-0}" = "1" ]; then
+   VLLM_ARGS+=(--vllm-enable-expert-parallel); EP_ON=1     # FlashComm1 硬需 rollout EP;CROSS_DP_EP 也需
+fi
+if [ "${FEAT_CROSS_DP_EP:-0}" = "1" ]; then
+   [ "${FEAT_DP_EXTERNAL_LB:-0}" = "1" ] || { echo "[cross-dp-ep][FATAL] 需同开 FEAT_DP_EXTERNAL_LB=1(EP world=dp×tp 依赖 DP 先到位)" >&2; exit 1; }
+   [ "${FEAT_BALANCE_SCHED:-0}" = "1" ] || echo "[cross-dp-ep][WARN] 建议同开 FEAT_BALANCE_SCHED=1(防跨 DP EP batch 不均拖尾,§20)" >&2
 fi
 [ "${FEAT_FLASHCOMM1:-0}" = "1" ] && export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
 [ "${FEAT_PREFIX_CACHE:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-prefix-caching --vllm-enable-chunked-prefill)   # align 模式硬依赖 chunked-prefill
+# FEAT_DP_EXTERNAL_LB=1:vLLM 原生 external-LB 分布式 DP —— 每引擎 = 一个 DP rank,各自 API server + 前置 LB。
+#   **DP 组大小由 layout 的 rollout.vllm_dp_size 唯一决定**(arguments.py 消费 + 校验 == 引擎数);脚本只置模式
+#   开关。--data-parallel-external-lb 经 _forward_vllm_cli_args 自动带到 vllm serve;per-rank
+#   --data-parallel-rank/-address/-rpc-port 由 vime 运行时分配(rollout.py #3)。默认 OFF = baseline 逐位不变。
+if [ "${FEAT_DP_EXTERNAL_LB:-0}" = "1" ]; then
+   if [ "${FEAT_LB_PROXY:-0}" != "1" ]; then
+      echo "[dp-extlb][FATAL] external-LB DP 需前置 LB 分发各 rank API server,请同开 FEAT_LB_PROXY=1" >&2; exit 1
+   fi
+   VLLM_ARGS+=(--vllm-data-parallel-external-lb)
+fi
 # 多特性各自贡献 additional-config 顶层键 → 合并成单个 JSON(否则重复 flag 后者覆盖前者)
 ADDCFG_PARTS=()
 [ "${FEAT_MULTISTREAM_SHARED_EXPERT:-0}" = "1" ] && ADDCFG_PARTS+=('"multistream_overlap_shared_expert":true')
 [ "${FEAT_STATIC_KERNEL:-0}" = "1" ] && ADDCFG_PARTS+=('"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":true}')
+# FEAT_BALANCE_SCHED=1:跨 DP rank 均衡调度(§20)——每 engine step 后 all_gather 各 rank 运行请求数,
+#   最忙副本打满时本副本停接 WAITING,防跨 DP EP batch 不均拖尾。DP-only:dp_size=1 时是无害 no-op;
+#   与 PD 分离(kv_producer/consumer)互斥(vllm-ascend 会 raise),纯 DP(kv_transfer_config=None)✅。
+#   纯调度层、理论不破 token-faith(§20.4)。建议随 FEAT_DP_EXTERNAL_LB 一起开。
+[ "${FEAT_BALANCE_SCHED:-0}" = "1" ] && ADDCFG_PARTS+=('"enable_balance_scheduling":true')
 [ "${#ADDCFG_PARTS[@]}" -gt 0 ] && VLLM_ARGS+=(--vllm-additional-config "{$(IFS=,; echo "${ADDCFG_PARTS[*]}")}")
 [ "${FEAT_HCCL_AIV:-0}" = "1" ] && export HCCL_OP_EXPANSION_MODE=AIV
 [ "${REPRO_DETERMINISTIC:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-deterministic-inference)
-echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0}"
+# [vime 2026-07-15 EXPERIMENTAL] FEAT_TRAIN_EXPANDABLE=1:把 expandable_segments forward 进训练 actor
+#   (ray actor 不继承父 env,必须经 --train-env-vars)。这是 OOM 所在的 88 训练侧,不碰 vLLM/CaMem/assert。
+#   默认 0 = 不变。与 vLLM 侧的 VIME_VLLM_KEEP_EXPANDABLE 独立。
+[ "${FEAT_TRAIN_EXPANDABLE:-0}" = "1" ] && PERF_ARGS+=(--train-env-vars "{\"PYTORCH_NPU_ALLOC_CONF\":\"${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}\"}")
+# [vime 2026-07-15 B] FEAT_OPT2=1:对齐 slime 开 opt-level 2 + moe-permute-fusion(NPU 融合算子省 unfused
+#   MoE permute 的中间张量 + workspace)。opt-level 值在上面数组处按 FEAT_OPT2 切;此处补 --moe-permute-fusion。
+#   前置已验:torch_npu 2.10.0 有 npu_moe_token_permute_with_routing_map。须验:model init 不崩 + token-faith + GDN。
+[ "${FEAT_OPT2:-0}" = "1" ] && PERF_ARGS+=(--moe-permute-fusion)
+echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
 
 # ─── Ray(单机 NNODES=1 走 head 分支)+ 启动 ───
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
