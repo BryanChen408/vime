@@ -23,4 +23,42 @@
 <!-- 按时间追加:每次动作、观察、bug、修复、commit -->
 
 ### [启动] 2026-07-15 — 迭代 1
-- 建本日志。摸 git 状态 + polar 健康。
+- 建本日志。git=feature/lb-proxy,17 脏改动。
+- **脏树按语义 4 提交**(工作树已干净):
+  - `05a64456` feat(dp): external-LB DP + 跨DP EP + 单测 + 设计文档
+  - `e48a4aa1` fix(oom): reserved ratchet 冻死修复(每步 empty_cache)+ NPU 显存探针
+  - `9496e427` chore(scripts): polar-minimal 特性开关 + start.sh
+  - `6102a33b` feat(ppo): 单机 PPO 适配(F-PPO-1 gate + 重 fork PPO 脚本 + 本日志)
+- polar :8080 LISTEN ✓(无需 hostctl 重启);hostctl 通道 `/home/docker/polar_e2e/` 备用。
+- 卡 4-15 空闲(GRPO 已停)。
+
+### [Run-A] 2026-07-15 — PPO 冒烟(NUM_ROLLOUT=4,单机 position 路径)
+- RUN_ID=`qwen36_polar_ppo_smoke1`,log=`/home/docker/logs/train_qwen36_polar_ppo_smoke1.log`
+- 命令(后台):
+  ```
+  CURRENT_IP=80.48.5.88 MASTER_ADDR=80.48.5.88 NNODES=1 NPUS_PER_NODE=12 \
+  RUN_ID=qwen36_polar_ppo_smoke1 QWEN36_CHUNK_LMHEAD=1 \
+  FEAT_TRAIN_EXPANDABLE=1 VIME_EMPTY_CACHE_PER_STEP=1 VIME_MEM_PROBE=1 FEAT_LB_PROXY=1 \
+  NUM_CRITIC_ONLY_STEPS=0 ROLLOUT_BATCH_SIZE=2 N_SAMPLES_PER_PROMPT=2 GLOBAL_BATCH_SIZE=4 \
+  NUM_ROLLOUT=4 ROLLOUT_MAX_RESPONSE_LEN=8192 MAX_TOKENS_PER_GPU=32768 \
+  SAVE=/workspace/Qwen3.6-35B-A3B_vime_ppo_smoke bash scripts/run-qwen36-35b-polar-ppo.sh
+  ```
+- 冒烟提速:response_len 降到 8192(功能验证不需 32k);其余对齐生产(chunk-lmhead/OOM 三件套/lb-proxy)。
+- 盯:①model init 不崩(F-PPO-1 gate 生效)②offload/wake + HCCL churn 穿过不崩/不卡(F-PPO-3)③critic value [T,1] ④policy/value 双 loss 有限 ⑤跨 3-4 步稳定 + 无 OOM。
+- **[17:30 观察 · init 通过]**
+  - 全 rank post-init:expandable=2/2、exp_reserved=27.99(OOM 修复携带 OK);model init **没崩**(F-PPO-1 gate 未破坏 init)。
+  - ✅ **critic value head 正确**:`model.py:187 reinitialize critic output_layer.weight checkpoint=(248320,2048) runtime=(1,2048)`([repeated 7x]=8 critic rank)→ critic backbone 从 ref_load 载入 + 标量头 (1,2048) + reinit 生效(A4 + model_provider 链路验证)。
+  - vLLM rollout 引擎起(/update_weights route、V1 engine v0.21.0、TP=4);无 Traceback/EI00/OOM。
+  - 待验:初始权重同步(首次 HCCL churn)→ rollout perf → 首步 [MEM-EMPTY](F-PPO-1 真实验证点 get_values [T,1] + offload/wake churn + 双 loss)。
+- **[并行预读 · 首步风险路径 map]**(趁 rollout 慢,提前读好便于 Monitor 一响即时判读)
+  - **F-PPO-1 断言点** = `loss.py:545 assert logits_chunk.size(-1)==1`(在 `get_values`)。gate 失效→critic 拿 hidden `[R,2048]`→此处崩(Monitor `size(-1)` 抓)。首步 get_values 不崩 = F-PPO-1 通过。
+  - **critic reinit 正确**:`model.py:200 weight.data.normal_(0,0.02)+bias.zero_()`。
+  - **F-PPO-3 进程组重建(D1)基本 de-risk**:`monkey_patch_torch_dist`(actor.py:64)早于 model init(:136)装;Megatron(parallel_state.py:236)+ MindSpeed CP ulysses/ring(model_parallel_utils.py:52/102/113/157/160)全走 `torch.distributed.new_group`→全被 ReloadableProcessGroup 包→offload/wake 全可 destroy+reload。**残留低风险**:reload 只还原 ranks+backend、不还原 `pg_options`(nccl_comm_cfgs)→ CP ring 重建成默认 options。若首次 offload/wake 崩,查 pg_options / 绕过 new_group 的组,而非机制缺失。
+  - DP 提交语法复验:rollout/arguments/vllm_engine/update_weight py_compile ✓。
+- **[18:35 · 🔴 BUG 确认 · F-PPO-3 offload 权重同步死锁 vLLM 引擎]**
+  - **现象**:67min 一个 rollout 都没 accept;**7395 个 polar session 全 `traces=0`**(no usable trace→dummy);vLLM **0 个生成请求**(`POST /v1/chat/completions`=0)。
+  - **定位**:直接打 :8001 与直连引擎 :15000 **都 504 Gateway Timeout**;vLLM 引擎进程活着但**最后一条日志停在 17:35:14**(初始 update_weights 那刻),之后 1 小时零日志零响应 → **引擎在初始 offload 权重同步时死锁冻住**。
+  - **PPO 特有(非 polar/环境)**:同 polar 上最近 3 个 GRPO run(092134/144301/150552)全正常(vLLM 收 11389/458/1812 真实请求、traces=0≈0)。排除"权重加载失败"红鲱鱼(GRPO 有 13562 个同样良性 warning 仍跑到 perf21)。
+  - **根因方向**:PPO 的 `update_weights` 走 `reconnect_rollout_engines=True`(offload+use_critic+!colocate)→ `wake→connect_rollout_engines→broadcast→sleep(disconnect_rollout_engines+destroy_process_groups)`;疑似 sleep 的 disconnect/destroy 把 vLLM 引擎留在权重广播的 HCCL collective 挂起态(或广播 weight 数不匹配 vLLM 等待)。GRPO 无 offload/不 disconnect,故引擎一直响应。**这正是 doc 标注的 F-PPO-3 "最高风险·从未验证" regime。**
+  - **动作**:停死锁 run(ray stop,polar 未动);调查 weight-sync connect/disconnect/broadcast 代码找最小 fix。**注**:冒烟设的 ROLLOUT_MAX_RESPONSE_LEN=8192 非本 bug 因(截断仅 1 次)。
+- 观察待填 →
