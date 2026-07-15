@@ -47,6 +47,13 @@ def apply_chunked_lm_head_patch():
             or not getattr(self, "post_process", False)
             or labels is not None
             or getattr(self, "mtp_process", False)  # MTP 路径不走(它在 postprocess 内算 loss)
+            # [F-PPO-1] critic 的 value head 是 hidden→1 的 output_layer,别旁路它。旁路只为躲 LM-head
+            # 的 [T, vocab] logits OOM;value 出 [T, 1],材料化本就 trivial、永不 OOM。若旁路,
+            # critic get_values 会收到 hidden [T, h] 而非 values [T, 1] → get_responses 断言
+            # size(-1)==1 崩。critic 与 actor 共用此 class-level patch,故按输出维区分:
+            # output_layer.weight.shape[0]==1 ⇒ value head(LM head 是 vocab/tp≫1,新条件恒 False)。
+            or getattr(getattr(self, "output_layer", None), "weight", None) is None
+            or self.output_layer.weight.shape[0] == 1
         ):
             return _orig_forward(self, *args, **kwargs)
 
