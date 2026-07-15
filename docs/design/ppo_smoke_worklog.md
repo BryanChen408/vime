@@ -61,4 +61,10 @@
   - **PPO 特有(非 polar/环境)**:同 polar 上最近 3 个 GRPO run(092134/144301/150552)全正常(vLLM 收 11389/458/1812 真实请求、traces=0≈0)。排除"权重加载失败"红鲱鱼(GRPO 有 13562 个同样良性 warning 仍跑到 perf21)。
   - **根因方向**:PPO 的 `update_weights` 走 `reconnect_rollout_engines=True`(offload+use_critic+!colocate)→ `wake→connect_rollout_engines→broadcast→sleep(disconnect_rollout_engines+destroy_process_groups)`;疑似 sleep 的 disconnect/destroy 把 vLLM 引擎留在权重广播的 HCCL collective 挂起态(或广播 weight 数不匹配 vLLM 等待)。GRPO 无 offload/不 disconnect,故引擎一直响应。**这正是 doc 标注的 F-PPO-3 "最高风险·从未验证" regime。**
   - **动作**:停死锁 run(ray stop,polar 未动);调查 weight-sync connect/disconnect/broadcast 代码找最小 fix。**注**:冒烟设的 ROLLOUT_MAX_RESPONSE_LEN=8192 非本 bug 因(截断仅 1 次)。
+- **[19:05 · 诊断精修(纠错)]**
+  - **纠正**:actor 侧 `disconnect_rollout_engines_from_distributed`(update_weight_from_distributed.py:459)是 **no-op**(docstring:trainer 侧 comm 故意不拆避 CUDA-graph self-deadlock、engine 侧 destroy 也 no-op)→ **"disconnect 拆组挂死"假设作废**。
+  - **精确定位**:直连 :15000 也 504 → 排除 polar/version-span,是 **vLLM EngineCore 自身死锁**。时序:收权重(17:35:14)→ update_weights 完成 197.9s(POST /update_weights 返回=engine handler 完成)→ resume(continue_generation)→ **之后在生成时 EngineCore 卡死**。
+  - **已排除**:disconnect(no-op)/polar+version-span(直连也 504)/8192 截断(仅1)/abort(仅1)/权重加载 warning(GRPO 13562 个仍正常)。
+  - **唯一 PPO 差异 = offload**(actor wake/sleep 环绕 update_weights);但每个具体假设 GRPO 都相同却正常 → 确切失效点静态看不出。
+  - **下一步 = py-spy 挂死引擎**:死锁在**初始 update_weights**(launch 后 ~11min,早于长 rollout),复现快。重启 smoke2 → 等初始 update_weights 后引擎 504 → py-spy EngineCore + actor rank0 拿确切死锁栈 → 定点 fix 或带栈升级给用户。
 - 观察待填 →
