@@ -137,6 +137,12 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
+        # [MEM PROBE] 模型/优化器一加载完就打 expandable 归属:重启后 ~1-2min 即可判定
+        #   expandable_segments 是否**真激活**(env 进程里有但 torch_npu 可能静默回退 False)、
+        #   以及是否覆盖 MindSpeed 全部分配——不必等首轮 rollout 到 train_one_step。
+        from vime.backends.megatron_utils.model import _log_npu_expandable
+        _log_npu_expandable("post-init", -1)
+
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
             from megatron.core.utils import get_model_config

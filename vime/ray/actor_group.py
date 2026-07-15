@@ -62,7 +62,7 @@ class RayTrainGroup:
         # Forward diagnostic env vars that the training actor code checks directly
         # via os.environ (e.g. VIME_SAVE_TIS_LOGPROBS for train-inference consistency
         # logprob capture).  Ray actors do NOT inherit the parent environment.
-        for _ev in ("VIME_SAVE_TIS_LOGPROBS",):
+        for _ev in ("VIME_SAVE_TIS_LOGPROBS", "VIME_MEM_PROBE", "VIME_EMPTY_CACHE_PER_STEP"):
             if _ev in os.environ:
                 env_vars[_ev] = os.environ[_ev]
 

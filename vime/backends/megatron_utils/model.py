@@ -39,6 +39,73 @@ from .model_provider import get_model_provider_func
 logger = logging.getLogger(__name__)
 
 
+def _log_npu_mem(tag: str, step_id: int = -1) -> None:
+    """[MEM PROBE] 实时 NPU 显存打印(env VIME_MEM_PROBE=1 开,默认关=零开销)。
+
+    区分 torch 池内 vs 池外(非-torch)占用——即 OOM 消息里 `total - torch_reserved` 那 ~24 GiB
+    torch 看不见的部分(CANN/HCCL/MindSpeed AscendC 算子 workspace)。
+      non_torch = device_used - torch_reserved
+    若 non_torch 很大 → 真·非-torch 占用(随 seq 长涨);若 device_used ≈ torch_reserved 却 OOM →
+    是设备级碎片(torch 要不到连续块),而非池外占用。用 mem_get_info() 拿设备级 free/total。
+    """
+    if os.environ.get("VIME_MEM_PROBE", "0") != "1":
+        return
+    npu = getattr(torch, "npu", None)
+    if npu is None or not npu.is_available():
+        return
+    try:
+        g = 1024 ** 3
+        reserved = npu.memory_reserved() / g
+        free, total = npu.mem_get_info()
+        dev_used = (total - free) / g
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        logger.info(
+            "[MEM %s] step=%d rank=%d torch_alloc=%.2f torch_reserved=%.2f max_reserved=%.2f "
+            "device_used=%.2f non_torch=%.2f dev_free=%.2f total=%.2f GiB",
+            tag, step_id, rank, npu.memory_allocated() / g, reserved, npu.max_memory_reserved() / g,
+            dev_used, dev_used - reserved, free / g, total / g,
+        )
+    except Exception as e:  # a probe must never break training
+        logger.warning("[MEM %s] probe failed: %s", tag, e)
+
+
+def _log_npu_expandable(tag: str, step_id: int = -1) -> None:
+    """[MEM PROBE] 证明 expandable_segments 是否**真激活**、覆盖范围、以及缓存空闲可归还比例。
+
+    torch_npu 的 memory_snapshot() 逐 segment 暴露 `is_expandable`——env 设了但静默回退成 False
+    (torch_npu 有 "expandable_segments setting failure, now change to False" 的兜底)时,这里会
+    如实显示 expandable=0。回答三问:
+      (1) PYTORCH_NPU_ALLOC_CONF 到底有没有进 actor 进程(env 转发验证);
+      (2) 分配器里多少 segment 真的 is_expandable(生效 + 覆盖 MindSpeed 全部分配的验证);
+      (3) cached_free(reserved−active)里多少落在**完全空闲**段 = empty_cache 保底能归还的量,
+          剩余是卡在半用段里的碎片(expandable 下仍可按页 unmap,但保守下界看 fully_free)。
+    默认关(VIME_MEM_PROBE=1 开);snapshot 有开销,仅探针开时调用。
+    """
+    if os.environ.get("VIME_MEM_PROBE", "0") != "1":
+        return
+    npu = getattr(torch, "npu", None)
+    if npu is None or not npu.is_available():
+        return
+    try:
+        g = 1024 ** 3
+        conf = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "<unset>")
+        segs = npu.memory_snapshot()
+        n = len(segs)
+        n_exp = sum(1 for s in segs if s.get("is_expandable"))
+        exp_res = sum(s["total_size"] for s in segs if s.get("is_expandable")) / g
+        leg_res = sum(s["total_size"] for s in segs if not s.get("is_expandable")) / g
+        cached_free = sum(s["total_size"] - s["active_size"] for s in segs) / g
+        fully_free = sum(s["total_size"] for s in segs if s["active_size"] == 0) / g
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        logger.info(
+            "[MEM-EXP %s] step=%d rank=%d conf=%s segs=%d expandable=%d exp_reserved=%.2f "
+            "legacy_reserved=%.2f cached_free=%.2f fully_free_seg=%.2f GiB",
+            tag, step_id, rank, conf, n, n_exp, exp_res, leg_res, cached_free, fully_free,
+        )
+    except Exception as e:  # a probe must never break training
+        logger.warning("[MEM-EXP %s] probe failed: %s", tag, e)
+
+
 def _disable_tqdm_for_non_main_rank() -> bool:
     return not (
         mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -552,6 +619,7 @@ def train_one_step(
 
             output_tensor = model(**forward_kwargs)
 
+        _log_npu_mem("post-fwd-mb", step_id)  # [MEM PROBE] per-microbatch post-fwd; prints on OOM step BEFORE bwd → catches the 24 GiB
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
@@ -559,6 +627,7 @@ def train_one_step(
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
+    _log_npu_mem("pre-fwd-bwd", step_id)  # [MEM PROBE] baseline before this step's fwd+bwd
     losses_reduced = forward_backward_func(
         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
         data_iterator=data_iterator,
@@ -569,6 +638,7 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    _log_npu_mem("post-fwd-bwd", step_id)  # [MEM PROBE] after fwd+bwd (won't print if bwd OOMs)
 
     valid_step = True
     grad_norm = float("nan")
@@ -603,6 +673,25 @@ def train_one_step(
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
+
+    # [vime 2026-07-15] 每步后把 caching allocator 的空闲缓存池(reserved−allocated)归还设备。
+    #   异步 pipeline 下 trainer 训完等 rollout 时会死攥 ~15 GiB 已释放但没归还的缓存 → dev_free 贴 OOM
+    #   边缘;expandable 只解碎片、不归还缓存池,归还须显式 empty_cache(对齐 slime 观察到的步间回落)。
+    #   gated:VIME_EMPTY_CACHE_PER_STEP=1 开(默认关=字节不变)。代价=下步需重新 reserve,轻微开销。
+    if os.environ.get("VIME_EMPTY_CACHE_PER_STEP", "0") == "1":
+        _npu = getattr(torch, "npu", None)
+        if _npu is not None and _npu.is_available():
+            # 前后实测:reserved 掉多少 = 缓存实际归还量;配 [MEM-EXP] 看是否 expandable 真生效。
+            _g = 1024 ** 3
+            _log_npu_expandable("pre-empty", step_id)
+            _res_before = _npu.memory_reserved() / _g
+            _npu.empty_cache()
+            _res_after = _npu.memory_reserved() / _g
+            if os.environ.get("VIME_MEM_PROBE", "0") == "1":
+                logger.info(
+                    "[MEM-EMPTY] reserved_before=%.2f reserved_after=%.2f reclaimed=%.2f GiB",
+                    _res_before, _res_after, _res_before - _res_after,
+                )
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         loss_reduced = reduce_train_step_metrics(
