@@ -93,6 +93,19 @@ def test_SKIPPED_DESTS_orchestrator_parallel_dims(args_mod):
 
 
 @pytest.mark.unit
+def test_SKIPPED_DESTS_keeps_external_lb_forwardable(args_mod):
+    """#1 / §19.2: --vllm-data-parallel-external-lb needs NO explicit definition — vllm's own
+    ``--data-parallel-external-lb`` auto-prefixes via add_vllm_arguments (verified: parses to
+    vllm_data_parallel_external_lb, default False). This regression guard fails loudly if
+    someone adds it to SKIPPED_DESTS, which would silently make the whole DP feature un-toggleable.
+    """
+    assert "data_parallel_external_lb" not in args_mod.SKIPPED_DESTS
+    assert "data_parallel_rank" not in args_mod.SKIPPED_DESTS
+    assert "data_parallel_address" not in args_mod.SKIPPED_DESTS
+    assert "data_parallel_rpc_port" not in args_mod.SKIPPED_DESTS
+
+
+@pytest.mark.unit
 def test_wrapper_strips_deprecated_kwargs_when_forwarding(args_mod):
     parser = argparse.ArgumentParser(add_help=False)
     wrap = args_mod._make_add_argument_wrapper(parser.add_argument)

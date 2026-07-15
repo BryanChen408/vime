@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 def _begin_vllm_weight_update_session(rollout_engines: Sequence[ActorHandle]) -> None:
     if dist.get_rank() == 0:
         logger.info("vLLM weight update: start_weight_update")
+        # [WSYNC-DBG 2026-07-14] 定位 2-engine "already active":打印 start 派发的引擎句柄身份。
+        #   [A,A](两个相同 handle)→ 列表有重复;[A,B](两个不同)→ 看 actor 侧 http_base 是否相同。
+        logger.info("[WSYNC-DBG] _begin start dispatch n=%d handles=%r",
+                    len(rollout_engines), [str(e) for e in rollout_engines])
         ray.get([engine.start_weight_update.remote(is_checkpoint_format=True) for engine in rollout_engines])
     dist.barrier(group=get_gloo_group())
 
@@ -392,6 +396,9 @@ def connect_rollout_engines_from_distributed(
     #   §18.2 演算)。非 external-LB(单引擎 / ③副本 dp_size=1 → data_parallel_index=0)走
     #   cumulative,与今天字节一致。默认 OFF,须与 P1 拉起(§19 #2/#3/#4)一起启用。
     external_lb = getattr(args, "vllm_data_parallel_external_lb", False)
+    # [WSYNC-DBG 2026-07-14] init 路径的引擎列表 —— 与 _begin(start 路径)的列表逐一对比,应完全一致。
+    logger.info("[WSYNC-DBG] init_group dispatch n=%d external_lb=%s world_size=%s handles=%r",
+                len(rollout_engines), external_lb, world_size, [str(e) for e in rollout_engines])
     refs = [
         engine.init_weights_update_group.remote(
             master_address=master_address,

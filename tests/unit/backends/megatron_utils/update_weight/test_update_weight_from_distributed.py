@@ -540,6 +540,34 @@ def test_connect_rollout_engines_always_uses_vllm_trainer_init(upw, monkeypatch)
     assert seen[0]["world_size"] == 4  # 1 + (1 + 2)
     assert len(engines[0].init_weights_update_group.calls) == 1
     assert len(engines[1].init_weights_update_group.calls) == 1
+    # #5 / §18.2: OFF (no external_lb) → cumulative offsets. counts [1,2] → cumulative [0,1,3]
+    #   → rank_offset = cumulative[i]+1 = [1, 2]. (Locks the offset VALUES, not just call count —
+    #   the prior "假覆盖" gap: this test asserted world_size/count but never the offset itself.)
+    assert engines[0].init_weights_update_group.calls[0].kwargs["rank_offset"] == 1
+    assert engines[1].init_weights_update_group.calls[0].kwargs["rank_offset"] == 2
+
+
+@pytest.mark.unit
+def test_connect_rollout_engines_external_lb_uses_uniform_offset(upw, monkeypatch):
+    # #5 / §18.2 铁律: external-LB → every DP-group member gets rank_offset=1 (uniform). The
+    #   vllm-ascend hccl client's data_parallel_index already carries the intra-group DP offset
+    #   (hccl_engine.py:74-78), so cumulative here would double-count → rank overflow. world_size
+    #   is unchanged by the offset choice (still Σ counts + 1).
+    args = type("Args", (), {"rollout_num_gpus_per_engine": 2, "vllm_data_parallel_external_lb": True})()
+    engines = [RecordingEngine(), RecordingEngine()]
+    seen: list[dict] = []
+    _patch_nccl_on_module(monkeypatch, upw, init_seen=seen)
+    monkeypatch.setattr(upw.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(upw.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(upw.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(upw.ray, "get", lambda refs: refs)
+    monkeypatch.setattr(upw.ray._private.services, "get_node_ip_address", lambda: "127.0.0.1")
+
+    upw.connect_rollout_engines_from_distributed(args, "g", engines, engine_gpu_counts=[2, 2])
+
+    assert engines[0].init_weights_update_group.calls[0].kwargs["rank_offset"] == 1
+    assert engines[1].init_weights_update_group.calls[0].kwargs["rank_offset"] == 1
+    assert seen[0]["world_size"] == 5  # 1 + (2 + 2), unchanged by uniform offset
 
 
 @pytest.mark.unit

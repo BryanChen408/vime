@@ -1803,8 +1803,37 @@ def vime_validate_args(args):
         args.actor_num_nodes = layout.actor_num_nodes
         args.actor_num_gpus_per_node = layout.actor_num_gpus_per_node
         args.rollout_num_gpus = layout.rollout_num_gpus
+        # [2026-07-14 fix] 对齐 slime arguments.py:1559 —— 端口分配器用 num_gpus_per_node 算
+        #   num_engines_per_node = num_gpus_per_node // gpus_per_engine。异构拓扑(train 8 卡 / infer 16 卡)
+        #   下必须取 **infer 节点** 的每节点卡数(rollout_num_gpus_per_node=16),否则停在默认 8 →
+        #   8//8=1,把共处 .52 的多个 rollout 引擎误判成不同节点 → 端口都从 base_port(15000)重起 →
+        #   两引擎撞同一端口(实测 --dp-ports 15000 15000)→ _http_base 相同 → start_weight_update
+        #   打到同一 API server → "already active" 500。vime 移植 slime layout loader 时漏了这行。
+        args.num_gpus_per_node = layout.rollout_num_gpus_per_node
         if layout.rollout_num_gpus_per_engine:
             args.rollout_num_gpus_per_engine = layout.rollout_num_gpus_per_engine
+        # [DP #6 P1 / external-LB] DP 组大小 = layout 的 vllm_dp_size,**唯一来源**(替代早期从
+        #   shell ROLLOUT_NUM_GPUS/PER_ENGINE 反推的双源做法)。vllm_validate_args(其后调,:260)会把
+        #   它同步到 args.vllm_dp_size。**仅 external_lb 时消费**——否则非-DP 基线会误吃 dp>1,OFF 分支
+        #   tp=gpus//(pp*dp) 把 TP 打小,毁基线。external-LB 下每个 engine slot = 一个 DP rank,故
+        #   vllm_dp_size 必须 == 引擎数(rollout_num_gpus // rollout_num_gpus_per_engine),不一致报错。
+        if getattr(args, "vllm_data_parallel_external_lb", False):
+            _n_engines = (
+                args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+                if args.rollout_num_gpus_per_engine
+                else 0
+            )
+            if not layout.vllm_dp_size:
+                raise ValueError(
+                    "external-LB DP (--vllm-data-parallel-external-lb) requires rollout.vllm_dp_size in the "
+                    f"resource layout (expected {_n_engines} = rollout_num_gpus // rollout_num_gpus_per_engine)"
+                )
+            if layout.vllm_dp_size != _n_engines:
+                raise ValueError(
+                    f"external-LB DP: rollout.vllm_dp_size ({layout.vllm_dp_size}) must equal the number of rollout "
+                    f"engines ({args.rollout_num_gpus} // {args.rollout_num_gpus_per_engine} = {_n_engines})"
+                )
+            args.vllm_data_parallel_size = layout.vllm_dp_size
 
     if args.debug_rollout_only:
         if args.colocate and (not args.rollout_num_gpus):

@@ -672,3 +672,71 @@ def test_control_plane_methods_noop_on_headless_worker(vllm_engine, monkeypatch)
     assert vllm_engine.update_weights_from_distributed(["w"], [torch.float32], [[1]], "g") is None
     assert vllm_engine.release_memory_occupation() is None
     assert vllm_engine.resume_memory_occupation() is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [DP #2/#4 P1 / external-LB] tests — lock the external-LB branches; OFF path stays
+# byte-identical. See docs/design/vime_vllm_native_dp_rollout.md §19.2 + §21.2.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _dp_args(vllm_args, *, external_lb, dp=2, pp=1):
+    vllm_args.vllm_pipeline_parallel_size = pp
+    vllm_args.vllm_data_parallel_size = dp
+    vllm_args.vllm_dp_size = dp
+    vllm_args.vllm_data_parallel_external_lb = external_lb
+    return vllm_args
+
+
+@pytest.mark.unit
+def test_resolve_parallel_sizes_external_lb_skips_dp_divisor(vllm_args):
+    # #2: external-LB → each slot IS one DP rank, so tp must NOT divide by dp:
+    #     tp = gpus_per_engine // pp. Contrast the OFF (internal-DP) semantics below.
+    _dp_args(vllm_args, external_lb=True, dp=2, pp=1)
+    tp, pp = mod._resolve_vllm_parallel_sizes(vllm_args, gpus_per_engine=4)
+    assert (tp, pp) == (4, 1)
+
+
+@pytest.mark.unit
+def test_resolve_parallel_sizes_off_still_divides_by_dp(vllm_args):
+    # OFF branch must be unchanged: tp = gpus // (pp * dp). Same inputs as above → different tp.
+    _dp_args(vllm_args, external_lb=False, dp=2, pp=1)
+    tp, pp = mod._resolve_vllm_parallel_sizes(vllm_args, gpus_per_engine=4)
+    assert (tp, pp) == (2, 1)
+
+
+@pytest.mark.unit
+def test_build_vllm_cmd_external_lb_injects_per_rank_dp_flags(vllm_args):
+    # #4: external-LB injects ONLY the per-rank flags (size/-external-lb auto-forward via
+    #     _forward_vllm_cli_args). Executor backend must stay mp, never external_launcher.
+    _dp_args(vllm_args, external_lb=True, dp=2, pp=1)
+    server_args = mod._compute_server_args(
+        vllm_args,
+        rank=1,
+        dist_init_addr=None,
+        host="127.0.0.1",
+        port=8000,
+        data_parallel_size=2,
+        data_parallel_rank=1,
+        data_parallel_address="80.48.5.52",
+        data_parallel_rpc_port=15002,
+    )
+    cmd, _ = mod.build_vllm_cmd_and_env(server_args)
+
+    assert cmd[cmd.index("--data-parallel-rank") + 1] == "1"
+    assert cmd[cmd.index("--data-parallel-address") + 1] == "80.48.5.52"
+    assert cmd[cmd.index("--data-parallel-rpc-port") + 1] == "15002"
+    assert cmd[cmd.index("--distributed-executor-backend") + 1] == "mp"
+    # size / external-lb are NOT injected here (they auto-forward); guard against double-add.
+    assert "--data-parallel-size" not in cmd
+    assert "--data-parallel-external-lb" not in cmd
+    assert "external_launcher" not in cmd
+
+
+@pytest.mark.unit
+def test_build_vllm_cmd_no_dp_flags_when_off(vllm_args):
+    # OFF path: no data-parallel-* flags at all (byte-identical to today).
+    _dp_args(vllm_args, external_lb=False, dp=1, pp=1)
+    server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+    cmd, _ = mod.build_vllm_cmd_and_env(server_args)
+    assert not any(isinstance(c, str) and c.startswith("--data-parallel-") for c in cmd)

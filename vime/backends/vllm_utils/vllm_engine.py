@@ -372,7 +372,10 @@ def build_vllm_subprocess_env(server_args: dict[str, Any]) -> dict[str, str]:
     # MUST NOT have expandable_segments under sleep mode — its CaMemAllocator
     # memory pool asserts against it (camem.py). Letting vllm-ascend's own
     # sleep-mode-aware logic (platform.py) re-add it only when sleep mode is off.
-    env.pop("PYTORCH_NPU_ALLOC_CONF", None)
+    # [vime 2026-07-15 EXPERIMENTAL] 默认仍 pop(安全)。VIME_VLLM_KEEP_EXPANDABLE=1 时保留,
+    #   让 vLLM 子进程也带 expandable(须配合 camem.py 已放开 assert;sleep/wake 可能出错,仅实验)。
+    if os.environ.get("VIME_VLLM_KEEP_EXPANDABLE", "0") != "1":
+        env.pop("PYTORCH_NPU_ALLOC_CONF", None)
     env.pop("TORCHDYNAMO_DISABLE", None)
     # torch.compile; the vLLM subprocess MUST have torch.compile enabled for
     # cudagraph capture.
@@ -429,6 +432,21 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
             (server_args["master_addr"], server_args["master_port"]),
             args,
         )
+
+    # [DP #4 P1 / external-LB] Inject the per-rank DP flags. --data-parallel-size and
+    #   --data-parallel-external-lb are auto-forwarded by _forward_vllm_cli_args (user set them
+    #   via --vllm-*), so only rank/address/rpc-port — which are per-slot and runtime-allocated
+    #   (§19 #3) — are added here. executor-backend MUST stay mp: external_launcher would make
+    #   vLLM multiply world_size by dp and break the weight-sync rank math (§18.1). OFF path
+    #   (data_parallel_rank None) adds nothing → byte-identical.
+    if getattr(args, "vllm_data_parallel_external_lb", False) and server_args.get("data_parallel_rank") is not None:
+        cmd += ["--data-parallel-rank", str(server_args["data_parallel_rank"])]
+        if server_args.get("data_parallel_address") is not None:
+            cmd += ["--data-parallel-address", str(server_args["data_parallel_address"])]
+        if server_args.get("data_parallel_rpc_port") is not None:
+            cmd += ["--data-parallel-rpc-port", str(server_args["data_parallel_rpc_port"])]
+        if not _user_overrode(args, "vllm_distributed_executor_backend") and "--distributed-executor-backend" not in cmd:
+            cmd += ["--distributed-executor-backend", "mp"]
 
     if getattr(args, "fp16", False):
         cmd += ["--dtype", "float16"]
@@ -592,6 +610,10 @@ class VLLMEngine(RayActor):
         disaggregation_bootstrap_port=None,
         router_ip=None,
         router_port=None,
+        data_parallel_size=None,
+        data_parallel_rank=None,
+        data_parallel_address=None,
+        data_parallel_rpc_port=None,
     ):
         # ``nccl_port`` is allocated by rollout but unused by vLLM (rendezvous uses ``dist_init_addr``).
         del nccl_port
@@ -610,6 +632,10 @@ class VLLMEngine(RayActor):
             vllm_overrides=self.vllm_overrides,
             num_gpus_per_engine=gpus_per_engine,
             disaggregation_bootstrap_port=disaggregation_bootstrap_port,
+            data_parallel_size=data_parallel_size,
+            data_parallel_rank=data_parallel_rank,
+            data_parallel_address=data_parallel_address,
+            data_parallel_rpc_port=data_parallel_rpc_port,
         )
         self._topology = self._server_args["topology"]
         self.node_rank = self._topology.node_rank
@@ -951,6 +977,12 @@ class VLLMEngine(RayActor):
 
     def start_weight_update(self, is_checkpoint_format: bool = False) -> dict:
         """``POST /start_weight_update`` — signals vLLM to enter IPC weight-update mode."""
+        # [WSYNC-DBG 2026-07-14] 定位 2-engine "already active":打印本引擎身份 + 实际要 POST 的 http_base。
+        #   两条日志 http_base 相同但 rank 不同 → B 的 base 指到了 A 的端口(2-DP 端口分配 bug);
+        #   rank/base 两次完全相同 → _begin 列表里有重复句柄。ray 前缀里的 (VLLMEngine pid=) 即哪个引擎。
+        logger.info("[WSYNC-DBG] start_weight_update entry rank=%s node_rank=%s http_base=%s ckpt=%s",
+                    getattr(self, "rank", "?"), getattr(self, "node_rank", "?"),
+                    self._http_base(), is_checkpoint_format)
         return self._make_request("start_weight_update", {"is_checkpoint_format": is_checkpoint_format})
 
     def finish_weight_update(self) -> dict:
@@ -1135,6 +1167,10 @@ def _compute_server_args(
     vllm_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
     disaggregation_bootstrap_port: int | None = None,
+    data_parallel_size: int | None = None,
+    data_parallel_rank: int | None = None,
+    data_parallel_address: str | None = None,
+    data_parallel_rpc_port: int | None = None,
 ) -> dict[str, Any]:
     """Build per-actor launch config for ``launch_server_process``."""
     gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
@@ -1174,6 +1210,11 @@ def _compute_server_args(
         "dp_size": _get_vllm_dp_size(args),
         "seed": getattr(args, "seed", 1234) + rank,
         "disaggregation_bootstrap_port": disaggregation_bootstrap_port,
+        # [DP #3/#4 P1 / external-LB] per-rank DP wiring (None on non-external-LB path).
+        "data_parallel_size": data_parallel_size,
+        "data_parallel_rank": data_parallel_rank,
+        "data_parallel_address": data_parallel_address,
+        "data_parallel_rpc_port": data_parallel_rpc_port,
     }
     _apply_vllm_overrides(args, server_args, vllm_overrides, rank)
     return server_args
