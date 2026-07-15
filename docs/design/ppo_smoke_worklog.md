@@ -67,4 +67,17 @@
   - **已排除**:disconnect(no-op)/polar+version-span(直连也 504)/8192 截断(仅1)/abort(仅1)/权重加载 warning(GRPO 13562 个仍正常)。
   - **唯一 PPO 差异 = offload**(actor wake/sleep 环绕 update_weights);但每个具体假设 GRPO 都相同却正常 → 确切失效点静态看不出。
   - **下一步 = py-spy 挂死引擎**:死锁在**初始 update_weights**(launch 后 ~11min,早于长 rollout),复现快。重启 smoke2 → 等初始 update_weights 后引擎 504 → py-spy EngineCore + actor rank0 拿确切死锁栈 → 定点 fix 或带栈升级给用户。
+- **[19:15 · py-spy 反转 + 发现我的 confound]**
+  - **py-spy 挂死引擎(2309736,post-kill 仍活)**:主线程栈 = `run_busy_loop→_process_input_queue→queue.get()` → **引擎 IDLE 等请求,不是 HCCL 死锁**;TP worker(2309781-84)全在 `do_poll`(等消息,非 NPU ioctl)。→ 真相是**请求根本没到引擎**,不是"引擎在 collective 挂死"。之前"EngineCore 死锁"判断**过头了**。
+  - **🔑 我的 confound**:smoke1 **丢了工作正常的 GRPO run(092134)的一堆 vLLM FEAT 开关**——GRPO 全开 `FEAT_FLASHCOMM1/PREFIX_CACHE/MULTISTREAM_SHARED_EXPERT/STATIC_KERNEL/HCCL_AIV`,我 smoke1 一个没设,还把 response_len 降 8192。→ **"深锁"很可能是我配置发散(掉了 GRPO 必需的 vLLM 特性/additional-config)导致引擎路由异常,未必 F-PPO-3。**
+  - **动作**:smoke2 = **完全对齐 GRPO 092134 配置(全 FEAT 开关 + response_len 默认)+ 只加 PPO args**,隔离 confound。若仍卡在 update_weights → 真 PPO/offload,再 py-spy(pre-kill)拿真栈;若通 → 我的配置发散是因。**教训:测新特性务必只改一个变量,别顺手动一堆配置(呼应 [[vime-validation-run-full-command]])。**
+- **[19:25 · 🔴 smoke2 撞 F-PPO-2 EI0013(跨域 RoCE)· 单机 PPO 真 blocker 定性]**
+  - smoke2(对齐 GRPO 全配置+PPO)**6min 撞 EI0013**:rank3 device **7↔11** 跨 HCCS 域 RoCE CQE 错误 → HCCL watchdog terminated → 崩。
+  - **拓扑实证**(npu-smi topo):HCCS 两域 = **0-7** 和 **8-15**(域间 PIX/PHB/SYS 非 HCCS→RoCE)。position 路径 actor 落 **4-11 横跨两域** → 训练 collective(rank3=card7 ↔ rank7=card11)跨域 → EI0013。
+  - **两 smoke 失败统一定性**:smoke1(无 HCCL_AIV)引擎无请求 + smoke2(有 HCCL_AIV)EI0013 —— **都是"单机 position 路径 PPO"的 doc 预测 blocker(F-PPO-2 跨域/F-PPO-3 offload)**;HCCL_AIV × 跨域是 EI0013 触发器。**工作正常的 GRPO 用 explicit layout 钉卡不跨域,我用 position 路径才跨域。**
+  - **✅ 修复 = route-b(doc 明定,前置就绪)**:
+    - `resource_layout_actor_domain2.yaml` 已存在(**actor 钉 8-15 同域→免 EI0013**,rollout 4-7,polar 0-3,专为此建)。
+    - F-PPO-2 Lock fix **已在 LIVE**(rollout.py:395 num_cpus=0)。
+    - A1(layout 加 critic placement + 删 "does not support critic" raise + A3 critic save 分目录)= `/home/docker/ppo_adapt_dev/A1-A3_placement_critic.patch`(非 git 格式,手工应用 placement_group.py:171/180/276)。
+  - **下一步**:应用 A1 → 跑 smoke3(RESOURCE_LAYOUT=resource_layout_actor_domain2.yaml,对齐 GRPO 配置+PPO)。避 EI0013 后若仍卡 → 才是 F-PPO-3 offload 真问题,再 py-spy。**注:route-b 是 doc 标注"需用户协调"的深水项;已授权"较大改动",继续推进。**
 - 观察待填 →

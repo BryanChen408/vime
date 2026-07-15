@@ -168,7 +168,9 @@ def _create_placement_groups_from_layout(args):
 
     return {
         "actor": (pg, actor_bundle_indices, actor_gpu_ids),
-        "critic": None,
+        # [F-PPO-2 步骤2/A1] critic 复用 actor bundle(共卡 offload 时分),与位置路径
+        # result["critic"]=result["actor"] 及官方 slime 的 actor/critic 共卡切换一致。
+        "critic": (pg, actor_bundle_indices, actor_gpu_ids) if args.use_critic else None,
         "rollout": (pg, rollout_bundle_indices, rollout_gpu_ids),
     }
 
@@ -177,8 +179,8 @@ def create_placement_groups(args):
     """Create placement groups for actor, critic, and rollout engines."""
 
     if getattr(args, "resource_layout_spec", None) is not None:
-        if args.use_critic:
-            raise ValueError("--resource-layout does not support critic placement in the first implementation")
+        # [F-PPO-2 步骤2/A1] critic 与 actor 共卡(见 _create_placement_groups_from_layout),
+        # 故 layout 路径支持 critic;原 "does not support critic" 限制取消。
         return _create_placement_groups_from_layout(args)
 
     num_gpus = 0
