@@ -1078,6 +1078,7 @@ class VLLMEngine(RayActor):
         they return finish_reason="abort" (consumer marks the session ERROR — slime
         option-3, prevents mixed-weight trajectories reaching the trainer). See
         docs/design/vime_abort_on_weight_sync.md. Returns the ``requests.Response``."""
+        logger.info("[WSYNC-DBG] pause_generation called node_rank=%s", self.node_rank)
         if self.node_rank != 0:
             return None
         response = requests.post(
@@ -1091,10 +1092,12 @@ class VLLMEngine(RayActor):
 
     def continue_generation(self):
         """``POST /resume`` to continue generation after pause."""
+        logger.info("[WSYNC-DBG] continue_generation called node_rank=%s", self.node_rank)
         if self.node_rank != 0:
             return None
         response = requests.post(f"{self._http_base()}/resume", json={}, timeout=120)
         response.raise_for_status()
+        logger.info("[WSYNC-DBG] continue_generation POST /resume -> %s", response.status_code)
         return response
 
     def post_process_weights(

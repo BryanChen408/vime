@@ -99,3 +99,9 @@
   | **F-PPO-3** offload 权重同步后引擎不服务 | 🔴 **真 blocker,根因=pause 无 resume(ActorUnavailableError 断 RPC)**,已精确定位,修复待拍板 |
   | OOM 修复 | ✅ 携带正常(smoke 全程 expandable 2/2) |
   - **净结果**:PPO 端到端在单机跑通了 init/critic/EI0013,**唯一剩 F-PPO-3(offload×rollout-RPC)一个精确 blocker**。三 smoke run 全停,卡空,polar 未动。
+
+- **[2026-07-16 02:00 · ⚠️ smoke4 加 [WSYNC-DBG] 日志——推翻上面的 F-PPO-3 根因,上表 F-PPO-3 行作废]**
+  - 给 pause/resume 加日志(`update_weight_from_distributed.py` + `vllm_engine.py`)后 smoke4 实测:`PAUSE done returns=[Response 200]` + `post-broadcast barrier rank=0`(rank 没变)+ `RESUME block 进了` + `RESUME done returns=[Response 200]` → **pause 和 resume 都 200 OK 正常执行**。复查 smoke3 `/resume`=**1**(早先 `POST /resume` grep 漏了)。`ActorUnavailableError` 栈在 `train_async.py:43 ray.get(rollout_data_future)`,**不在 resume 路径**。
+  - **→ "pause 无 resume 卡死"是错的(grep 假象)。教训:别用弱 grep 下强根因,要运行时日志。**
+  - **F-PPO-3 真相(两个 offload bug,均未 root-cause)**:①**引擎 pause(abort)+resume 都 200 后仍不服务**(:8001/:15000 都 504,请求到不了 EngineCore,py-spy 证引擎 IDLE);②**训练侧崩** `Megatron param_and_grad_buffer.py:908 reset(): tensor data not allocated` + Ascend `ERR01003`(offload 释放 grad buffer 后 reset 拿到未分配 tensor)。
+  - **下一步**:分开查 (a) vLLM abort-pause+resume 后 API server→EngineCore 为何不通;(b) offload grad buffer 生命周期(NPUWeightOffloader 漏 onload grad buffer?)。别急下单一根因。smoke4 已崩停,卡空 polar 未动。

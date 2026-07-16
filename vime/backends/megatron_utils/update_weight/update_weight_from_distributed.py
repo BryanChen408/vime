@@ -146,8 +146,12 @@ class UpdateWeightFromDistributed:
         """
         self.weight_version += 1
 
+        logger.info("[WSYNC-DBG] update_weights ENTRY rank=%d is_pp_src=%s wv=%d n_engines=%d",
+                    dist.get_rank(), self._is_pp_src_rank, self.weight_version, len(self.rollout_engines))
         if dist.get_rank() == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+            logger.info("[WSYNC-DBG] PAUSE block (rank0): pausing %d engines", len(self.rollout_engines))
+            _pr = ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+            logger.info("[WSYNC-DBG] PAUSE done returns=%r", _pr)
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
             # int4/fp4 pre_process
@@ -169,7 +173,9 @@ class UpdateWeightFromDistributed:
             _end_vllm_weight_update_session(self.rollout_engines)
 
         dist.barrier(group=get_gloo_group())
-        if dist.get_rank() == 0:
+        _rk = dist.get_rank()
+        logger.info("[WSYNC-DBG] post-broadcast barrier passed rank=%d (RESUME if ==0)", _rk)
+        if _rk == 0:
             # int4/fp4 post_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
                 post_process_weights(
@@ -180,10 +186,17 @@ class UpdateWeightFromDistributed:
             # version-span guard: still paused (before resume) -> tell the polar gateway the
             # new weight version so post-resume turns are stamped v_{N+1} and continuations
             # that would span this update are rejected.  Best-effort, never blocks resume.
-            from vime_bridge.version_span import push_policy_version_to_gateway
-            push_policy_version_to_gateway(self.args, self.weight_version)
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            # [WSYNC-DBG] wrap so a push failure can't silently skip resume (also logs it).
+            try:
+                from vime_bridge.version_span import push_policy_version_to_gateway
+                push_policy_version_to_gateway(self.args, self.weight_version)
+            except Exception as _e:
+                logger.warning("[WSYNC-DBG] push_policy_version raised (non-fatal): %r", _e)
+            logger.info("[WSYNC-DBG] RESUME block (rank0): calling continue_generation on %d engines", len(self.rollout_engines))
+            _cr = ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            logger.info("[WSYNC-DBG] RESUME done returns=%r", _cr)
         dist.barrier(group=get_gloo_group())
+        logger.info("[WSYNC-DBG] update_weights EXIT rank=%d", _rk)
 
     def _send_weights(self, pbar: tqdm | None) -> None:
         """
