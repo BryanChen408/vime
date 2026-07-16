@@ -251,7 +251,7 @@ def _get_model_provider_func(
     return model_provider
 
 
-def wrap_model_provider_with_freeze(original_provider, args):
+def wrap_model_provider_with_freeze(original_provider, args, role="actor"):
     def wrapped_provider(
         pre_process=True,
         post_process=True,
@@ -267,7 +267,7 @@ def wrap_model_provider_with_freeze(original_provider, args):
                 provider_kwargs[key] = kwargs.get(key, None)
 
         model = original_provider(**provider_kwargs)
-        freeze_model_params(model, args)
+        freeze_model_params(model, args, role)
 
         return model
 
@@ -275,21 +275,30 @@ def wrap_model_provider_with_freeze(original_provider, args):
 
 
 def get_model_provider_func(args, role="actor"):
-    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args)
+    return wrap_model_provider_with_freeze(_get_model_provider_func(args, role), args, role)
 
 
-def freeze_model_params(model: GPTModel, args: argparse.Namespace):
-    if getattr(args, "only_train_params_name_list", None):
+def freeze_model_params(model: GPTModel, args: argparse.Namespace, role: str = "actor"):
+    # 全局列表(--only-train-params-name-list / --freeze-params-name-list)对所有 role 生效,保持原语义。
+    # [SAO C8 frozen-attention critic] critic 额外支持 critic 专用列表 —— 仅作用 critic、绝不误冻 actor。
+    #   critic 专用列表存在时,对 critic 覆盖全局列表(便于 actor 全量训、critic 只训 MoE)。
+    only_train = getattr(args, "only_train_params_name_list", None)
+    freeze = getattr(args, "freeze_params_name_list", None)
+    if role == "critic":
+        only_train = getattr(args, "critic_only_train_params_name_list", None) or only_train
+        freeze = getattr(args, "critic_freeze_params_name_list", None) or freeze
+
+    if only_train:
         for name, param in model.named_parameters():
             param.requires_grad = False
-            for pattern in args.only_train_params_name_list:
+            for pattern in only_train:
                 if re.search(pattern, name):
                     param.requires_grad = True
                     break
 
-    if getattr(args, "freeze_params_name_list", None):
+    if freeze:
         for name, param in model.named_parameters():
-            for pattern in args.freeze_params_name_list:
+            for pattern in freeze:
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break

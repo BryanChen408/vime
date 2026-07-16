@@ -215,6 +215,22 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                         """,
             )
             parser.add_argument(
+                "--critic-only-train-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="""[SAO C8] 仅 critic:只训匹配这些正则的参数、其余冻结(actor 不受影响)。
+                        frozen-attention critic 例: --critic-only-train-params-name-list mlp.experts output_layer""",
+            )
+            parser.add_argument(
+                "--critic-freeze-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="""[SAO C8] 仅 critic:冻结匹配这些正则的参数、其余可训(actor 不受影响)。
+                        frozen-attention critic 例: --critic-freeze-params-name-list self_attention""",
+            )
+            parser.add_argument(
                 "--allgather-cp",
                 action="store_true",
                 default=False,
@@ -796,6 +812,13 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=0,
                 help="Number of initial rollout steps that train critic only; set >= num_rollout for critic-only runs",
+            )
+            parser.add_argument(
+                "--critic-update-steps",
+                type=int,
+                default=1,
+                help="[SAO C12a] Faster Value Update: 每个 rollout 做 K 次 critic 更新 / 1 次 policy 更新"
+                "(K>1 让 value 更快跟上 policy;SAO K=2)。⚠️ K>1 会使 critic 的 LR 调度器步进 K 倍快。",
             )
             parser.add_argument(
                 "--megatron-config-path",
@@ -1983,3 +2006,8 @@ def vime_validate_args(args):
 
     if args.only_train_params_name_list and args.freeze_params_name_list:
         raise ValueError("You can only specify ONE of: --only-train-params-name-list, or --freeze-params-name-list.")
+
+    if getattr(args, "critic_only_train_params_name_list", None) and getattr(args, "critic_freeze_params_name_list", None):
+        raise ValueError(
+            "You can only specify ONE of: --critic-only-train-params-name-list, or --critic-freeze-params-name-list."
+        )

@@ -4,17 +4,19 @@
 # 详见 docs/design/ppo_adaptation_findings.md §7/§9 与 ppo_adaptation_review_tables.md。
 # ⚠️ fork 自 run-qwen36-35b-polar-ppo.sh @ 2026-07-16;PPO 脚本演进就要从它重新 fork(只差 header + RUN_ID + PPO_ARGS 块)。
 #
-# 路线 A(本脚本默认开,均为配置项/零代码,SAO_* env 可关):
+# 路线 A(本脚本默认开,配置项/零代码,SAO_* env 可关):
 #   - value 预训练 warmup:--num-critic-only-steps(治价值冷启动;SAO=10)          [C9]
 #   - off-policy = DIS:--use-tis(vime TIS 乘法 = π_θ/π_rollout,等价 SAO DIS)    [C11]
 #   - 非对称裁剪:--eps-clip 0.8 / --eps-clip-high 3.0(code 任务那套;数学用 0.3/5.0) [C11/Q-10]
 #   - token 级 loss 归一:--calculate-per-token-loss(SAO_TOKEN_LEVEL_LOSS 可关)     [F-PPO-8]
 #     ⚠️ 首跑先确认该 flag 形态无误(reset_arg 定义),再长跑。
+#   - Faster Value Update K=2:--critic-update-steps 2(**已实现** train_async K 循环;默认开)[C12a]
 #
-# 未开(需先写代码 / 待决策,见 §9 遗留;首跑不带):
-#   - Frozen-Attention critic [C8/Q-3]:vime 冻结开关(--only-train-params-name-list)是**全局**的,
-#     直接用会连 actor 一起冻坏 → 必须先把它 role 化(只作用 critic)才能启用。
-#   - Faster Value Update K=2 [C12a]:train_async.py 需加 K 循环(~15 行)。
+# 已实现但默认关(需占卡确认后开):
+#   - Frozen-Attention critic [C8]:冻结开关已 role 化(--critic-only/freeze-params-name-list 仅作用 critic,
+#     不误冻 actor);SAO_FROZEN_ATTN_CRITIC=1 启用。⚠️ Q-1/Q-2:regex 命中需一次 named_parameters() dump 确认。
+#
+# 未开(需继续写代码 / 待决策,见 §9 遗留):
 #   - critic 独立 LR [Q-12]:走 --megatron-config-path role=critic YAML(SAO=5e-6)。
 #   - Skip-Obs GAE + length-adaptive λ [C10/C12b]:改 GAE(路线 B,二期);λ=1 时 skip-obs 是 no-op,须成对上。
 #
@@ -205,6 +207,9 @@ PPO_ARGS=(
    --eps-clip ${EPS_CLIP:-0.8}
    --eps-clip-high ${EPS_CLIP_HIGH:-3.0}
    # ↑ [SAO/C11/Q-10] 非对称裁剪:code 任务 0.8/3.0(数学任务 0.3/5.0);env 可覆盖。
+   --critic-update-steps ${SAO_CRITIC_UPDATE_STEPS:-2}
+   # ↑ [SAO/C12a] Faster Value Update K=2(已实现:train_async.py K 循环)。K=1 回退原逻辑。
+   #   ⚠️ Q-4:K>1 使 critic 的 LR 调度器步进 K 倍快 → 盯 value LR/loss 曲线。
    # 注:--lr(OPTIMIZER_ARGS,继承 PPO=2e-6)actor/critic 共用;SAO critic 常需独立更大 LR(Q-12,走 megatron-config YAML)。
 )
 # [SAO/F-PPO-8] token 级 |M| 归一(over 全 batch 可训 token,非 per-seq);SAO_TOKEN_LEVEL_LOSS=0 关。
@@ -212,9 +217,14 @@ PPO_ARGS=(
 [ "${SAO_TOKEN_LEVEL_LOSS:-1}" = "1" ] && PPO_ARGS+=(--calculate-per-token-loss)
 # [SAO/C11 可选 · Q-9] icepop 掩码替 vanilla clamp / 忠实 DIS 单-mask:选择机制待确认,默认不加。
 #   忠实版走 --custom-tis-function-path 指向 icepop 实现。
-# [SAO/C8 未启用 · Q-3] Frozen-Attention critic:--only-train-params-name-list 是全局的,
-#   直接加会连 actor 一起冻坏 → 需先把冻结改成 role 感知(只作用 critic)再启用。
-# [SAO/C12a 未启用] Faster Value Update K=2:需 train_async.py 加 K 循环(~15 行)。
+# [SAO/C8 已实现] Frozen-Attention critic:冻结开关已 role 化(--critic-only-train-params-name-list /
+#   --critic-freeze-params-name-list 仅作用 critic,不误冻 actor)。默认 OFF;SAO_FROZEN_ATTN_CRITIC=1 启用。
+#   ⚠️ Q-1/Q-2:命中需一次占卡 named_parameters() dump 确认。默认 pattern = "mlp.experts output_layer"
+#   = 只训 MoE routed experts + value head,冻全部 attention(GDN+full)/norm/embedding/router/shared_expert。
+if [ "${SAO_FROZEN_ATTN_CRITIC:-0}" = "1" ]; then
+   PPO_ARGS+=(--critic-only-train-params-name-list ${SAO_CRITIC_TRAIN_PATTERNS:-mlp.experts output_layer})
+fi
+# [SAO/C12a] Faster Value Update K=2 已在 PPO_ARGS(--critic-update-steps ${SAO_CRITIC_UPDATE_STEPS:-2})。
 
 OPTIMIZER_ARGS=(
    --optimizer adam

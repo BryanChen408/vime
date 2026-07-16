@@ -48,7 +48,15 @@ def train(args):
 
         if args.use_critic:
             actor_trains_this_step = rollout_id >= args.num_critic_only_steps
+            # [SAO C12a] Faster Value Update: 每个 rollout 做 K=critic_update_steps 次 critic 更新 / 1 次 policy。
+            #   每次 async_train = 一步 value 梯度(train_critic: 算 V→GAE→一步 value_loss);末次返回的 values 供
+            #   actor 当 old-values/advantage baseline。中间步 ray.get 串行化(每步读上一步更新后的 critic 权重)。
+            #   K=1 与原逻辑逐位一致。⚠️ Q-4: async_train 也步进 critic 的 LR 调度器 → K 次=critic LR 表走 K 倍快,
+            #   可能中途衰减到低值;首跑盯 value LR/loss 曲线(见 docs/design/ppo_adaptation_findings.md §9 Q-4)。
             value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+            for _ in range(max(1, args.critic_update_steps) - 1):
+                ray.get(value_refs)
+                value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if actor_trains_this_step:
                 ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
             else:
