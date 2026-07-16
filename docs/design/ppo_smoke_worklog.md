@@ -105,3 +105,17 @@
   - **→ "pause 无 resume 卡死"是错的(grep 假象)。教训:别用弱 grep 下强根因,要运行时日志。**
   - **F-PPO-3 真相(两个 offload bug,均未 root-cause)**:①**引擎 pause(abort)+resume 都 200 后仍不服务**(:8001/:15000 都 504,请求到不了 EngineCore,py-spy 证引擎 IDLE);②**训练侧崩** `Megatron param_and_grad_buffer.py:908 reset(): tensor data not allocated` + Ascend `ERR01003`(offload 释放 grad buffer 后 reset 拿到未分配 tensor)。
   - **下一步**:分开查 (a) vLLM abort-pause+resume 后 API server→EngineCore 为何不通;(b) offload grad buffer 生命周期(NPUWeightOffloader 漏 onload grad buffer?)。别急下单一根因。smoke4 已崩停,卡空 polar 未动。
+
+- **[2026-07-16 03:15 · ✅ 走 Option A:NPU offload 对齐 slime,用 torch_memory_saver 换掉手搓 NPUWeightOffloader — F-PPO-3 bug② 从根上消除]**
+  - **溯源 NPUWeightOffloader**:非 vime/slime 上游,是同事 ZhihaoSun `75293035 "tmp for gogogo"`(2026-06-26)手搓的 NPU 替代品。slime 官方(含 slime-ascend)PPO 路径**统一用 torch_memory_saver**(actor.py:180/189 无条件 pause/resume,NPU 也走),**无此 bug**。vime 本就继承了 slime 的 torch_memory_saver + PPO 支持,同事只是**额外**加了 NPU 分支替代品。
+  - **bug② 根因**:`NPUWeightOffloader._release_ddp_buffers` 把 `grad_data` storage `resize_(0)` + `p.main_grad=None`,但 `onload()` **只还 param.data、从不还 grad buffer** → 下个训练 step `param_and_grad_buffer.reset()` 撞未分配 tensor(`ERR01003`)。Python 层 storage resize **本质上无法 transparent**(resize 回来是新分配,main_grad view 全悬空)。
+  - **验证优先(用户要求"先实测再改")**:
+    - **差点误判**:首测报 `LD_PRELOAD cannot be preloaded` → 差点断言"torch_memory_saver 昇腾不可用、同事手搓有理"。**实为我路径 bug**——.so 在 `site-packages/` 顶层,我多套了一层 `torch_memory_saver/` 子目录。slime 用 `dirname(dirname(__file__))` 两层才对。
+    - **正确路径重测(card 0):`.so 的 NEEDED 含 `libascendcl.so`** = 昇腾专用 build,hook `aclrtMalloc`;`with region(enable_cpu_backup=True)` 内分配 4.3G → `pause()` 释放 4.3G HBM(60.73→65.03G)→ `resume()` **数据完整**(x.sum 1073741824→1073741824,match=True)。**torch_memory_saver 在本 A2 机确实能 offload/还原**,allocator 层做、不破坏 grad_data view → 无 bug②。
+  - **改动(4 处,全镜像 slime,commit 见下)**:
+    1. `actor.py` imports:`from torch_memory_saver import torch_memory_saver`(无条件,删 NPUWeightOffloader import + is_npu gate)。
+    2. `actor.py` offloader-init:删 NPUWeightOffloader/storage_resize_hook 分支,统一 slime 式 `memory_margin_bytes` 设置。
+    3. `actor.py` sleep/wake:`torch_memory_saver.pause()/resume()` 无条件(对齐 slime:180/189)。
+    4. `actor_group.py`:offload_train 块拆 `and not is_npu()`(NPU 也挂 LD_PRELOAD hook + TMS_INIT_ENABLE + CPU_BACKUP)。
+    - NPUWeightOffloader/storage_resize_hook 现已 **orphaned 无人 import**;`npu_weight_offloader.py` 保留(死代码,低风险不删),已清我加的 ② 探针。
+  - **下一步 = smoke5**:GRPO 对齐配置(FLASHCOMM1/PREFIX_CACHE/MULTISTREAM/STATIC_KERNEL,不带 HCCL_AIV,domain2 layout)冲 update_weights→真生成→[MEM-EMPTY]→首步+3步。重点看:bug② 是否消失(offload/onload 不再崩 reset);bug①(引擎 pause+resume 后不服务)是否随 offloader 换掉一并消失(① 探针在 vllm scheduler set_pause_state 仍在,观察 pause/resume 时序+有无 PAUSED_NEW 饿死)。

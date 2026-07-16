@@ -66,7 +66,7 @@ class RayTrainGroup:
             if _ev in os.environ:
                 env_vars[_ev] = os.environ[_ev]
 
-        if self.args.offload_train and self.args.train_backend == "megatron" and not is_npu():
+        if self.args.offload_train and self.args.train_backend == "megatron":
             import torch_memory_saver
 
             for path in [

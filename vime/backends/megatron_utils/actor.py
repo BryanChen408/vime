@@ -13,10 +13,7 @@ if is_npu():
     import mindspeed.megatron_adaptor
     from mindspeed.megatron_adaptor import repatch
 from megatron.core import mpu
-if is_npu():
-    from vime.utils.npu_weight_offloader import NPUWeightOffloader
-else:
-    from torch_memory_saver import torch_memory_saver
+from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
 
 from vime.ray.train_actor import TrainRayActor
@@ -109,29 +106,14 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier(group=get_gloo_group())
 
         if args.offload_train:
-            if is_npu():
-                # [storage-resize] The default NPUWeightOffloader._release_ddp_buffers swaps
-                # param_data/grad_data to empty tensors, but Megatron's bucket views still alias
-                # the original storage, so the DDP flat buffers (grad_data fp32 + param_data bf16,
-                # ~13GB/rank for 9B/TP4) are NOT freed — leaving too little HBM for vLLM's KV
-                # cache on wake_up (OOM: aclrtMallocPhysical at camem_allocator). Patch
-                # offload/onload to verl-style storage().resize_(0) which frees the shared storage.
-                # Done here, NOT via the npu_mem_offload sitecustomize hook, because importing the
-                # hook at interpreter startup runs before torch is ready ("operator prims::sum does
-                # not exist"); by this point torch/torch_npu are fully initialised.
-                # B-mode (param+grad) via env VIME_OFFLOAD_PARAM_BUFFER=1.
-                try:
-                    import storage_resize_hook
-
-                    storage_resize_hook.patch_offloader(NPUWeightOffloader)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"storage-resize patch unavailable, using default offloader: {e}")
-                self._weight_offloader = NPUWeightOffloader()
-                logger.info("NPU weight offloader initialised for rollout-stage actor offload")
-            else:
-                if (x := args.train_memory_margin_bytes) > 0:
-                    logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
-                    torch_memory_saver.memory_margin_bytes = x
+            # Align with slime: torch_memory_saver works on NPU too (Ascend-patched
+            # hook .so links libascendcl → hooks aclrtMalloc; pause() frees the
+            # interesting-region HBM, resume() restores it transparently at the
+            # allocator level, so DDP grad_data views survive intact — verified
+            # 4.3G freed + data-match on this A2 machine).
+            if (x := args.train_memory_margin_bytes) > 0:
+                logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
+                torch_memory_saver.memory_margin_bytes = x
 
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
@@ -242,10 +224,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
-        if is_npu():
-            self._weight_offloader.offload(self.model)
-        else:
-            torch_memory_saver.pause()
+        torch_memory_saver.pause()
 
         print_memory("after offload model")
 
@@ -254,10 +233,7 @@ class MegatronTrainRayActor(TrainRayActor):
         assert self.args.offload_train
         print_memory("before wake_up model")
 
-        if is_npu():
-            self._weight_offloader.onload(self.model)
-        else:
-            torch_memory_saver.resume()
+        torch_memory_saver.resume()
 
         clear_memory()
         reload_process_groups()
