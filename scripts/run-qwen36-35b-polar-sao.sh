@@ -6,7 +6,7 @@
 #
 # 路线 A(本脚本默认开,配置项/零代码,SAO_* env 可关):
 #   - value 预训练 warmup:--num-critic-only-steps(治价值冷启动;SAO=10)          [C9]
-#   - off-policy = DIS:--use-tis(vime TIS 乘法 = π_θ/π_rollout,等价 SAO DIS)    [C11]
+#   - off-policy = DIS:--use-tis(clamp 近似;SAO_DIS_MASK=1 换 icepop 掩码=忠实版)  [C11]
 #   - 非对称裁剪:--eps-clip 0.8 / --eps-clip-high 3.0(code 任务那套;数学用 0.3/5.0) [C11/Q-10]
 #   - token 级 loss 归一:--calculate-per-token-loss(SAO_TOKEN_LEVEL_LOSS 可关)     [F-PPO-8]
 #     ⚠️ 首跑先确认该 flag 形态无误(reset_arg 定义),再长跑。
@@ -213,10 +213,16 @@ PPO_ARGS=(
    # 注:--lr(OPTIMIZER_ARGS,继承 PPO=2e-6)actor/critic 共用;SAO critic 常需独立更大 LR(Q-12,走 megatron-config YAML)。
 )
 # [SAO/F-PPO-8] token 级 |M| 归一(over 全 batch 可训 token,非 per-seq);SAO_TOKEN_LEVEL_LOSS=0 关。
-#   ⚠️ 首跑先确认该 flag 形态(reset_arg 定义)无误再长跑。
+#   ✅ 已核实:Megatron 原生 store_true(裸 flag 正确);cp_utils 对 CP>1 已 chunk-aware(Q-16 设计上正确)。
 [ "${SAO_TOKEN_LEVEL_LOSS:-1}" = "1" ] && PPO_ARGS+=(--calculate-per-token-loss)
-# [SAO/C11 可选 · Q-9] icepop 掩码替 vanilla clamp / 忠实 DIS 单-mask:选择机制待确认,默认不加。
-#   忠实版走 --custom-tis-function-path 指向 icepop 实现。
+# [SAO/C11 · Q-9] DIS 掩码:--use-tis 默认走 vanilla_tis(clamp,近似);SAO 忠实版用 icepop(mask,range 外置零)。
+#   ✅ 已核实:icepop 签名与 vanilla 一致,可经 custom-tis-function-path 选(load_function 按模块路径 import)。
+#   注:--tis-clip/--tis-clip-low(默认 2.0/0)界的是 off-policy 因子 π_old/π_rollout(与 --eps-clip 界的 π_θ/π_old 分两段)。
+if [ "${SAO_DIS_MASK:-0}" = "1" ]; then
+   PPO_ARGS+=(--custom-tis-function-path vime.backends.megatron_utils.loss.icepop_function)
+fi
+[ -n "${SAO_TIS_CLIP:-}" ] && PPO_ARGS+=(--tis-clip "${SAO_TIS_CLIP}")
+[ -n "${SAO_TIS_CLIP_LOW:-}" ] && PPO_ARGS+=(--tis-clip-low "${SAO_TIS_CLIP_LOW}")
 # [SAO/C8 已实现] Frozen-Attention critic:冻结开关已 role 化(--critic-only-train-params-name-list /
 #   --critic-freeze-params-name-list 仅作用 critic,不误冻 actor)。默认 OFF;SAO_FROZEN_ATTN_CRITIC=1 启用。
 #   ⚠️ Q-1/Q-2:命中需一次占卡 named_parameters() dump 确认。默认 pattern = "mlp.experts output_layer"
