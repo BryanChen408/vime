@@ -145,7 +145,7 @@ if [ "${MATH_MODE:-0}" = "1" ]; then
       --polar-reward-key score
       --polar-task-id-template "{args.polar_run_id}-math-{rollout_id}-{sample.group_index}"
       --polar-submit-mode task_request
-      --polar-task-template "$(cat "${MATH_TASK_TEMPLATE:-${SCRIPT_DIR}/math_task_template.json}")"
+      --polar-task-template-file "${MATH_TASK_TEMPLATE:-${SCRIPT_DIR}/math_task_template.json}"
       --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
       --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
       --rollout-scheduler-mode session_pool
