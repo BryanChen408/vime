@@ -23,8 +23,7 @@
     },
     "kwargs": {
       "volumes": [
-        "operator_runtime:/opt/canonical:ro",
-        "operator_runtime/tools:/opt/workspace/agent_workdir/tools:ro"
+        "math_runtime:/opt/canonical:ro"
       ]
     }
   },
