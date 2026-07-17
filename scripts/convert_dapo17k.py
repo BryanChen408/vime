@@ -24,19 +24,21 @@ def _extract_prompt(rec: dict) -> str | None:
         v = rec.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    # verl 风格:prompt = [{"role":"user","content":...}]
+    # 消息列表(DAPO/verl 风格):prompt = [{"role":"user","content":...}]
     p = rec.get("prompt")
     if isinstance(p, list):
-        for m in reversed(p):
-            if isinstance(m, dict) and m.get("role") == "user":
-                c = m.get("content")
-                if isinstance(c, str) and c.strip():
-                    return c.strip()
+        # 优先 role=user;否则取任意含 content 的项(容错无 role)
+        users = [m.get("content") for m in p if isinstance(m, dict) and m.get("role") == "user"]
+        anys = [m.get("content") for m in p if isinstance(m, dict) and m.get("content")]
+        picks = users or anys
+        picks = [c.strip() for c in picks if isinstance(c, str) and c.strip()]
+        if picks:
+            return "\n\n".join(picks)
     return None
 
 
 def _extract_answer(rec: dict) -> str | None:
-    for k in ("answer", "ground_truth", "solution", "final_answer"):
+    for k in ("label", "answer", "ground_truth", "solution", "final_answer"):
         v = rec.get(k)
         if v is not None and str(v).strip():
             return str(v).strip()

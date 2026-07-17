@@ -21,8 +21,13 @@
 set -e
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
-# 数据:DAPO-17k 已是 prompt/label(label=整数答案,judge-only,agent 只见 prompt)
-export OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-/home/docker/datasets/dapo-math-17k.jsonl}
+# 数据:DAPO-17k 的 prompt 是消息列表 → 展平成字符串(polar instruction 要字符串);label=整数答案(judge-only)
+RAW_DAPO=${RAW_DAPO:-/home/docker/datasets/dapo-math-17k.jsonl}
+export OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-/home/docker/datasets/dapo-math-17k-vime.jsonl}
+if [ ! -f "${OPERATOR_TASK_JSONL}" ]; then
+   echo "[start_math] flatten DAPO prompt list → string → ${OPERATOR_TASK_JSONL}"
+   python3 "${SCRIPT_DIR}/convert_dapo17k.py" "${RAW_DAPO}" "${OPERATOR_TASK_JSONL}"
+fi
 export MATH_TASK_TEMPLATE=${MATH_TASK_TEMPLATE:-${SCRIPT_DIR}/math_task_template.json}
 
 # 拓扑 / 卡位(单机,rollout 4-7 / actor 8-15)

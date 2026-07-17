@@ -6,7 +6,7 @@
     "settings": {
       "max_turns": 20,
       "disallowed_tools": "AskUserQuestion CronCreate CronDelete CronList EnterPlanMode EnterWorktree ExitPlanMode ExitWorktree NotebookEdit ScheduleWakeup TaskCreate TaskGet TaskList TaskOutput TaskStop TaskUpdate TodoWrite WebFetch WebSearch",
-      "append_system_prompt": "You are solving a competition math problem. You MAY write and run Python (via the Bash tool) to compute or verify intermediate steps. Reason carefully. When finished, output the FINAL answer on its own line as \\boxed{ANSWER} where ANSWER is a single integer. Do not ask the user any questions in this non-interactive run."
+      "append_system_prompt": "You are solving a competition math problem. You MAY write and run Python (via the Bash tool) to compute or verify intermediate steps. Reason carefully, then give the final answer EXACTLY in the format requested by the problem statement (a single integer on its own line after 'Answer:'). Do not ask the user any questions in this non-interactive run."
     }
   },
   "runtime": {
