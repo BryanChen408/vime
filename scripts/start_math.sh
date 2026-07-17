@@ -7,11 +7,13 @@
 # ── 隔离契约(关键,务必看懂再改)────────────────────────────────────────
 #   本脚本【零改动】算子的 run-qwen36-35b-polar-minimal.sh 与整个 vime_bridge:
 #     · math 与 operator 走【同一条】已验证的 operator_samples 派发/推理/轨迹捕获链路;
-#     · 与 operator 的唯一差别 = 不 attach task_source(agent 只拿题面 instruction,不拿任务文件),
-#       靠把 OPERATOR_TASKS_DIR 设为一个【空白值 " "】实现:
-#         - 它非空,能穿过 minimal 脚本 :35 的 `${OPERATOR_TASKS_DIR:-默认op_tasks}`(不被替回默认);
-#         - 到 bridge 后 _optional_text(" ") → strip → None → _attach_operator_task_source 早返回;
-#         => 不传 task_source。(见 vime_bridge/rollout.py:_attach_operator_task_source)
+#     · 与 operator 的唯一差别 = 不 attach task_source(agent 只拿题面 instruction,不拿任务文件)。
+#       实现:本脚本【运行时生成】一份删掉 `--operator-tasks-dir` 那一行的临时 minimal 启动器
+#       —— 原版脚本一字不动。原因:原版无条件传 `--operator-tasks-dir "${OPERATOR_TASKS_DIR}"`
+#       且在 `${POLAR_ARGS[@]}`【unquoted】展开(:294):任何空/空白值都被词分割成 argparse
+#       语法错,任何真实目录又会让 bridge 对 math op_name 找不到 {op_name}.py 报错。删掉该行 →
+#       args.operator_tasks_dir=None(argparse default=None 可选项)→ _attach_operator_task_source
+#       早返回 → 不传 task_source。
 #     · 答案在 sample.metadata.answer(judge-only,不进 agent prompt);经 operator_profile.py:194
 #       → task_metadata.sample_metadata.answer 到 math_judge。
 #     · profile 由 polar 侧 default_operator_profile=math_npu 决定;vime 不传 profile,只发 URL。
@@ -31,8 +33,11 @@ if [ ! -f "${OPERATOR_TASK_JSONL}" ]; then
    python3 "${SCRIPT_DIR}/prep_dapo_math.py" "${RAW_DAPO}" "${OPERATOR_TASK_JSONL}"
 fi
 
-# ⭐ math 关键旁路:空白 tasks-dir → 不 attach task_source(见顶部隔离契约)。切勿设为真实目录。
-export OPERATOR_TASKS_DIR=" "
+# ⭐ math 关键旁路:生成【删掉 --operator-tasks-dir 那一行】的临时启动器(原版 minimal 一字不动,见顶部契约)
+MINIMAL="${SCRIPT_DIR}/run-qwen36-35b-polar-minimal.sh"
+MATH_LAUNCHER="$(mktemp -t run-qwen36-35b-math-XXXXXX.sh)"
+grep -v -- '--operator-tasks-dir' "${MINIMAL}" > "${MATH_LAUNCHER}"
+trap 'rm -f "${MATH_LAUNCHER}"' EXIT
 
 # ── 拓扑 / 卡位(单机,rollout 4-7 / actor 8-15)──
 export MASTER_ADDR=${MASTER_ADDR:-80.48.5.88}
@@ -50,7 +55,7 @@ MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-32768} \
 POLAR_MAX_ACTIVE_SESSIONS=${POLAR_MAX_ACTIVE_SESSIONS:-16} \
 VIME_MEM_PROBE=1 FEAT_TRAIN_EXPANDABLE=1 VIME_EMPTY_CACHE_PER_STEP=1 \
 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=1 FEAT_HCCL_AIV=1 \
-bash "${SCRIPT_DIR}/run-qwen36-35b-polar-minimal.sh"
+bash "${MATH_LAUNCHER}"
 
 # ── 看什么(判据)──────────────────────────────────────────────────────
 #   ✅ reward mean 几十步内趋势上升 + train/tis≈1 + pass@1 上升 = 管线通。
