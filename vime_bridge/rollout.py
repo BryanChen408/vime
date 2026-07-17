@@ -364,6 +364,7 @@ def _build_submission_payload(
         task_position=task_position,
     )
     if config.submit_mode == "task_request":
+        _forward_answer_to_metadata(payload, group)
         return payload
 
     first_sample = group[0]
@@ -398,6 +399,31 @@ def _build_submission_payload(
         thin["timeout_seconds"] = payload["timeout_seconds"]
     _attach_operator_task_source(thin, config)
     return thin
+
+
+def _forward_answer_to_metadata(payload: dict[str, Any], group: list[Any]) -> None:
+    """Put the sample's ground-truth answer into judge-only task metadata (for math_judge).
+
+    Leakage-safe: polar only feeds ``instruction`` to the agent; task metadata is
+    never rendered into the prompt, but IS carried into ``trajectory.metadata
+    ['task_metadata']`` for the evaluator. No-op when the sample has no answer
+    (e.g. non-math task_request tasks), so this is safe to always call.
+    """
+    if not group:
+        return
+    first_sample = group[0]
+    answer = getattr(first_sample, "label", None)
+    if answer is None:
+        sample_md = getattr(first_sample, "metadata", None) or {}
+        if isinstance(sample_md, dict):
+            answer = sample_md.get("answer")
+    if answer is None:
+        return
+    md = payload.get("metadata")
+    if not isinstance(md, dict):
+        md = {}
+    md.setdefault("answer", str(answer))
+    payload["metadata"] = md
 
 
 def _attach_operator_task_source(payload: dict[str, Any], config: PolarSlimeConfig) -> None:
