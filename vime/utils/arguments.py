@@ -669,11 +669,6 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--polar-reward-key", type=str, default=None)
             parser.add_argument("--polar-task-id-template", type=str, default="polar-slime-{rollout_id}-{sample.group_index}")
             parser.add_argument("--polar-instruction-template", type=str, default=None)
-            # task_request submit mode (non-operator agentic tasks, e.g. math): the JSON
-            # task template must include an `agent` spec; bridge renders it per sample.
-            parser.add_argument("--polar-task-template", type=json.loads, default=None)
-            parser.add_argument("--polar-task-template-file", type=str, default=None)
-            parser.add_argument("--polar-submit-mode", type=str, default=None)
             parser.add_argument("--operator-tasks-dir", type=str, default=None)
             parser.add_argument("--polar-tasks-dir", type=str, default=None)
             parser.add_argument("--rollout-max-async-level", type=int, default=None)

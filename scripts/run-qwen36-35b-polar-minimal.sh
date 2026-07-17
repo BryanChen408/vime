@@ -136,38 +136,19 @@ ROLLOUT_ARGS=(
    --rollout-seed "${ROLLOUT_SEED:-42}"
 )
 
-if [ "${MATH_MODE:-0}" = "1" ]; then
-   # 数学 agentic 管线验证:走 operator_samples(和 operator 同一条已验证派发/推理/捕获链路)。
-   #   profile 由 polar 侧 default_operator_profile=math_npu 决定(vime 不传 profile,只发 URL)。
-   #   不设 --operator-tasks-dir → 无 task_source,agent 只拿题面 instruction;答案在
-   #   sample.metadata.answer(judge-only)。
-   POLAR_ARGS=(
-      --polar-url "${POLAR_ROLLOUT_URL}"
-      --polar-run-id "${RUN_ID}"
-      --polar-reward-key score
-      --polar-task-id-template "{args.polar_run_id}-math-{rollout_id}-{sample.group_index}"
-      --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
-      --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
-      --rollout-scheduler-mode session_pool
-      --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
-      --rollout-release-on-postrun
-      --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
-   )
-else
-   POLAR_ARGS=(
-      --polar-url "${POLAR_ROLLOUT_URL}"
-      --polar-run-id "${RUN_ID}"
-      --polar-reward-key score
-      --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
-      --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
-      --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
-      --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
-      --rollout-scheduler-mode session_pool
-      --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
-      --rollout-release-on-postrun
-      --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
-   )
-fi
+POLAR_ARGS=(
+   --polar-url "${POLAR_ROLLOUT_URL}"
+   --polar-run-id "${RUN_ID}"
+   --polar-reward-key score
+   --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
+   --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
+   --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
+   --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
+   --rollout-scheduler-mode session_pool
+   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
+   --rollout-release-on-postrun
+   --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
+)
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"

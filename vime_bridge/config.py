@@ -47,15 +47,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
             "in Slime's custom config YAML."
         )
 
-    # task template: prefer a file path (--polar-task-template-file, avoids shell
-    # word-splitting of inline JSON with spaces); fall back to inline dict.
-    _tt_file = getattr(args, "polar_task_template_file", None)
-    if _tt_file:
-        import json as _json
-        with open(_tt_file) as _f:
-            task_template = _json.load(_f)
-    else:
-        task_template = deepcopy(getattr(args, "polar_task_template", None) or {})
+    task_template = deepcopy(getattr(args, "polar_task_template", None) or {})
     if not isinstance(task_template, dict):
         raise ValueError("polar_task_template must be a mapping")
     submit_mode = str(getattr(args, "polar_submit_mode", "") or "").strip().lower()

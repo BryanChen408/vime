@@ -1,44 +1,45 @@
 #!/bin/bash
-# ═══ 一键拉起 math agentic 管线验证(DAPO-17k 走 polar claudecode + math_judge)═══
+# ═══ math agentic 管线验证一键启动(DAPO-17k → polar claudecode + math_judge)═══
 #
-# 目的:验证 polar 接入整条 RL 管线是否正确(轨迹捕获→rebuild→reward→advantage→权重回灌→
-#   策略改善),以 reward 训得上去 + TIS≈1 为判据。不是训模型,是给管线冒烟。
+# 目的:验证 polar 接入整条 vime RL 管线是否正确(轨迹捕获→rebuild→reward→advantage→回灌→
+#   策略改善)。判据:reward 趋势上升 + train/tis≈1。不是训模型,是给管线冒烟。
+#
+# ── 隔离契约(关键,务必看懂再改)────────────────────────────────────────
+#   本脚本【零改动】算子的 run-qwen36-35b-polar-minimal.sh 与整个 vime_bridge:
+#     · math 与 operator 走【同一条】已验证的 operator_samples 派发/推理/轨迹捕获链路;
+#     · 与 operator 的唯一差别 = 不 attach task_source(agent 只拿题面 instruction,不拿任务文件),
+#       靠把 OPERATOR_TASKS_DIR 设为一个【空白值 " "】实现:
+#         - 它非空,能穿过 minimal 脚本 :35 的 `${OPERATOR_TASKS_DIR:-默认op_tasks}`(不被替回默认);
+#         - 到 bridge 后 _optional_text(" ") → strip → None → _attach_operator_task_source 早返回;
+#         => 不传 task_source。(见 vime_bridge/rollout.py:_attach_operator_task_source)
+#     · 答案在 sample.metadata.answer(judge-only,不进 agent prompt);经 operator_profile.py:194
+#       → task_metadata.sample_metadata.answer 到 math_judge。
+#     · profile 由 polar 侧 default_operator_profile=math_npu 决定;vime 不传 profile,只发 URL。
 #
 # ── 前置(polar 侧,一次性)──────────────────────────────────────────────
-#   polar 必须运行【含 math_judge 代码】的版本,否则 evaluator strategy=math_judge 解析失败。
-#   代码在隔离分支 feature/math-judge @ worktree /home/docker/math_polar_wt。两种上法:
-#     A) 让宿主机 polar 从 worktree 起(PYTHONPATH=/home/docker/math_polar_wt/src),或
-#     B) 把 3 个文件同步进 polar 运行 checkout 后重启:
-#          src/polar/trajectory/evaluator/math_judge.py (新)
-#          src/polar/trajectory/evaluator/__init__.py    (+MathJudgeEvaluator)
-#          src/polar/trajectory/registry.py              (+register math_judge)
-#   重启走 hostctl(见 polar_ctl.py restart_polar_stack),重启后 polar 仍在 :8001。
-#   ⚠️ 这会顶掉当前 operator run 的 polar 配置(math 验证期间独占 polar)。
-#
-# ── 拉起(vime 侧)───────────────────────────────────────────────────────
-#   在本 worktree(feature/math-pipeline-validation)执行本脚本即可。
+#   polar 必须以 math profile 启动(math 代码/profile 在隔离分支 `math` @ /home/docker/math_wt):
+#     POLAR_PROFILE=deploy/ascend_operator/profile.math.yaml bash restart_polar_host.sh
 #
 set -e
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
-# 数据:DAPO-17k 走 operator_samples —— prompt 保持消息列表(vime Dataset 要 list;
-#   bridge prompt_to_instruction_text 转成字符串 instruction 给 agent);prep 补
-#   metadata.op_name(operator_samples 硬需)+ metadata.answer(judge-only,→ math_judge)。
+# ── 数据:DAPO-17k → operator_samples 行(prompt 保持消息列表;prep 补 metadata.op_name + answer)──
 RAW_DAPO=${RAW_DAPO:-/home/docker/datasets/dapo-math-17k.jsonl}
 export OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-/home/docker/datasets/dapo-math-17k-prep.jsonl}
 if [ ! -f "${OPERATOR_TASK_JSONL}" ]; then
-   echo "[start_math] prep DAPO (+metadata.op_name/answer, prompt 保持 list) → ${OPERATOR_TASK_JSONL}"
+   echo "[start_math] prep DAPO(+metadata.op_name/answer,prompt 保持 list)→ ${OPERATOR_TASK_JSONL}"
    python3 "${SCRIPT_DIR}/prep_dapo_math.py" "${RAW_DAPO}" "${OPERATOR_TASK_JSONL}"
 fi
 
-# 拓扑 / 卡位(单机,rollout 4-7 / actor 8-15)
+# ⭐ math 关键旁路:空白 tasks-dir → 不 attach task_source(见顶部隔离契约)。切勿设为真实目录。
+export OPERATOR_TASKS_DIR=" "
+
+# ── 拓扑 / 卡位(单机,rollout 4-7 / actor 8-15)──
 export MASTER_ADDR=${MASTER_ADDR:-80.48.5.88}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-4,5,6,7,8,9,10,11,12,13,14,15}
 export VIME_ROLLOUT_LOW_CARDS=1
 
-# ── 冒烟规模:关键是造出组内 reward 方差(避免 zero-std 假阴性)──
-#   bs 8 × N 8 = 64 序列/step,远大于算子冒烟的 2×2;DAPO 已按 RL 难度过滤 → 组内自然有对有错。
-MATH_MODE=1 \
+# ── 冒烟规模:bs8 × N8 = 64 序列/step,造组内 reward 方差(避免 zero-std 假阴性)──
 RUN_ID=${RUN_ID:-qwen36_math_$(date +%Y%m%d-%H%M%S)} \
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8} \
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8} \
@@ -52,8 +53,8 @@ FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=1 FEAT_H
 bash "${SCRIPT_DIR}/run-qwen36-35b-polar-minimal.sh"
 
 # ── 看什么(判据)──────────────────────────────────────────────────────
-#   ✅ 管线通:reward mean 几十步内趋势上升 + train/tis≈1 + pass@1 上升。
+#   ✅ reward mean 几十步内趋势上升 + train/tis≈1 + pass@1 上升 = 管线通。
 #   ⚠️ std≈0 / zero_std 组占比高 → 难度/方差问题(调 N_SAMPLES,不是修管线)。
 #   ⚠️ adv 正常但 reward 平 → 查 advantage 符号 / 轨迹→样本映射 / LR。
-#   埋点:先看 debug rollout 里 trajectory 是否多轮(§轨迹形状);math_judge 的 EvalResult.metadata
-#         带 pred/gt/correct/gt_found —— gt_found=False 说明答案没进 metadata(排查,别当解错)。
+#   埋点:math_judge 的 EvalResult.metadata 带 pred/gt/correct/gt_found;
+#         gt_found=False = 答案没到 judge(排查 metadata 透传,别当解错)。
