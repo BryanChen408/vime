@@ -136,19 +136,38 @@ ROLLOUT_ARGS=(
    --rollout-seed "${ROLLOUT_SEED:-42}"
 )
 
-POLAR_ARGS=(
-   --polar-url "${POLAR_ROLLOUT_URL}"
-   --polar-run-id "${RUN_ID}"
-   --polar-reward-key score
-   --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
-   --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
-   --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
-   --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
-   --rollout-scheduler-mode session_pool
-   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
-   --rollout-release-on-postrun
-   --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
-)
+if [ "${MATH_MODE:-0}" = "1" ]; then
+   # 数学 agentic 管线验证:task_request 模式 —— agent/runtime/evaluator=math_judge 全在 task_template;
+   #   不再走 operator profile。答案由 bridge 塞进 judge-only task metadata(_forward_answer_to_metadata)。
+   POLAR_ARGS=(
+      --polar-url "${POLAR_ROLLOUT_URL}"
+      --polar-run-id "${RUN_ID}"
+      --polar-reward-key score
+      --polar-task-id-template "{args.polar_run_id}-math-{rollout_id}-{sample.group_index}"
+      --polar-submit-mode task_request
+      --polar-task-template "$(cat "${MATH_TASK_TEMPLATE:-${SCRIPT_DIR}/math_task_template.json}")"
+      --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
+      --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
+      --rollout-scheduler-mode session_pool
+      --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
+      --rollout-release-on-postrun
+      --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
+   )
+else
+   POLAR_ARGS=(
+      --polar-url "${POLAR_ROLLOUT_URL}"
+      --polar-run-id "${RUN_ID}"
+      --polar-reward-key score
+      --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
+      --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
+      --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
+      --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
+      --rollout-scheduler-mode session_pool
+      --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
+      --rollout-release-on-postrun
+      --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
+   )
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"
