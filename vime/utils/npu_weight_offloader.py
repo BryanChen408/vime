@@ -1,23 +1,48 @@
-"""NPU weight offloader — CPU offload for Megatron model parameters on Ascend NPU.
+"""NPU weight offloader — storage-resize release of Megatron DDP flat buffers on Ascend.
 
-Drop-in replacement for ``torch_memory_saver`` on NPU, where the original
-CUDA LD_PRELOAD hooks are unavailable.  Operates at the Python level:
-iterates model parameters, copies data to CPU, and **replaces ``param.data``
-with the CPU tensor** so that NPU storage is immediately dereferenced and
-freed (CPython refcounting).  No tiny placeholder NPU tensors are created.
+Drop-in replacement for ``torch_memory_saver`` on NPU, where the CUDA
+LD_PRELOAD/VMM hooks are unavailable.
+
+Why storage-resize (design history):
+  v1 (fake offload, removed): copied each ``param.data`` to CPU and swapped the
+  DDP flat-buffer attributes (``param_data``/``grad_data``) to empty tensors.
+  Every Megatron bucket view still aliased the original flat storage, so not a
+  single byte of HBM was returned (~13GB/rank residue for 9B/TP4) and vLLM
+  wake_up OOMed allocating its KV cache (aclrtMallocPhysical at camem_allocator).
+
+  v2 (current, verl-style): ``untyped_storage().resize_(0)`` on the flat buffer
+  shrinks the one storage all views share — every view invalidated at once,
+  tensor object identity preserved (optimizer/main_grad references stay valid),
+  physical pages returned after ``empty_cache()``. ``onload()`` resizes the
+  storage back, copies ``param_data`` from its pinned-CPU backup and zeroes
+  ``grad_data`` (contents are disposable; backward refills them). Validated on
+  mynpu2 as the runtime patch in scripts/npu_mem_offload (run
+  qwen35_9b_8card_20260630_061951); now built in — no PYTHONPATH injection.
+
+A/B modes (env ``VIME_OFFLOAD_PARAM_BUFFER``, read at each offload call):
+  "0" (default, A): release ``grad_data`` only (fp32, ~9GB/rank @ 9B/TP4);
+      ``param_data`` stays on NPU for direct IPC export.
+  "1" (B): release ``param_data`` + ``grad_data``; params backed up to pinned
+      CPU. Rollout-stage training residue ≈ 0 — required for colocate, where
+      vLLM's KV cache needs the whole card. Safe because vLLM ``load_weights``
+      copies (the engine never aliases actor storage).
+
+Measured (Qwen3.5-0.8B, 4×910B3, colocate): v1 left 4.5GB allocated during
+rollout with 0 physically freed; A leaves 1.4GB; B leaves 0.0GB with training
+metrics identical to A.
 
 Usage::
 
     offloader = NPUWeightOffloader()
-    offloader.offload(model)   # param.data → CPU, NPU HBM freed
+    offloader.offload(model)   # flat buffers resized to 0, HBM freed
     # ... vLLM rollout (actor NPU memory available) ...
-    offloader.onload(model)    # CPU → param.data on NPU, saved tensors released
+    offloader.onload(model)    # storage restored, params copied back, grads zeroed
 """
 
 from __future__ import annotations
 
-import gc
 import logging
+import os
 import time
 from typing import Any
 
@@ -25,27 +50,23 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# (id(buffer), attr) -> (original_storage_size_bytes, pinned_cpu_backup_or_None)
+_SavedEntry = tuple[int, torch.Tensor | None]
+
 
 class NPUWeightOffloader:
-    """Save / restore Megatron model weights to CPU for NPU HBM offloading.
+    """Release / restore Megatron DDP flat buffers via storage-resize.
 
-    **offload()** copies every leaf parameter from NPU → CPU, then sets
-    ``param.data = cpu_copy``.  The old NPU tensor has zero references so
-    CPython deallocates it immediately — no garbage left behind.
-
-    **onload()** sends each saved CPU buffer back to NPU, restores
-    ``param.data``, and frees the CPU copy.
-
-    Before offload, ``param.grad`` is set to ``None`` on every parameter to
-    release gradient buffers (which would otherwise keep NPU storage alive).
-    After offload, ``torch.npu.empty_cache()`` + ``gc.collect()`` are called
-    to force the NPU allocator and Python GC to release all freed blocks.
+    Operates on the ``_ParamAndGradBuffer`` flat tensors (``grad_data`` fp32,
+    ``param_data`` bf16) that Megatron's DDP wrapper owns.  Individual
+    ``param.data`` / ``param.main_grad`` tensors are views into these buffers,
+    so resizing the shared storage releases everything in one step and — once
+    the storage is resized back — every view becomes valid again without any
+    pointer surgery.
     """
 
     def __init__(self) -> None:
-        self._saved: dict[str, torch.Tensor] = {}  # name → CPU tensor
-        self._saved_devices: dict[str, torch.device] = {}  # name → original device
-        self._saved_dtypes: dict[str, torch.dtype] = {}  # name → original dtype
+        self._saved: dict[tuple[int, str], _SavedEntry] = {}
         self._offloaded_bytes: int = 0
         self._offload_time: float = 0.0
         self._onload_time: float = 0.0
@@ -55,112 +76,104 @@ class NPUWeightOffloader:
     # ------------------------------------------------------------------
 
     def offload(self, model: torch.nn.Module, verbose: bool = True) -> int:
-        """Copy all model parameters from NPU to CPU and release NPU storage.
+        """Resize the DDP flat-buffer storages to 0 and return bytes released.
 
-        Returns:
-            Total bytes offloaded.
+        ``grad_data`` is always released without backup (backward refills it).
+        ``param_data`` is additionally released — after a pinned-CPU backup —
+        when ``VIME_OFFLOAD_PARAM_BUFFER=1`` (B mode).
         """
         if self._saved:
             logger.warning(
-                "offload() called but %d params already offloaded — skipping",
+                "offload() called but %d buffers already offloaded — skipping",
                 len(self._saved),
             )
             return self._offloaded_bytes
 
         t0 = time.perf_counter()
+        offload_param = os.environ.get("VIME_OFFLOAD_PARAM_BUFFER", "0") == "1"
+        attrs = ("grad_data", "param_data") if offload_param else ("grad_data",)
 
-        # 1. Release gradient buffers AND Megatron DDP flat-buffer storage.
-        #    DDP._ParamAndGradBuffer holds grad_data (and optionally param_data)
-        #    as large NPU flat tensors that share storage with model params
-        #    via views.  Changing individual param.data does NOT free these
-        #    flat buffers, so we must explicitly release them first.
-        _zero_grads(model)
-        _release_ddp_buffers(model)
-        _force_npu_cleanup()
-
-        # 2. Offload every NPU leaf parameter.
-        #    (No storage dedup needed — untie-embeddings-and-output-weights is on,
-        #    so there are no tied weights.  Each param has independent storage.)
         total_bytes = 0
         count = 0
-        for name, param in _iter_params(model):
-            if not _is_npu(param):
-                continue
-            if param.numel() == 0:
-                continue
-            device = param.device
-            dtype = param.dtype
+        for buf in _iter_ddp_buffers(model):
+            for attr in attrs:
+                flat = getattr(buf, attr, None)
+                if not (isinstance(flat, torch.Tensor) and flat.numel() > 0):
+                    continue
+                storage = flat.untyped_storage()
+                size = storage.size()
+                if size == 0:
+                    continue
+                if attr == "param_data":
+                    # Weights must survive: back up to pinned CPU before release.
+                    backup = flat.detach().to("cpu", copy=True).pin_memory()
+                else:
+                    # Gradients are disposable.
+                    backup = None
+                self._saved[(id(buf), attr)] = (size, backup)
+                storage.resize_(0)
+                total_bytes += size
+                count += 1
 
-            # CPU copy — use plain .cpu() which is reliable on NPU.
-            cpu_tensor = param.data.detach().cpu()
-            total_bytes += cpu_tensor.numel() * cpu_tensor.element_size()
-
-            # Store metadata and CPU tensor.
-            self._saved[name] = cpu_tensor
-            self._saved_devices[name] = device
-            self._saved_dtypes[name] = dtype
-
-            # ★ Release NPU HBM: replace param.data with the CPU copy.
-            # nn.Parameter.data setter calls Tensor.set_() which changes
-            # the underlying storage pointer and decrements the old NPU
-            # storage's refcount. We explicitly drop any temporary
-            # references to help CPython deallocate promptly.
-            param.data = cpu_tensor
-            count += 1
+        torch.npu.empty_cache()
 
         self._offloaded_bytes = total_bytes
         self._offload_time = time.perf_counter() - t0
-
-        # 4. Force cleanup: released blocks back to NPU driver.
-        #    Call empty_cache() multiple times — the NPU caching
-        #    allocator sometimes needs several rounds to release all
-        #    cached blocks after mass deallocation.
-        _force_npu_cleanup()
-        _force_npu_cleanup()  # second pass for stragglers
-
         if verbose:
-            self._log("offload", total_bytes, self._offload_time, count)
-
+            logger.info(
+                "NPU flat-buffer offload (%s): %d buffers, %.1f MiB released in %.2fs",
+                "param+grad" if offload_param else "grad-only",
+                count,
+                total_bytes / (1024 * 1024),
+                self._offload_time,
+            )
         return total_bytes
 
     def onload(self, model: torch.nn.Module, verbose: bool = True) -> int:
-        """Restore model parameters from saved CPU buffers back to NPU.
-
-        Returns:
-            Total bytes restored.
-        """
+        """Resize storages back, restore params from CPU backup, zero grads."""
         if not self._saved:
-            logger.warning("onload() called but no params saved — skipping")
+            logger.warning("onload() called but nothing offloaded — skipping")
             return 0
 
         t0 = time.perf_counter()
         total_bytes = 0
         restored = 0
+        for buf in _iter_ddp_buffers(model):
+            for attr in ("grad_data", "param_data"):
+                flat = getattr(buf, attr, None)
+                if flat is None:
+                    continue
+                entry = self._saved.pop((id(buf), attr), None)
+                if entry is None:
+                    continue
+                size, backup = entry
+                flat.untyped_storage().resize_(size)
+                if backup is not None:
+                    flat.copy_(backup)
+                else:
+                    # Fresh physical pages hold garbage; zero so params without a
+                    # gradient contribution this step don't feed junk to the optimizer.
+                    flat.zero_()
+                total_bytes += size
+                restored += 1
 
-        for name, param in _iter_params(model):
-            cpu_tensor = self._saved.pop(name, None)
-            if cpu_tensor is None:
-                continue
-            device = self._saved_devices.pop(name, param.device)
-            dtype = self._saved_dtypes.pop(name, param.dtype)
-
-            total_bytes += cpu_tensor.numel() * cpu_tensor.element_size()
-
-            # Move back to NPU and assign.
-            param.data = cpu_tensor.to(device=device, dtype=dtype)
-            restored += 1
+        if self._saved:
+            # Buffer objects changed between offload and onload (model rebuilt?) —
+            # the leftover storages can no longer be restored through this handle.
+            logger.warning(
+                "onload(): %d saved buffers had no matching DDP buffer and were dropped",
+                len(self._saved),
+            )
+            self._saved.clear()
 
         self._onload_time = time.perf_counter() - t0
-
-        # Clean up any stragglers and free CPU memory.
-        self._saved.clear()
-        self._saved_devices.clear()
-        self._saved_dtypes.clear()
-        gc.collect()
-
         if verbose:
-            self._log("onload", total_bytes, self._onload_time, restored)
-
+            logger.info(
+                "NPU flat-buffer onload: %d buffers, %.1f MiB restored in %.2fs",
+                restored,
+                total_bytes / (1024 * 1024),
+                self._onload_time,
+            )
         return total_bytes
 
     # ------------------------------------------------------------------
@@ -169,11 +182,7 @@ class NPUWeightOffloader:
 
     @property
     def is_offloaded(self) -> bool:
-        return len(self._saved) > 0
-
-    @property
-    def num_saved(self) -> int:
-        return len(self._saved)
+        return bool(self._saved)
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -181,143 +190,31 @@ class NPUWeightOffloader:
             "offloaded_mb": self._offloaded_bytes / (1024 * 1024),
             "offload_time_s": round(self._offload_time, 2),
             "onload_time_s": round(self._onload_time, 2),
-            "num_params": len(self._saved) or -1,
+            "num_buffers": len(self._saved) or -1,
         }
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _log(self, direction: str, total_bytes: int, elapsed: float, count: int) -> None:
-        mb = total_bytes / (1024 * 1024)
-        bw = mb / elapsed if elapsed > 0 else 0.0
-        logger.info(
-            "NPU weight %s: %d params, %.1f MiB in %.2fs (%.0f MiB/s)",
-            direction,
-            count,
-            mb,
-            elapsed,
-            bw,
-        )
 
 
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
 
-def _is_npu(param: torch.nn.Parameter) -> bool:
-    return param.device.type in ("npu", "privateuseone")
+def _iter_ddp_buffers(model):
+    """Yield Megatron ``_ParamAndGradBuffer`` objects from *model*.
 
-
-def _iter_params(model):
-    """Yield ``(name, param)`` from *model*, which may be a ``nn.Module`` or a
-    ``list`` of ``DDP``-wrapped module chunks (Megatron pipeline parallelism).
+    *model* may be a single DDP-wrapped module or a list of DDP-wrapped chunks
+    (pipeline parallelism).  Buffers live on the DDP wrapper itself under
+    ``buffers`` and — for MoE — ``expert_parallel_buffers``.
     """
-    if isinstance(model, list):
-        for chunk in model:
-            # Megatron DDP can wrap a list of model chunks; unwrap both.
-            inner = chunk
-            for _ in range(2):
-                if hasattr(inner, "module"):
-                    inner = inner.module
-            if isinstance(inner, list):
-                for m in inner:
-                    yield from m.named_parameters()
-            else:
-                yield from inner.named_parameters()
-    else:
-        yield from model.named_parameters()
-
-
-def _zero_grads(model) -> None:
-    """Set ``.grad = None`` on every parameter to release gradient buffers."""
-    for _, param in _iter_params(model):
-        if param.grad is not None:
-            param.grad = None
-
-
-def _release_ddp_buffers(model) -> None:
-    """Release Megatron DDP flat gradient/parameter buffers via storage().resize_(0).
-
-    Megatron's ``_ParamAndGradBuffer`` holds flat ``grad_data`` (fp32, always) and
-    ``param_data`` (bf16 in colocate), which are shared by multiple bucket views.
-    Previous implementation (clone + empty) failed because bucket views alias the
-    flat storage, preventing its physical release despite Python-level clones.
-
-    Correct approach (verl-style):
-    - grad_data.storage().resize_(0) + empty_cache() → releases grad buffer physics
-      (grad content can be lost; backward will recompute).
-    - param_data: controlled by VIME_OFFLOAD_PARAM_BUFFER env var:
-      - 0 (default): keep param on NPU (for IPC export). Only release grad.
-      - 1: also release param + backup to CPU. Requires vLLM load_weights to copy.
-    """
-    import os
-    offload_param = int(os.environ.get("VIME_OFFLOAD_PARAM_BUFFER", "0"))
-
-    ddps = _get_ddp_wrappers(model)
-    released_size = 0
-
-    for ddp in ddps:
-        # Megatron stores buffers in ddp.buffers (list) and ddp.expert_parallel_buffers (MoE).
-        buffers_to_release = []
-        if hasattr(ddp, "buffers"):
-            buffers_to_release.extend(ddp.buffers)
-        if hasattr(ddp, "expert_parallel_buffers"):
-            buffers_to_release.extend(ddp.expert_parallel_buffers)
-
-        for buf in buffers_to_release:
-            if not hasattr(buf, "grad_data") or not hasattr(buf, "param_data"):
+    chunks = model if isinstance(model, (list, tuple)) else [model]
+    seen: set[int] = set()
+    for chunk in chunks:
+        if chunk is None:
+            continue
+        for list_attr in ("buffers", "expert_parallel_buffers"):
+            bufs = getattr(chunk, list_attr, None)
+            if not isinstance(bufs, (list, tuple)):
                 continue
-
-            # Release grad_data (always, grad is recomputed in backward).
-            if buf.grad_data is not None:
-                grad_storage = buf.grad_data.untyped_storage()
-                grad_size = grad_storage.size()
-                grad_storage.resize_(0)
-                released_size += grad_size
-                # Mark for backward recomputation (zero + overwrite with backward).
-                for p in buf.params:
-                    if hasattr(p, "main_grad"):
-                        p.main_grad = None
-
-            # Release param_data (optional, depends on VIME_OFFLOAD_PARAM_BUFFER).
-            if offload_param and buf.param_data is not None:
-                param_storage = buf.param_data.untyped_storage()
-                param_size = param_storage.size()
-                param_storage.resize_(0)
-                released_size += param_size
-
-    if released_size > 0:
-        torch.npu.empty_cache()
-        logger.info(
-            "Released DDP flat buffers: %.0f MiB (grad always, param %s)",
-            released_size / (1024 * 1024),
-            "yes" if offload_param else "no",
-        )
-
-
-def _get_ddp_wrappers(model):
-    """Return list of Megatron DDP wrapper objects from *model*.
-
-    The DDP wrapper holds ``_ParamAndGradBuffer`` which we need to release.
-    The inner module (``ddp.module``) does NOT hold these buffers.
-    """
-    if isinstance(model, list):
-        return [chunk for chunk in model if hasattr(chunk, "module")]
-    if hasattr(model, "module"):
-        return [model]
-    return []
-
-
-def _force_npu_cleanup() -> None:
-    """Force NPU allocator and Python GC to release all freed blocks."""
-    try:
-        torch.npu.empty_cache()
-    except Exception:
-        pass
-    # Some torch_npu versions have a more aggressive sync.
-    try:
-        torch.npu.synchronize()
-    except Exception:
-        pass
-    gc.collect()
+            for buf in bufs:
+                if buf is not None and id(buf) not in seen:
+                    seen.add(id(buf))
+                    yield buf
