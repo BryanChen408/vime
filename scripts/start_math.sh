@@ -21,11 +21,15 @@
 set -e
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
-# 数据:直接用原始 DAPO-17k。prompt 是消息列表 —— vime Dataset(有 processor)要求 list;
-#   bridge 的 prompt_to_instruction_text 会把 list 转成字符串 instruction 给 polar agent。
-#   label=整数答案(judge-only,由 _forward_answer_to_metadata 塞进 task metadata)。
-export OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-/home/docker/datasets/dapo-math-17k.jsonl}
-export MATH_TASK_TEMPLATE=${MATH_TASK_TEMPLATE:-${SCRIPT_DIR}/math_task_template.json}
+# 数据:DAPO-17k 走 operator_samples —— prompt 保持消息列表(vime Dataset 要 list;
+#   bridge prompt_to_instruction_text 转成字符串 instruction 给 agent);prep 补
+#   metadata.op_name(operator_samples 硬需)+ metadata.answer(judge-only,→ math_judge)。
+RAW_DAPO=${RAW_DAPO:-/home/docker/datasets/dapo-math-17k.jsonl}
+export OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-/home/docker/datasets/dapo-math-17k-prep.jsonl}
+if [ ! -f "${OPERATOR_TASK_JSONL}" ]; then
+   echo "[start_math] prep DAPO (+metadata.op_name/answer, prompt 保持 list) → ${OPERATOR_TASK_JSONL}"
+   python3 "${SCRIPT_DIR}/prep_dapo_math.py" "${RAW_DAPO}" "${OPERATOR_TASK_JSONL}"
+fi
 
 # 拓扑 / 卡位(单机,rollout 4-7 / actor 8-15)
 export MASTER_ADDR=${MASTER_ADDR:-80.48.5.88}

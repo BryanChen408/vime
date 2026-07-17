@@ -137,15 +137,15 @@ ROLLOUT_ARGS=(
 )
 
 if [ "${MATH_MODE:-0}" = "1" ]; then
-   # 数学 agentic 管线验证:task_request 模式 —— agent/runtime/evaluator=math_judge 全在 task_template;
-   #   不再走 operator profile。答案由 bridge 塞进 judge-only task metadata(_forward_answer_to_metadata)。
+   # 数学 agentic 管线验证:走 operator_samples(和 operator 同一条已验证派发/推理/捕获链路)。
+   #   profile 由 polar 侧 default_operator_profile=math_npu 决定(vime 不传 profile,只发 URL)。
+   #   不设 --operator-tasks-dir → 无 task_source,agent 只拿题面 instruction;答案在
+   #   sample.metadata.answer(judge-only)。
    POLAR_ARGS=(
       --polar-url "${POLAR_ROLLOUT_URL}"
       --polar-run-id "${RUN_ID}"
       --polar-reward-key score
       --polar-task-id-template "{args.polar_run_id}-math-{rollout_id}-{sample.group_index}"
-      --polar-submit-mode task_request
-      --polar-task-template-file "${MATH_TASK_TEMPLATE:-${SCRIPT_DIR}/math_task_template.json}"
       --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
       --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
       --rollout-scheduler-mode session_pool
