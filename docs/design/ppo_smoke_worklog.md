@@ -119,3 +119,51 @@
     4. `actor_group.py`:offload_train 块拆 `and not is_npu()`(NPU 也挂 LD_PRELOAD hook + TMS_INIT_ENABLE + CPU_BACKUP)。
     - NPUWeightOffloader/storage_resize_hook 现已 **orphaned 无人 import**;`npu_weight_offloader.py` 保留(死代码,低风险不删),已清我加的 ② 探针。
   - **下一步 = smoke5**:GRPO 对齐配置(FLASHCOMM1/PREFIX_CACHE/MULTISTREAM/STATIC_KERNEL,不带 HCCL_AIV,domain2 layout)冲 update_weights→真生成→[MEM-EMPTY]→首步+3步。重点看:bug② 是否消失(offload/onload 不再崩 reset);bug①(引擎 pause+resume 后不服务)是否随 offloader 换掉一并消失(① 探针在 vllm scheduler set_pause_state 仍在,观察 pause/resume 时序+有无 PAUSED_NEW 饿死)。
+
+- **[2026-07-16 03:40 · 🔴 smoke5 actor __init__ 崩 AssertionError + 挖出 expandable×TMS 深层冲突]**
+  - **smoke5 结果**:actor 在 `MegatronTrainRayActor.__init__` 创建期崩**裸 AssertionError**(无消息),Ray 把 actor 内部帧完全折叠(driver + worker.err 都只剩 `^^^^`+`AssertionError`,查不到 vime 行号)。远早于 update_weights,不是 bug①/②。
+  - **排查**:`TrainRayActor.__init__`(train_actor.py:35-53)无 assert;`import vime.backends.megatron_utils.actor`(全 actor env:LD_PRELOAD+TMS_INIT+expandable)干净、TMS region/pause/resume 也不 assert。→ assert 不在 import/TMS-init。**slime 也给 NPU actor 挂同一 LD_PRELOAD**(actor_group.py:64-74,我就镜像的它)→ LD_PRELOAD 本身没问题。
+  - **🔑 挖出真冲突:torch_memory_saver ⊥ expandable_segments**。实测(正确顶层 .so 路径 + `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`):`tms.pause()` 释放 **0.00G**(无 expandable 时释放 4.3G)。机制:expandable_segments 走虚拟内存映射(aclrtReserveMemAddress/MapMem)绕过 TMS 的 aclrtMalloc hook → TMS 追踪不到。TMS 源码 `entrypoint.py:158 _sanity_checks` 本就对 expandable 有 guard(只是查 CUDA 变量、NPU 下没 raise,故静默 no-op)。
+  - **vime-smoke5 vs slime 真差异 = expandable**:smoke5 带 `FEAT_TRAIN_EXPANDABLE=1`,slime TMS 路径**不带** expandable(靠 offload 省显存)。__init__ 的 AssertionError 疑为 LD_PRELOAD hook × expandable × 真实 model-init 的交互(standalone 未复现全)。
+  - **决定(自主,遵 follow-ref 对齐 slime)**:Option A 硬前提 = **FEAT_TRAIN_EXPANDABLE=0**。验证过的 OOM 修复是每步 empty_cache(代码级常开),expandable 是未定论附加实验,去掉安全。→ 重跑 smoke5b(去 expandable,余配置不变)验证 (a) __init__ assert 是否随之消失 (b) offload 是否真释放。
+  - **⚠️ 待用户拍板的深水项(记录,先自己推进 smoke5b)**:若 __init__ assert 去 expandable 后仍在,或去 expandable 后训练步真 OOM → 则 **Option A(TMS,⊥expandable)vs Option B(修手搓 NPUWeightOffloader,Python 层 ∥expandable)** 是产品级取舍(影响 OOM 策略 + slime 对齐),需用户定。
+
+- **[2026-07-16 03:48 · ✅ expandable×TMS 冲突证据闭环 + smoke5b 起(去 expandable)]**
+  - **严格复验(hook 两次都确认映射进程 `/proc/self/maps`)**:不设 expandable→`pause` 释放 4.30G;`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`→释放 **0.00G**。冲突板上钉钉。
+  - **slime-ascend 自证**:`run-qwen3-8B-npu-colocate.sh:7` 明文 "Do not set expandable_segments... Otherwise offload will fail to take effect and may result in OOM"。slime 只在 SFT/非 offload 脚本开 expandable。
+  - **解答"GRPO 带 expandable 为何没踩"**:GRPO `--no-offload-train`(minimal:205)+ 分卡(rollout4-7/train8-15)→ 从不调 TMS.pause();PPO `use_critic` 强制 `offload_train=True`(arguments.py:1893)→ pause/resume 必须真释放 → 才撞。**两 regime 不矛盾**。
+  - **smoke5b 起**(bg bmo3lqvrk,full log smoke5b_full.log,训练 log train_qwen36_polar_ppo_smoke5b.log,Monitor bq7f2spln):唯一变化=去 `FEAT_TRAIN_EXPANDABLE`,对齐 slime offload 配置。验 ①__init__ AssertionError 是否随 expandable 去掉而消失 ②offload `[MEM-EMPTY]` 真释放。findings 存记忆 [[tms-offload-vs-expandable-segments-conflict]]。
+
+- **[2026-07-16 04:00 · 🟡 smoke5b:actor __init__ assert 已消(去 expandable 生效)→ 撞 rollout 卡被外部僵尸占满]**
+  - **进展**:smoke5b(去 FEAT_TRAIN_EXPANDABLE)actor `__init__` AssertionError **消失** → 证实 __init__ assert 就是 expandable×TMS 交互。run 推进到 vLLM 引擎 init。
+  - **新 blocker(环境,非代码)**:vLLM engine worker 崩 `ValueError: Free memory on device (12.81/60.95 GiB) < 0.8 util (48.76 GiB)`。查:**cards 4-7(vime rollout 卡)被 host pid 1698751-4 各占 48944MB**,是 22h 前另一 run 残留的 vLLM 引擎(TP4/35B)。
+  - **杀不掉**:这 4 个 pid 不在本容器 PID namespace(`/proc` 无、`kill` No such process);我 kill 光本 ns 的 14 个 22h 孤儿 python + `ray stop --force`(158 进程)后,cards 4-7 依旧 48G×4。
+  - **hostctl 无解**:动作只有 status/restart_polar_stack/cleanup_ports/tail_logs/restart_observer;restart_polar_stack 只重启 polar host 服务(8080/8100/…)、明确 skip 内部端口/NPU 清理,不碰 cards 4-7。
+  - **→ 必须宿主机侧清 cards 4-7(kill 1698751-4 或 reset NPU 4-7),等用户决策。** polar(:8080/0-3)全程未动、健康。
+
+- **[2026-07-16 04:05 · smoke5c 起(用户已 host 清 cards 4-7)]**
+  - 用户在宿主机清掉 1698751-4,cards 4-7 已空(NPU 占用进程=0)。tip:重跑前 `pkill -9 VLLM`(残留一般全是 vLLM),记忆 [[relaunch-cleanup-pkill-vllm-residuals]]。
+  - smoke5c 起(bg bnio42mq0,full log smoke5c_full.log,训练 log train_qwen36_polar_ppo_smoke5c.log,Monitor bgyhie7gh)。配置=smoke5b(去 expandable + domain2 layout + GRPO 对齐 FEAT)。检查点:actor-init(应过)→ 引擎 init(卡空应过)→ update_weights(offload [MEM-EMPTY] 真释放 + bug① 引擎不服务,agent 根因A+修候选待用)。
+
+- **[2026-07-16 05:20 · ⚠️ 纠错:actor __init__ AssertionError 是持久 bug,非 expandable 导致 + 加插桩抓真栈]**
+  - **smoke5c(卡已清)推进到:actor-init ❌ 又崩 `MegatronTrainRayActor.__init__() AssertionError`**(引擎 4 TP worker init 全过 `Free memory 60.59G` 后,actor 崩)。→ **推翻 03:40 的"去 expandable 修好 actor assert"判断**:smoke5b 里 actor 其实也崩了,只是引擎显存错误(卡被占)先冒出来、我误判。**actor __init__ assert 是 Option A 引入的持久 bug,一直没 root-cause。**
+  - **静态查遍无果**:import 干净(worker env 复现 IMPORT_OK);`TrainRayActor.__init__` 体(configure_logger/get_free_port/get_local_gpu_id)无 assert;actor.py 的 assert 都在 sleep/wake/rollout(非 __init__)。Ray 把 creation-task traceback 折叠成裸 `AssertionError`+`^^^^`,查不到 vime 行号。
+  - **动作**:给 `train_actor.py TrainRayActor.__init__` 包 try/except + `traceback.print_exc()`([SMOKE-DBG] 临时插桩,之后删),真栈会在 Ray 折叠前落 worker stderr。smoke5d 重跑抓栈(Monitor bndtriim0 盯 SMOKE-DBG)。
+  - **清理教训**:vLLM 引擎进程名是 **`VLLM::EngineCore`** 不是 "VLLMEngine",`pkill -f VLLMEngine` 匹配不到 → 要 `pkill -9 -f "VLLM::"` 或 `pkill -9 -f VLLM`。已更新记忆 [[relaunch-cleanup-pkill-vllm-residuals]]。
+
+- **[2026-07-16 07:00 · 🎯🎯 actor __init__ AssertionError 根因实锤 + 修复(Ray×LD_PRELOAD 信号冲突)· Option A 通了构造关]**
+  - **根因**(driver-side dump Ray 的 RayTaskError.args 挖出真栈):`ray/_private/utils.py:1472` 的 `DeferSigint.__exit__` 断言 `assert overridden_sigint_handler is not None` 失败。`DeferSigint` 包每个 task 执行,`__enter__` 存 `getsignal(SIGINT)`、`__exit__` 断言非 None。**torch_memory_saver 的 LD_PRELOAD hook .so 在进程启动装了 C 级 SIGINT handler → Python `getsignal(SIGINT)` 返回 None(实测坐实:挂 LD_PRELOAD 从 default_int_handler 变 None)→ Ray 存了 None → task 收尾断言崩**。actor 的 import/__init__ 其实都成功,崩在 Ray task 收尾——所以我 __init__/imports 插桩全没吃到(assert 不在 vime 代码)。
+  - **为什么之前拿不到栈**:Ray 显示层把它折叠成裸 `^^^^ AssertionError`,但完整栈在 `RayTaskError.args` 里(driver 侧 catch ActorDiedError dump 全属性才挖出)。RAY_DEDUP_LOGS=0/__init__插桩/import插桩都没用,因为根本不在那些位置。
+  - **修复**:`/workspace/vime/sitecustomize.py`——解释器启动(`site` import,主线程,Ray 之前)把 SIGINT 重置为 `default_int_handler`,仅当 getsignal None(即 LD_PRELOAD 进程)才动,driver/engine 无 LD_PRELOAD 不受影响。**worker_process_setup_hook 走不通**:str 形式 Ray fetch_registered_method 不执行、callable 形式 runtime_env JSON 序列化 TypeError(已从 actor_group.py 撤回)。sitecustomize 已单测:挂 LD_PRELOAD 后 getsignal None→非None;smoke5l 实证 actor 越过构造 dist-init 8/8+建模型,构造 assert=0。
+  - **随后新错(offload)**:smoke5l 到第一次 `sleep()→torch_memory_saver.pause()` 崩 `AttributeError: 'NoneType' object has no attribute 'pause'`(`_impl` 是 None)。**根因**:`pause()`=`self._impl.pause()` 不 `_ensure_initialized`;且实测 `tms_pause` 只释放 **region() 内(mem_pool)分配的内存**——region 外分配 pause 释放 **0G**,region 内 4.3G+数据完整。**Option A 漏了把模型 init 包进 `torch_memory_saver.region()`**。修复:actor.py 用 `region(tag="model", enable_cpu_backup=True)` 包 `initialize_model_and_optimizer`(既初始化 _impl 又让模型可 offload+CPU备份)。smoke5m 验证中。
+  - **⚠️ slime 疑点(未解)**:slime 全仓无 region() 调用、pause() 也不 _ensure_initialized,却能跑——可能 slime 的 TMS 版本/环境不同,但不影响 vime 这套的修法正确性(实测 region 是必需的)。
+
+- **[2026-07-17 · 🎯🎯🎯 done-bar 达成:单机 PPO 3 步 e2e 稳定跑通(内存天花板已破)]**
+  - **结果**:step0/1/2(用户 1-indexed 的 step1/2/3)**全部完整 e2e**——rollout 0/1/2 + critic-step 0/1/2 + actor-step 0/1/2 + uw_end=4,**0 次 memory-pressure 杀**,峰值稳在 1891G,loss +0.898→-0.173→-0.429 + critic value_loss 5.34→4.26→3.94(真 PPO 在学)。run 由用户手动 kill 结束(非崩;ActorDiedError/ERR99999 是 kill 副产品)。
+  - **内存根因(实锤,回退到 NPUWeightOffloader Option B 后)**:host 峰值贴死 2015G 天花板。分解(both models=70B):优化器 m+v+master fp32 **832G**(=12B×70B✓,torch_cpu_other 实测)+ grad 280 + param 备份 140(驱动 pinned)+ **CPU-offload 的 pinned staging/传输 buf ~200G** + 框架/Python/torch/激活 ~350G + /dev/shm ckpt 64G + kernel。"textbook 1260G" 与真实 2015G 之间是 ~750G 工程开销(offload 税 + 框架 + shmem)。
+  - **peak 机制**:actor-step 首次 optimizer.step() 惰性分配 Adam m/v（torch_cpu_other 17→52G/rank，永久 +555G）把地板抬高；随后 update_weights 的 B-mode param 备份（onload 释放/offload 新建的瞬时量，代码 npu_weight_offloader onload pop 备份证实不累积）叠在抬高的地板上 → 顶到天花板。param 再 offload 不是"新增"，是地板（优化器）永久涨了。
+  - **bf16 优化器态证伪无效**:`--exp-avg-dtype bf16` 对 offload 路径 host 零效果——HybridDeviceOptimizer 的 CPU 子优化器用 fp32 master 建 m/v，绕过 exp_avg_dtype（实测 torch_cpu_other bf16=fp32=52G/rank）。保留 flag 可回退。
+  - **制胜三招**（都进了 feature/lb-proxy）：① **jemalloc**（`VIME_JEMALLOC=1` 经 Ray runtime_env env_vars 注入 LD_PRELOAD+激进 decay，因 Ray 剥离 driver LD_PRELOAD；实测 6 actor 全 jemalloc_mapped）→ 激进 decay 立即还 glibc 攒的已释放页 → 峰值 **2015→1891G**。② **RAY_MEM_THRESHOLD=0.97**（jemalloc 腾出 ~95G 真实余量后 0.95=1915G 反而擦线误杀非关键 worker；0.97=1955G 清尖峰有余量、kill 在 60G free 处仍安全）。③ **删 /dev/shm 孤儿 ckpt**（Qwen3.6-35B_ma_dist，月前 ma_dist 格式遗留、训练实际 load fused_torch_dist；Shmem 64→0G，白捡 64G）。
+  - **安全铁律**（写死进 run 脚本）：**绝不 `RAY_memory_monitor_refresh_ms=0`**——监控关闭时冲破天花板 → 整机 CPU thrashing 冻死、殃及宿主机 polar（用户实测强调）。留 `RAY_memory_usage_threshold` 让 Ray 干净杀 vime actor。
+  - **训推分离不解**（实锤 rollout 仅 14G+polar 12G host，大头全训练侧)。**真彻底解=跨节点 actor/critic 分离**：已实现 critic 独立放置（向后兼容）+ `scripts/resource_layout.dual88actor_64critic.yaml`（actor@88/critic@64，每节点只放一个模型优化器 ~660G，地板砸半，不赌 margin）。jemalloc 那套是"勉强挤过 + 稳"，跨节点是"根治"。
+  - **过程纠错**（用户逼出的严谨）：早先把 fp32 也能到的 step0-e2e 误吹成 jemalloc 独功（实测各 fp32 run uw_end 也=2）；jemalloc 真实增量仅"死点后移 + 峰值降 ~100G"，最终靠 0.97 抬阈值 + 删 shm 才真跑通。别凭单 worker 被杀/grep-artifact actor 数判死。
