@@ -112,7 +112,8 @@ def _build_layout_bundles(layout, device_name):
     ``node:<ip>: 0.001`` resource request (forces the bundle onto that node)."""
     node_resource_keys = _node_resource_keys_by_ip()
     bundles = []
-    for role in (layout.actor, layout.rollout):
+    # layout.critic 默认空 () → 不产生额外 bundle(共卡老路径);非空则为独立 critic 卡位建 bundle。
+    for role in (layout.actor, layout.critic, layout.rollout):
         for item in role:
             node_resource_key = node_resource_keys.get(item.node)
             if node_resource_key is None:
@@ -166,11 +167,23 @@ def _create_placement_groups_from_layout(args):
     logger.info("Rollout placement from resource layout:")
     _log_bundle_order(bundle_infos, rollout_bundle_indices)
 
+    # critic 卡位:
+    #   - layout 无 critic 条目(layout.critic 空)→ 复用 actor bundle = 共卡老路径(行为不变,
+    #     [F-PPO-2 步骤2/A1] critic 与 actor 共卡 offload 时分,与位置路径 result["critic"]=result["actor"] 一致)。
+    #   - layout 显式给 critic 独立 (node, devices) → 建独立 placement(分卡 / 跨节点),每节点只放一个模型优化器。
+    if not args.use_critic:
+        critic_placement = None
+    elif layout.critic:
+        critic_bundle_indices, critic_gpu_ids = select_role_bundles(bundle_infos, layout.critic, role_name="critic")
+        logger.info("Critic placement from resource layout (independent, not colocated with actor):")
+        _log_bundle_order(bundle_infos, critic_bundle_indices)
+        critic_placement = (pg, critic_bundle_indices, critic_gpu_ids)
+    else:
+        critic_placement = (pg, actor_bundle_indices, actor_gpu_ids)
+
     return {
         "actor": (pg, actor_bundle_indices, actor_gpu_ids),
-        # [F-PPO-2 步骤2/A1] critic 复用 actor bundle(共卡 offload 时分),与位置路径
-        # result["critic"]=result["actor"] 及官方 slime 的 actor/critic 共卡切换一致。
-        "critic": (pg, actor_bundle_indices, actor_gpu_ids) if args.use_critic else None,
+        "critic": critic_placement,
         "rollout": (pg, rollout_bundle_indices, rollout_gpu_ids),
     }
 

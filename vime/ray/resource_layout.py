@@ -18,6 +18,10 @@ class NodeDevices:
 @dataclasses.dataclass(frozen=True)
 class ResourceLayout:
     actor: tuple[NodeDevices, ...] = ()
+    # critic 独立卡位:默认空 () → critic 复用 actor bundle(共卡老路径,行为不变);
+    # 仅当 yaml 显式给 roles.critic 才建独立 placement(分卡 / 跨节点),让每个节点只放
+    # 一个模型的优化器,避开 host 内存天花板。见 placement_group._create_placement_groups_from_layout。
+    critic: tuple[NodeDevices, ...] = ()
     rollout: tuple[NodeDevices, ...] = ()
     polar_reserved: tuple[NodeDevices, ...] = ()
     rollout_num_gpus_per_engine: int | None = None
@@ -45,7 +49,8 @@ class ResourceLayout:
 
     @property
     def ray_num_gpus(self) -> int:
-        return self.actor_num_gpus + self.rollout_num_gpus
+        # critic 独立卡位时须计入(空 critic → critic_num_gpus=0,与共卡老路径一致)。
+        return self.actor_num_gpus + self.critic_num_gpus + self.rollout_num_gpus
 
     @property
     def actor_num_nodes(self) -> int:
@@ -59,6 +64,26 @@ class ResourceLayout:
         if len(counts) != 1:
             raise ValueError(
                 "--resource-layout requires equal actor device counts per node for the current Megatron path; "
+                f"got {sorted(counts)}"
+            )
+        return counts.pop()
+
+    @property
+    def critic_num_gpus(self) -> int:
+        return sum(len(item.devices) for item in self.critic)
+
+    @property
+    def critic_num_nodes(self) -> int:
+        return len(_device_counts_by_node(self.critic))
+
+    @property
+    def critic_num_gpus_per_node(self) -> int:
+        if not self.critic:
+            return 0
+        counts = set(_device_counts_by_node(self.critic).values())
+        if len(counts) != 1:
+            raise ValueError(
+                "--resource-layout requires equal critic device counts per node for the current Megatron path; "
                 f"got {sorted(counts)}"
             )
         return counts.pop()
@@ -107,6 +132,7 @@ def resource_layout_from_dict(data: dict[str, Any]) -> ResourceLayout:
 
     layout = ResourceLayout(
         actor=_parse_role(roles, "actor"),
+        critic=_parse_role(roles, "critic", required=False),
         rollout=_parse_role(roles, "rollout"),
         polar_reserved=_parse_role(roles, "polar_reserved", required=False),
         rollout_num_gpus_per_engine=_optional_positive_int(data, ("rollout", "num_gpus_per_engine")),
@@ -248,6 +274,7 @@ def _validate_layout(layout: ResourceLayout) -> None:
     used: dict[tuple[str, int], str] = {}
     for role_name, entries in (
         ("actor", layout.actor),
+        ("critic", layout.critic),
         ("rollout", layout.rollout),
         ("polar_reserved", layout.polar_reserved),
     ):

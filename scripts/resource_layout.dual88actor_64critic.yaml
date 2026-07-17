@@ -1,0 +1,34 @@
+# [多节点 layout] 双机 actor/critic 角色分离 —— 每个训练模型独占一个节点,
+#   使每节点 host 只放 **一个** 模型的优化器(~660G),避开单节点 host 内存天花板(2015G)。
+#   (单机共卡时 actor+critic 优化器同放一节点 ~1327G + 每步 fp32 Adam transient 顶到 2009-2016G 真 OOM。)
+#
+# 拓扑:
+#   node-88 (80.48.5.88):前 8 卡 0-7 = actor 训练;后 8 卡 8-15 = polar 推理(host 服务,非 Ray)。
+#   node-64 (80.48.5.64):前 8 卡 0-7 = critic 训练;后 8 卡 8-15 = vime rollout 推理。
+#
+# 通信:
+#   - actor(88 内)/ critic(64 内)各自 Megatron 集合通信**都在节点内**(TP2×CP4×EP8,免 EI0013 跨域 RoCE)。
+#   - actor ↔ critic 数据流走 **Ray RPC 传 CPU tensor**(train_critic 返回 values,actor_group.py:131)→ 跨节点天然可行、不需 HCCL/RoCE。
+#   - actor(88) → rollout(64) 的 update_weights 权重同步是**跨节点**,与既定 dual88train64infer.yaml 同路径(照 slime 双机权重广播)。
+#   critic 卡数 = actor 卡数 = 8 → 并行度天然一致,沿用 actor 的 TP/CP/EP,无需重配。
+#
+# 各节点可见卡(layout device 号必须对上各节点 ASCEND_RT_VISIBLE_DEVICES 暴露的物理卡):
+#   node-88: ASCEND_RT_VISIBLE_DEVICES=0-7    (只暴露 actor 卡;polar 独占 8-15,对 Ray 隐藏)
+#   node-64: ASCEND_RT_VISIBLE_DEVICES=0-15   (critic 0-7 + rollout 8-15 都归 Ray)
+#
+# 对应启动(照 slime 双机;head=MASTER 节点):
+#   head@88:   ASCEND_RT_VISIBLE_DEVICES=0-7  CURRENT_IP=80.48.5.88 SOCKET_IFNAME=ens1f3  (=MASTER_ADDR → head 分支)
+#   worker@64: ASCEND_RT_VISIBLE_DEVICES=0-15 CURRENT_IP=80.48.5.64 SOCKET_IFNAME=ens3f3  (≠MASTER_ADDR → worker 分支)
+#   两节点都: NNODES=2 NPUS_PER_NODE=8 MASTER_ADDR=80.48.5.88
+#   (critic 独立 placement 由 vime.ray.placement_group 支持:layout 有 roles.critic → 建独立 bundle;无则复用 actor 共卡。)
+roles:
+  actor:
+    - {node: 80.48.5.88, devices: "0-7"}
+  polar_reserved:
+    - {node: 80.48.5.88, devices: "8-15"}
+  critic:
+    - {node: 80.48.5.64, devices: "0-7"}
+  rollout:
+    - {node: 80.48.5.64, devices: "8-15"}
+rollout:
+  num_gpus_per_engine: 4   # 8 rollout 卡 → 2 引擎(TP4,沿用现有推理);设 8 则 1 引擎 TP8

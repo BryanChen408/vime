@@ -1802,6 +1802,11 @@ def vime_validate_args(args):
         args.resource_layout_spec = layout
         args.actor_num_nodes = layout.actor_num_nodes
         args.actor_num_gpus_per_node = layout.actor_num_gpus_per_node
+        # critic 独立卡位:layout 显式给了 roles.critic → 用 critic 自己的卡数覆盖上面默认的
+        # critic=actor(1774-1775);layout 无 critic 条目(layout.critic 空)→ 保持共卡=actor 不变。
+        if layout.critic:
+            args.critic_num_nodes = layout.critic_num_nodes
+            args.critic_num_gpus_per_node = layout.critic_num_gpus_per_node
         args.rollout_num_gpus = layout.rollout_num_gpus
         # [2026-07-14 fix] 对齐 slime arguments.py:1559 —— 端口分配器用 num_gpus_per_node 算
         #   num_engines_per_node = num_gpus_per_node // gpus_per_engine。异构拓扑(train 8 卡 / infer 16 卡)
