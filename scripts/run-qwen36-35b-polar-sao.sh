@@ -12,13 +12,16 @@
 #     ⚠️ 首跑先确认该 flag 形态无误(reset_arg 定义),再长跑。
 #   - Faster Value Update K=2:--critic-update-steps 2(**已实现** train_async K 循环;默认开)[C12a]
 #
-# 已实现但默认关(需占卡确认后开):
-#   - Frozen-Attention critic [C8]:冻结开关已 role 化(--critic-only/freeze-params-name-list 仅作用 critic,
-#     不误冻 actor);SAO_FROZEN_ATTN_CRITIC=1 启用。⚠️ Q-1/Q-2:regex 命中需一次 named_parameters() dump 确认。
+# 已实现但默认关(env 一键开;占卡确认后启用):
+#   - Frozen-Attention critic [C8]:冻结开关已 role 化(仅作用 critic,不误冻 actor);SAO_FROZEN_ATTN_CRITIC=1。
+#     ⚠️ Q-1/Q-2:regex 命中需一次 dump(SAO_DUMP_CRITIC_PARAMS=/tmp/critic_params.txt)确认。
+#   - critic 独立 LR [Q-12]:SAO_CRITIC_CONFIG=scripts/sao_critic_config.yaml(critic lr 5e-6,仅覆盖 critic)。
+#   - Skip-Obs GAE + length-adaptive λ [C10/C12b,路线 B]:SAO_ROUTE_B=1(skip-obs + α=1.5);λ=1 时 skip-obs=no-op,须成对。
+#     单测已验(tests/test_sao_gae.py):mask 全1=标准 GAE、skip-obs 手算、终止 reward 穿 masked 尾回流。
 #
-# 未开(需继续写代码 / 待决策,见 §9 遗留):
-#   - critic 独立 LR [Q-12]:走 --megatron-config-path role=critic YAML(SAO=5e-6)。
-#   - Skip-Obs GAE + length-adaptive λ [C10/C12b]:改 GAE(路线 B,二期);λ=1 时 skip-obs 是 no-op,须成对上。
+# ⚠️ 长 trace 必读:polar rollout trace 可达 22–40K tokens。adapter 以 max_tokens_per_gpu×cp_size 过滤,
+#   默认 MAX_TOKENS_PER_GPU=512 → 512×4=2048 会把长 trace 全丢(No progress)。**必须设 MAX_TOKENS_PER_GPU=32768**
+#   (=131072,同 start_ppo.sh)。见 vime_bridge/rollout.py:_resolve_max_tokens。
 #
 # 其余(env / 拓扑 / Ray / 推理引擎 / 特性叠加 / MISC / CKPT)全继承 PPO 脚本。
 # PPO 关键点(详见 docs/design/ppo_adaptation_findings.md):
@@ -230,7 +233,17 @@ fi
 if [ "${SAO_FROZEN_ATTN_CRITIC:-0}" = "1" ]; then
    PPO_ARGS+=(--critic-only-train-params-name-list ${SAO_CRITIC_TRAIN_PATTERNS:-mlp.experts output_layer})
 fi
+#   占卡定 regex:SAO_DUMP_CRITIC_PARAMS=/tmp/critic_params.txt 跑一次 → 看 critic 全部参数名(rank0 写文件,不中断训练)。
 # [SAO/C12a] Faster Value Update K=2 已在 PPO_ARGS(--critic-update-steps ${SAO_CRITIC_UPDATE_STEPS:-2})。
+# [SAO/C10+C12b 已实现 · 路线 B,默认关] skip-observation GAE + length-adaptive λ(必须成对;λ=1 时 skip-obs 是 no-op)。
+#   SAO_ROUTE_B=1 一键开(skip-obs + α=1.5);或单独 SAO_SKIP_OBS_GAE=1 / SAO_GAE_LAMBDA_ALPHA=<α>。
+#   ⚠️ 单测已验 mask 全1=标准 GAE、skip-obs 手算、终止 reward 穿 masked 尾回流(tests/test_sao_gae.py);占卡数值待验。
+if [ "${SAO_ROUTE_B:-0}" = "1" ]; then
+   PPO_ARGS+=(--skip-observation-gae --gae-lambda-alpha "${SAO_GAE_LAMBDA_ALPHA:-1.5}")
+else
+   [ "${SAO_SKIP_OBS_GAE:-0}" = "1" ] && PPO_ARGS+=(--skip-observation-gae)
+   [ -n "${SAO_GAE_LAMBDA_ALPHA:-}" ] && PPO_ARGS+=(--gae-lambda-alpha "${SAO_GAE_LAMBDA_ALPHA}")
+fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
@@ -316,6 +329,8 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
          EXTRA_ARGS=()
          [ -n "${RESOURCE_LAYOUT:-}" ] && EXTRA_ARGS+=(--resource-layout "${RESOURCE_LAYOUT}")
          [ "${FEAT_LB_PROXY:-0}" = "1" ] && EXTRA_ARGS+=(--rollout-lb-proxy)
+         # [SAO/Q-12] critic 独立 LR/超参:SAO_CRITIC_CONFIG=scripts/sao_critic_config.yaml(critic lr 5e-6),仅覆盖 critic。
+         [ -n "${SAO_CRITIC_CONFIG:-}" ] && EXTRA_ARGS+=(--megatron-config-path "${SAO_CRITIC_CONFIG}")
          python3 train_async.py \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             ${TOPO_ARGS[@]} ${MODEL_ARGS[@]} ${ROLLOUT_ARGS[@]} ${POLAR_ARGS[@]} \

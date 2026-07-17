@@ -1,0 +1,9 @@
+# [SAO Q-12] critic 独立超参覆盖(--megatron-config-path)。
+# 用法:在 SAO 脚本设 SAO_CRITIC_CONFIG=/workspace/vime/scripts/sao_critic_config.yaml。
+# critic 运行时会选 role=critic 的条目、用 overrides 覆盖继承自 actor 的 args;actor 不受影响。
+# SAO:critic LR 5e-6 > policy 1e-6(CompactionRL 用 critic 3e-6 > policy 2e-6)。按 value-loss/EV 曲线调。
+megatron:
+  - name: sao-critic
+    role: critic
+    overrides:
+      lr: 5.0e-6

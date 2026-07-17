@@ -680,8 +680,22 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             if cp_rank == 0:
                 k[-1] += reward
             rewards.append(k)
+        # [SAO C12b] length-adaptive λ 逐样本(α>0);否则固定 args.lambd。
+        if getattr(args, "gae_lambda_alpha", 0.0) and args.gae_lambda_alpha > 0:
+            lambd = [max(0.0, 1.0 - 1.0 / (args.gae_lambda_alpha * max(1, L))) for L in response_lengths]
+        else:
+            lambd = args.lambd
+        # [SAO C10] skip-observation GAE:传 loss_masks 跳过 observation(loss_mask==0)。
+        skip_obs = getattr(args, "skip_observation_gae", False)
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths,
+            response_lengths,
+            values,
+            rewards,
+            args.gamma,
+            lambd,
+            chunked=not skip_obs,
+            loss_masks_list=loss_masks if skip_obs else None,
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":
@@ -1122,9 +1136,18 @@ def value_loss_function(
     if values.numel() == 0:
         loss += 0 * values.sum()
 
+    # [SAO Q-15] Explained Variance:判断 critic 预测准不准(value 预训练停止判据,SAO EV≈0.4-0.5)。
+    #   EV = 1 − Var(returns − values) / Var(returns);→1 越准,≤0 = 没学到。vime 原先无此指标。
+    with torch.no_grad():
+        if returns.numel() > 1:
+            explained_var = 1.0 - (returns - values).var() / (returns.var() + 1e-8)
+        else:
+            explained_var = torch.zeros((), device=loss.device, dtype=loss.dtype)
+
     reported_loss = {
         "value_loss": loss.clone().detach(),
         "value_clipfrac": values_clipfrac.clone().detach(),
+        "value_explained_var": explained_var.clone().detach(),
     }
 
     return loss, reported_loss

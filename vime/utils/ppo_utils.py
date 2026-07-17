@@ -383,6 +383,7 @@ def get_advantages_and_returns_batch(
     gamma,
     lambd,
     chunked: bool = True,
+    loss_masks_list=None,
 ):
     """
     Batched GAE with CP support.
@@ -437,19 +438,35 @@ def get_advantages_and_returns_batch(
             full_values[i, :L] = full_values_list[i][:L]
             full_rewards[i, :L] = full_rewards_list[i][:L]
 
-        if not chunked:
+        # [SAO C10/C12b] skip-obs mask 或逐样本 λ → 走 mask/vec-aware vanilla_gae(chunked 无法逐样本/mask)。
+        lambd_arg = lambd
+        if isinstance(lambd, (list, tuple)):
+            lambd_arg = torch.tensor([float(x) for x in lambd], device=device, dtype=dtype)
+
+        full_mask = None
+        if loss_masks_list is not None:
+            if cp_size > 1:
+                from vime.backends.megatron_utils.cp_utils import all_gather_with_cp
+
+                gathered_masks = [
+                    all_gather_with_cp(m, tl, rl)
+                    for m, tl, rl in zip(loss_masks_list, total_lengths, response_lengths, strict=False)
+                ]
+            else:
+                gathered_masks = loss_masks_list
+            full_mask = torch.zeros(B, max_len, device=device, dtype=dtype)
+            for i in range(B):
+                L = response_lengths[i]
+                full_mask[i, :L] = gathered_masks[i][:L].to(dtype)
+
+        use_vanilla = (full_mask is not None) or torch.is_tensor(lambd_arg) or (not chunked)
+        if use_vanilla:
             full_advantages, full_returns = vanilla_gae(
-                rewards=full_rewards,
-                values=full_values,
-                gamma=gamma,
-                lambd=lambd,
+                rewards=full_rewards, values=full_values, gamma=gamma, lambd=lambd_arg, mask=full_mask
             )
         else:
             full_advantages, full_returns = chunked_gae(
-                rewards=full_rewards,
-                values=full_values,
-                gamma=gamma,
-                lambd=lambd,
+                rewards=full_rewards, values=full_values, gamma=gamma, lambd=lambd_arg
             )
 
         advantages_list = []
@@ -487,24 +504,42 @@ def vanilla_gae(
     rewards: torch.Tensor,
     values: torch.Tensor,
     gamma: float,
-    lambd: float,
+    lambd,
+    mask: torch.Tensor | None = None,
 ):
+    # lambd: float 或 [B] tensor(逐样本 length-adaptive λ,SAO C12b)。
+    # mask: None = 标准 GAE;否则 [B,T] 的 1/0(1=action、0=observation)→ [SAO C10] skip-observation GAE:
+    #   δ、γλ 只在 action 间单步传播,跳过 observation(其 V 未训练、不入递推);observation 上的奖励(如终止
+    #   reward 落在 masked 尾)被累加折扣回前一个 action。⚠️ mask 全 1 时与标准 GAE 逐位一致(见 tests/test_sao_gae.py)。
     B, T = rewards.shape
     device = rewards.device
     dtype = rewards.dtype
+    if not torch.is_tensor(lambd):
+        lambd = torch.full((B,), float(lambd), device=device, dtype=dtype)
 
+    adv = torch.zeros(B, T, device=device, dtype=dtype)
     lastgaelam = torch.zeros(B, device=device, dtype=dtype)
-    adv_rev = []
 
-    for t in reversed(range(T)):
-        next_value = values[:, t + 1] if t < T - 1 else 0.0
-        delta = rewards[:, t] + gamma * next_value - values[:, t]
-        lastgaelam = delta + gamma * lambd * lastgaelam
-        adv_rev.append(lastgaelam)
+    if mask is None:
+        for t in reversed(range(T)):
+            next_value = values[:, t + 1] if t < T - 1 else torch.zeros(B, device=device, dtype=dtype)
+            delta = rewards[:, t] + gamma * next_value - values[:, t]
+            lastgaelam = delta + gamma * lambd * lastgaelam
+            adv[:, t] = lastgaelam
+    else:
+        next_action_value = torch.zeros(B, device=device, dtype=dtype)  # 下一个 action token 的 V(结尾=0)
+        carry_reward = torch.zeros(B, device=device, dtype=dtype)  # 跳过的 observation 累计(折扣)奖励
+        for t in reversed(range(T)):
+            m = mask[:, t] > 0
+            new_gae = (rewards[:, t] + carry_reward + gamma * next_action_value - values[:, t]) + gamma * lambd * lastgaelam
+            new_carry = rewards[:, t] + gamma * carry_reward
+            adv[:, t] = torch.where(m, new_gae, torch.zeros_like(new_gae))
+            lastgaelam = torch.where(m, new_gae, lastgaelam)
+            next_action_value = torch.where(m, values[:, t], next_action_value)
+            carry_reward = torch.where(m, torch.zeros_like(carry_reward), new_carry)
 
-    full_advantages = torch.stack(adv_rev[::-1], dim=1)  # [B, max_len]
-    full_returns = full_advantages + values  # [B, max_len]
-    return full_advantages, full_returns
+    full_returns = adv + values  # [B, max_len]
+    return adv, full_returns
 
 
 def chunked_gae(

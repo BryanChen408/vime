@@ -935,6 +935,18 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument(
+                "--skip-observation-gae",
+                action="store_true",
+                help="[SAO C10] 多轮 agentic:GAE 跳过 observation(loss_mask==0)token,action→action 单步 γλ 传播。"
+                "仅 λ<1 才有实质效果(λ=1 时 telescope 自动抵消)。启用会强制走非-chunked GAE。",
+            )
+            parser.add_argument(
+                "--gae-lambda-alpha",
+                type=float,
+                default=0.0,
+                help="[SAO C12b] length-adaptive λ:>0 时逐样本 λ=1−1/(α·l)(SAO α=1.5);0=用固定 --lambd。",
+            )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",

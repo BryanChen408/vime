@@ -302,3 +302,23 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace, role: str = "
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break
+
+    # [SAO C8 · Q-1/Q-2] 占卡时 dump critic 参数名 → 敲定 frozen-attention regex(GDN 冻不冻 / router 训不训)。
+    #   用法:SAO_DUMP_CRITIC_PARAMS=/path/critic_params.txt(或 =1 → /tmp/critic_params.txt)。仅 rank0、仅 critic、
+    #   写完不中断训练;每行 = "requires_grad<TAB>shape<TAB>name"。全程 try/except,绝不影响训练。
+    if role == "critic":
+        import os
+
+        dump_target = os.environ.get("SAO_DUMP_CRITIC_PARAMS")
+        if dump_target:
+            try:
+                import torch
+
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                if rank == 0:
+                    path = "/tmp/critic_params.txt" if dump_target in ("1", "true", "") else dump_target
+                    with open(path, "w") as f:
+                        for name, param in model.named_parameters():
+                            f.write(f"{int(param.requires_grad)}\t{tuple(param.shape)}\t{name}\n")
+            except Exception:
+                pass
