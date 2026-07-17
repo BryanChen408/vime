@@ -72,6 +72,12 @@ export VLLM_TOOL_CALL_PARSER=qwen3_coder
 export VLLM_REASONING_PARSER=qwen3
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=1
+# [安全铁律] Ray 内存监控必须常开,绝不设 RAY_memory_monitor_refresh_ms=0。
+#   监控关闭时训练冲破 host 内存天花板(~2015G)会触发真 OOM → 整机 CPU thrashing 冻死,
+#   殃及宿主机 polar(违反"绝不杀 polar")。阈值处 Ray 干净杀 vime actor 保护整机。
+#   默认 0.95(1915G,留 ~100G 余量);实测本 config 峰值 2009-2016G 会在此被干净杀,
+#   要真跑通须先把峰值降到阈值下(拓扑改 actor/critic 分卡去 B-mode / 第二训练节点)。
+export RAY_memory_usage_threshold="${RAY_MEM_THRESHOLD:-0.95}"
 # HCCL(节点内 HCCS + 跨机 socket;长跑 EI0013 容错 + 35B 权重广播大 buffer)
 export HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-60000-60050}
 export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
@@ -210,8 +216,14 @@ OPTIMIZER_ARGS=(
    --adam-beta1 0.9
    --adam-beta2 0.98
    --optimizer-cpu-offload
-   --overlap-cpu-optimizer-d2h-h2d
+   --optimizer-offload-fraction "${OPT_OFFLOAD_FRACTION:-1.0}"
+   ${VIME_OVERLAP_CPU_OPT:+--overlap-cpu-optimizer-d2h-h2d}
    --use-precision-aware-optimizer
+   # Adam m/v 状态精度:默认 bf16(单机 host 内存修复,省 ~495G,峰值 2006G→~1550G)。
+   # 原因:优化器态 fp32 的 master+m+v=3×4B×P≈1486G host 贴死 2015G 天花板;m/v 用 bf16
+   # 半精度存储(precision-aware-optimizer 主用场景,不影响 lr/beta/收敛)。设 VIME_OPT_STATE_DTYPE=fp32 回退。
+   --exp-avg-dtype "${VIME_OPT_STATE_DTYPE:-bf16}"
+   --exp-avg-sq-dtype "${VIME_OPT_STATE_DTYPE:-bf16}"
 )
 
 VLLM_ARGS=(
@@ -297,7 +309,7 @@ echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
    ray stop --force
    rm -rf "${RAY_TEMP_DIR}"
-   ray start --head --port "${RAY_PORT}" --dashboard-host=0.0.0.0 --node-ip-address="${CURRENT_IP}" --dashboard-port="${RAY_DASHBOARD_PORT}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
+   ray start --head --port "${RAY_PORT}" --dashboard-host=0.0.0.0 --node-ip-address="${CURRENT_IP}" --dashboard-port="${RAY_DASHBOARD_PORT}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --object-store-memory="${RAY_OBJECT_STORE_MEMORY:-50000000000}" --disable-usage-stats
 
    while true; do
       active_node_count=$(ray status | awk '

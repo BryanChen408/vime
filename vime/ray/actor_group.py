@@ -88,6 +88,20 @@ class RayTrainGroup:
             env_vars["TMS_INIT_ENABLE"] = "1"
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
+        # [jemalloc opt-in] Ray 剥离 driver 的 LD_PRELOAD(见上 line 64 forwarding 注释:actor 不继承
+        #   父环境),故 jemalloc 须经 runtime_env 注入才进得了 actor。gated on VIME_JEMALLOC=1;仅在
+        #   LD_PRELOAD 未被 TMS 占用时设(NPU 路径 TMS 块被跳过,LD_PRELOAD 空)。
+        #   目的:glibc per-thread arena 保留已释放内存致 host RSS 虚高,每步 optimizer.step() 的 fp32
+        #   transient 叠在保留内存上顶高峰值;jemalloc 激进 decay 立即还页给 OS → 压低峰值(单机 host
+        #   贴 2015G 天花板时的低成本挣扎手段)。lib/MALLOC_CONF 可经 env 覆盖。
+        if os.environ.get("VIME_JEMALLOC") == "1" and "LD_PRELOAD" not in env_vars:
+            env_vars["LD_PRELOAD"] = os.environ.get(
+                "VIME_JEMALLOC_LIB", "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
+            )
+            env_vars["MALLOC_CONF"] = os.environ.get(
+                "VIME_JEMALLOC_MALLOC_CONF", "background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
+            )
+
         # We cannot do routing replay for critic.
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
