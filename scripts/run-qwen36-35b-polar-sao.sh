@@ -228,8 +228,10 @@ fi
 [ -n "${SAO_TIS_CLIP_LOW:-}" ] && PPO_ARGS+=(--tis-clip-low "${SAO_TIS_CLIP_LOW}")
 # [SAO/C8 已实现] Frozen-Attention critic:冻结开关已 role 化(--critic-only-train-params-name-list /
 #   --critic-freeze-params-name-list 仅作用 critic,不误冻 actor)。默认 OFF;SAO_FROZEN_ATTN_CRITIC=1 启用。
-#   ⚠️ Q-1/Q-2:命中需一次占卡 named_parameters() dump 确认。默认 pattern = "mlp.experts output_layer"
-#   = 只训 MoE routed experts + value head,冻全部 attention(GDN+full)/norm/embedding/router/shared_expert。
+#   ✅ Q-1/Q-2 已静态定 regex(读 qwen3_next.py):GDN=self_attention.linear_attn.*、full-attn=self_attention.*、
+#     experts=mlp.experts.*、value head=output_layer.*。默认 "mlp.experts output_layer" = 只训 routed experts+value head,
+#     冻全部 attention(GDN+full)/norm/embedding/router/shared_expert。宽版(含 shared_expert/router):
+#     SAO_CRITIC_TRAIN_PATTERNS='mlp\. output_layer'。dump(SAO_DUMP_CRITIC_PARAMS)= 占卡最终确认。
 if [ "${SAO_FROZEN_ATTN_CRITIC:-0}" = "1" ]; then
    PPO_ARGS+=(--critic-only-train-params-name-list ${SAO_CRITIC_TRAIN_PATTERNS:-mlp.experts output_layer})
 fi

@@ -17,6 +17,7 @@ from vime.utils.ppo_utils import (
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    explained_variance,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
@@ -1136,13 +1137,9 @@ def value_loss_function(
     if values.numel() == 0:
         loss += 0 * values.sum()
 
-    # [SAO Q-15] Explained Variance:判断 critic 预测准不准(value 预训练停止判据,SAO EV≈0.4-0.5)。
-    #   EV = 1 − Var(returns − values) / Var(returns);→1 越准,≤0 = 没学到。vime 原先无此指标。
+    # [SAO Q-15] Explained Variance:value 预训练停止判据(SAO EV≈0.4-0.5)。vime 原先无此指标。
     with torch.no_grad():
-        if returns.numel() > 1:
-            explained_var = 1.0 - (returns - values).var() / (returns.var() + 1e-8)
-        else:
-            explained_var = torch.zeros((), device=loss.device, dtype=loss.dtype)
+        explained_var = explained_variance(returns, values)
 
     reported_loss = {
         "value_loss": loss.clone().detach(),

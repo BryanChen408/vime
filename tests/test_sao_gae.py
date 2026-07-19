@@ -73,10 +73,45 @@ def test_terminal_reward_on_masked_tail():
     print("test_terminal_reward_on_masked_tail OK (终止 reward 穿过 masked 尾回流)")
 
 
+def test_explained_variance():
+    # [SAO Q-15] EV = 1 − Var(R−V)/Var(R)。
+    from vime.utils.ppo_utils import explained_variance
+
+    r = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    assert torch.allclose(explained_variance(r, r.clone()), torch.tensor(1.0), atol=1e-4)  # 完美预测 → 1
+    assert explained_variance(r, torch.full_like(r, r.mean())).abs() < 1e-3  # 只预测均值 → 0
+    assert explained_variance(r, -r) < 0  # 比均值还差 → <0
+    assert explained_variance(torch.tensor([5.0]), torch.tensor([0.0])) == 0.0  # numel<=1 兜底
+    print("test_explained_variance OK")
+
+
+def test_critic_update_count_logic():
+    # [SAO C12a] 镜像 train_async.py 的 K 循环:K → 调 K 次 async_train,末次 ref 传 actor;K=1 逐位不变。
+    calls = []
+
+    def fake_async_train(_rollout_id, data):
+        calls.append(data)
+        return f"ref{len(calls)}"
+
+    def run(K):
+        calls.clear()
+        value_refs = fake_async_train(0, "d")
+        for _ in range(max(1, K) - 1):  # 中间 ray.get 省略,不影响计数/末次 ref
+            value_refs = fake_async_train(0, "d")
+        return value_refs, len(calls)
+
+    assert run(1) == ("ref1", 1)
+    assert run(2) == ("ref2", 2)
+    assert run(3) == ("ref3", 3)
+    print("test_critic_update_count_logic OK (K→K calls, last ref→actor)")
+
+
 if __name__ == "__main__":
     test_backward_compat()
     test_mask_all_ones_equals_standard()
     test_per_sample_lambda()
     test_skip_observation_small()
     test_terminal_reward_on_masked_tail()
+    test_explained_variance()
+    test_critic_update_count_logic()
     print("ALL GAE TESTS PASSED")

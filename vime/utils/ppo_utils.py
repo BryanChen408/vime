@@ -438,7 +438,9 @@ def get_advantages_and_returns_batch(
             full_values[i, :L] = full_values_list[i][:L]
             full_rewards[i, :L] = full_rewards_list[i][:L]
 
-        # [SAO C10/C12b] skip-obs mask 或逐样本 λ → 走 mask/vec-aware vanilla_gae(chunked 无法逐样本/mask)。
+        # [SAO C10/C12b] skip-obs mask 或逐样本 λ → 走 mask/vec-aware vanilla_gae。
+        # 注:chunked_gae 的并行 scan 用统一 w=γλ 矩阵,与"在 observation 边界重置/逐样本 λ"冲突 → 有意延后
+        #   (vanilla O(T) 正确、仅长序列略慢;route-B 二期本就需占卡验,届时再评估 chunked 化)。
         lambd_arg = lambd
         if isinstance(lambd, (list, tuple)):
             lambd_arg = torch.tensor([float(x) for x in lambd], device=device, dtype=dtype)
@@ -498,6 +500,14 @@ def get_advantages_and_returns_batch(
                 returns_list.append(full_returns[i, :L])
 
     return advantages_list, returns_list
+
+
+def explained_variance(returns: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """[SAO Q-15] Explained Variance = 1 − Var(returns − values) / Var(returns)。
+    判断 critic 预测准不准(value 预训练停止判据,SAO EV≈0.4-0.5)。→1 越准,0=只学到均值,<0=比均值还差。"""
+    if returns.numel() <= 1:
+        return torch.zeros((), device=returns.device, dtype=returns.dtype)
+    return 1.0 - (returns - values).var() / (returns.var() + 1e-8)
 
 
 def vanilla_gae(
