@@ -35,6 +35,13 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    # valid-before-train: baseline eval on the held-out set before any weight update
+    # (async loop only evals periodically from rollout_id+1, so it never captures step-0;
+    #  mirrors the sync train.py:71 pre-train eval). Gated on eval config → no-op for runs
+    #  without --eval-interval (e.g. operator), so behavior there is unchanged.
+    if args.eval_interval is not None and not getattr(args, "skip_eval_before_train", False):
+        ray.get(rollout_manager.eval.remote(args.start_rollout_id))
+
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
