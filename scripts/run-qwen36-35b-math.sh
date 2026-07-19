@@ -100,7 +100,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
    --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
-   --save-interval 10
+   --save-interval 100
    --no-save-optim
    --megatron-to-hf-mode raw
    # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
@@ -132,11 +132,21 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
    --rollout-temperature 0.7
    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
-   --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
-   --save-debug-train-data "${POLAR_OUTPUT_DIR}/vime_debug_train_${RUN_ID}_rollout_{rollout_id}_{rank}.pt"
+  # --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
+  # --save-debug-train-data "${POLAR_OUTPUT_DIR}/vime_debug_train_${RUN_ID}_rollout_{rollout_id}_{rank}.pt"
    --use-dynamic-global-batch-size
    --rollout-seed "${ROLLOUT_SEED:-42}"
 )
+
+# ── validation/eval:设了 EVAL_TASK_JSONL 才开 —— 每 EVAL_INTERVAL 步在留出集(如 AIME)上评一次。
+#   eval 走同一条 agentic 链路(eval-function-path),复用 input/label/metadata key;不设则不评。
+if [ -n "${EVAL_TASK_JSONL:-}" ]; then
+   ROLLOUT_ARGS+=(
+      --eval-prompt-data "${EVAL_TASK_JSONL}"
+      --eval-interval "${EVAL_INTERVAL:-10}"
+      --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL:-8}"
+   )
+fi
 
 POLAR_ARGS=(
    --polar-url "${POLAR_ROLLOUT_URL}"

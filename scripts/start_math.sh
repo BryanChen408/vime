@@ -32,6 +32,15 @@ if [ ! -f "${OPERATOR_TASK_JSONL}" ]; then
    python3 "${SCRIPT_DIR}/prep_dapo_math.py" "${RAW_DAPO}" "${OPERATOR_TASK_JSONL}"
 fi
 
+# ── eval 集:AIME 2024(留出验证,不参与训练)——
+#   缺 prep 则从原始 AIME 自动生成;op_name 用 'aime_' 前缀,避免与训练集 'math_' 撞车。
+RAW_AIME=${RAW_AIME:-/home/docker/datasets/aime2024/aime-2024-slime.jsonl}
+export EVAL_TASK_JSONL=${EVAL_TASK_JSONL:-/home/docker/datasets/aime2024/aime-2024-prep.jsonl}
+if [ ! -f "${EVAL_TASK_JSONL}" ]; then
+   echo "[start_math] prep AIME(+metadata.op_name(aime_)/answer)→ ${EVAL_TASK_JSONL}"
+   python3 "${SCRIPT_DIR}/prep_dapo_math.py" "${RAW_AIME}" "${EVAL_TASK_JSONL}" aime
+fi
+
 # ── 拓扑 / 卡位(单机,rollout 4-7 / actor 8-15)──
 export MASTER_ADDR=${MASTER_ADDR:-80.48.5.88}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-4,5,6,7,8,9,10,11,12,13,14,15}
@@ -39,16 +48,17 @@ export VIME_ROLLOUT_LOW_CARDS=1
 
 # ── 冒烟规模:bs8 × N8 = 64 序列/step,造组内 reward 方差(避免 zero-std 假阴性)──
 RUN_ID=${RUN_ID:-qwen36_math_$(date +%Y%m%d-%H%M%S)} \
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8} \
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-32} \
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8} \
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64} \
-NUM_ROLLOUT=${NUM_ROLLOUT:-50} \
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32} \
+NUM_ROLLOUT=${NUM_ROLLOUT:-5000} \
 QWEN36_CHUNK_LMHEAD=1 \
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-32768} \
-POLAR_MAX_ACTIVE_SESSIONS=${POLAR_MAX_ACTIVE_SESSIONS:-16} \
+POLAR_MAX_ACTIVE_SESSIONS=${POLAR_MAX_ACTIVE_SESSIONS:-96} \
 VIME_MEM_PROBE=1 FEAT_TRAIN_EXPANDABLE=1 VIME_EMPTY_CACHE_PER_STEP=1 \
 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=1 FEAT_HCCL_AIV=1 \
 FEAT_LB_PROXY=1 \
+EVAL_INTERVAL=${EVAL_INTERVAL:-10} N_SAMPLES_PER_EVAL=${N_SAMPLES_PER_EVAL:-8} \
 bash "${SCRIPT_DIR}/run-qwen36-35b-math.sh"
 
 # ── 看什么(判据)──────────────────────────────────────────────────────
