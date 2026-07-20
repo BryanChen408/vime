@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import logging
+import os
 from typing import Any
 
 from vime_bridge._messages import messages_to_text
@@ -215,6 +216,21 @@ def _build_sample(
     }
     polar_metadata.update(_scheduler_metadata(result, trace))
 
+    # [A: logprob-integrity consumer] polar 的 _logprob_integrity 检测了 per-token misattribution / -9999
+    #   (全 response token,含 CoT),记进 trace.metadata["logprob_integrity"](仅有问题时才有此键)。vime 之前
+    #   无消费者(孤儿)→ 坏 logprob 会毒化 GRPO/DIS 比值(unmask CoT 后 CoT logprob 首次被用,尤其致命)。
+    #   这里接上:有问题就 remove_sample(drain-backfill 掉);VIME_KEEP_BAD_LOGPROB=1 可关(调试)。
+    _trace_meta = getattr(trace, "metadata", None)
+    _integrity = _trace_meta.get("logprob_integrity") if isinstance(_trace_meta, dict) else None
+    integrity_reject = bool(_integrity) and os.environ.get("VIME_KEEP_BAD_LOGPROB", "0") != "1"
+    if integrity_reject:
+        logger.warning(
+            "LOGPROB-INTEGRITY-REJECT session=%s trace=%d integrity=%s -> remove_sample",
+            result.session_id,
+            trace_index,
+            _integrity,
+        )
+
     return Sample(
         group_index=group_index,
         index=index,
@@ -232,6 +248,7 @@ def _build_sample(
         loss_mask=loss_mask,
         rollout_log_probs=response_log_probs,
         status=status,
+        remove_sample=integrity_reject,
         metadata={"polar": polar_metadata},
     )
 
