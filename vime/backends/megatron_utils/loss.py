@@ -1024,17 +1024,14 @@ def policy_loss_function(
         loss += 0 * logits.sum()
 
     train_rollout_logprob_abs_diff = None
-    cot_tis = None  # [C] reasoning(loss_mask==0 & rollout_lp≠0)token 上的 TIS 比值(和 action 的 tis 分开上报)
+    # [C] cot_tis(reasoning token 上的 TIS)曾在此按 `_cot_sel.any()` 条件塞进 reported_loss —— 是个 bug:
+    #   reduce_train_step_metrics 跨微批对 `values` 张量**逐元素相加**,要求每个微批 report 的 keys 完全一致
+    #   (长度须相等)。含 think token 的 mb 多报一项、不含的少报一项 → `size a(12) vs b(13)` 崩(cp_utils.py:169)。
+    #   且 flat `.mean()` 也不匹配 reducer 的 sum/单分母契约(CoT token 是与 action 分母不同的population)。
+    #   正确做法 = 独立 all-reduce(自带 CoT 分子和+token 计数),不走这个单分母 reducer。留作 follow-up,先移除以恢复训练。
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
-        # [C] cot_tis:放开 CoT(POLAR_MASK_REASONING=0)前,验 reasoning 的 rollout logprob 一致(→ wandb 应≈1)。
-        #   只在 masked reasoning(loss_mask==0 且 lp≠0)上取,observation(lp==0)排除;直接 flat-mean(诊断用)。
-        #   ⚠️ unmask 后此集为空 → 不上报;放开后想单独盯 CoT 需用 reasoning_span 版(见 TODO)。
-        _cot_lm = torch.cat(batch["loss_masks"], dim=0)
-        _cot_sel = (_cot_lm == 0) & (rollout_log_probs != 0.0)
-        if bool(_cot_sel.any()):
-            cot_tis = torch.exp(old_log_probs - rollout_log_probs)[_cot_sel].mean()
 
         # Save per-token logprobs for train-inference consistency analysis
         _save_ci_logprobs = os.environ.get("VIME_SAVE_TIS_LOGPROBS", "")
@@ -1056,8 +1053,6 @@ def policy_loss_function(
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
-    if cot_tis is not None:
-        reported_loss["cot_tis"] = cot_tis.clone().detach()
 
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
