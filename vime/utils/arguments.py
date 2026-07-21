@@ -685,6 +685,11 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--rollout-session-pool-pause-policy", type=str, default=None)
             parser.add_argument("--polar-session-pool-pause-policy", type=str, default=None)
             parser.add_argument("--polar-allow-weight-update-overlap", action=argparse.BooleanOptionalAction, default=None)
+            # task_request submit mode (e.g. SWE-Gym coding-agent): path to an OmegaConf
+            # YAML/JSON task template (runtime + agent + evaluator). Presence auto-selects
+            # task_request mode. Loaded into a mapping by vime_bridge.config.
+            parser.add_argument("--polar-task-template", type=str, default=None)
+            parser.add_argument("--polar-submit-mode", type=str, default=None)
             return parser
 
         def add_eval_arguments(parser):

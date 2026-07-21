@@ -47,9 +47,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
             "in Slime's custom config YAML."
         )
 
-    task_template = deepcopy(getattr(args, "polar_task_template", None) or {})
-    if not isinstance(task_template, dict):
-        raise ValueError("polar_task_template must be a mapping")
+    task_template = _load_polar_task_template(getattr(args, "polar_task_template", None))
     submit_mode = str(getattr(args, "polar_submit_mode", "") or "").strip().lower()
     if not submit_mode:
         submit_mode = "task_request" if task_template else "operator_samples"
@@ -215,6 +213,30 @@ def _first_configured(args: Any, *names: str, default: Any = None) -> Any:
         if value not in (None, ""):
             return value
     return default
+
+
+def _load_polar_task_template(value: Any) -> dict[str, Any]:
+    """Resolve ``--polar-task-template`` into a task-payload mapping.
+
+    Accepts a path to an OmegaConf YAML/JSON file (the ``task_request`` submit
+    mode, e.g. the SWE-Gym coding-agent pipeline), an already-parsed mapping
+    (tests / programmatic callers), or ``None``/"" (``operator_samples`` mode).
+    Mirrors how ``--eval-config`` is loaded in ``vime/utils/arguments.py``.
+    """
+    if value in (None, ""):
+        return {}
+    if isinstance(value, dict):
+        return deepcopy(value)
+    if isinstance(value, str):
+        from omegaconf import OmegaConf
+
+        loaded = OmegaConf.to_container(OmegaConf.load(value), resolve=True)
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                f"polar_task_template file {value!r} must contain a mapping"
+            )
+        return loaded
+    raise ValueError("polar_task_template must be a file path or a mapping")
 
 
 def _optional_text(value: Any) -> str | None:
