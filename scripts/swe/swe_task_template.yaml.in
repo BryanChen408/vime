@@ -1,0 +1,106 @@
+# vime --polar-task-template (task_request submit mode) — SWE-Gym coding agent.
+#
+# DOCKER backend — matches how our Ascend rollouts actually run
+# (deploy/ascend_operator/topology.yaml uses backend: docker; apptainer is never
+# used here and can't do Ascend NPU passthrough — factory.py). Adapted from the
+# GPU-lineage upstream example examples/swegym_slime_grpo/polar_config.yaml (its
+# `polar_task_template:` block, which was written for apptainer), promoted to top
+# level — vime's --polar-task-template expects the task mapping itself, and
+# vime_bridge.config validates that `agent` is a top-level key.
+#
+# Note: unlike our kernel-gen (operator) tasks, SWE containers are CPU-only
+# (codex edits files + runs pytest; the model runs remotely via the polar proxy),
+# so there is NO kwargs.ascend NPU passthrough here.
+#
+# Two-layer templating:
+#   ${AGENT_CLI_DIR}     -> shell envsubst at launch (run script) BEFORE vime loads this.
+#                           Use restricted `envsubst '${AGENT_CLI_DIR}'` so $HOME below
+#                           stays literal (expanded inside the task container, not the host).
+#   {sample.metadata.*}  -> rendered per-sample by vime_bridge at submit time.
+#                           `{sample.metadata.instance}` renders to the whole instance DICT
+#                           (sole-placeholder -> object; see _render_template_value).
+#
+# Divergences from the upstream GPU example (apptainer -> docker):
+#   runtime.backend         apptainer -> docker
+#   runtime.image           {...}/{instance_id}.sif -> {sample.metadata.docker_image}
+#   volumes CLI-dir mount    {args.polar_apptainer...}-indirection -> ${AGENT_CLI_DIR} (vime
+#                            has no polar_agent_cli_dir arg; envsubst the host path directly).
+# Everything else (env, prepare/eval_prepare, agent, builder, evaluator) is verbatim.
+
+timeout_seconds: 2400
+runtime:
+  backend: "docker"
+  # SWE-Gym per-instance image, loaded on the polar host docker daemon.
+  # metadata.docker_image is stamped by prepare_data (Phase 3) via
+  # registry_image_for_instance_id(instance_id).
+  image: "{sample.metadata.docker_image}"
+  network: "host"
+  workdir: "/polar/session/workspace"
+  env:
+    HOME: "/polar/session/home"
+    PATH: "/polar/session/home/.venv/bin:/opt/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  kwargs:
+    volumes:
+      # Node 22 + codex CLI, provisioned into ${AGENT_CLI_DIR} on the polar host.
+      - "${AGENT_CLI_DIR}:/opt/node:ro"
+  # Node + codex mounted from ${AGENT_CLI_DIR} — no npm install at session start.
+  prepare:
+    - type: exec
+      command: >-
+        rm -rf /polar/session/workspace &&
+        mkdir -p /polar/session/logs/agent /polar/session/workspace "$HOME/.venv/bin" &&
+        cp -a /testbed/. /polar/session/workspace/ &&
+        ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
+        ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
+        git config --global core.pager '' &&
+        cd /polar/session/workspace &&
+        (git reset --hard || true)
+  # Fresh reward-test runtime applies the patch and runs swebench tests.
+  eval_prepare:
+    - type: exec
+      command: >-
+        mkdir -p /polar/session/logs/agent "$HOME/.venv/bin" &&
+        ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python" &&
+        ln -sf /opt/miniconda3/envs/testbed/bin/python "$HOME/.venv/bin/python3" &&
+        git config --global core.pager ''
+agent:
+  harness: "codex"
+  # Label sent by codex as the request `model`; the polar proxy routes it to the
+  # vime-served model. If vllm-ascend rejects unknown model names, set this to the
+  # served name (e.g. qwen3_5moeforconditionalgeneration) — verify in the smoke test.
+  model_name: "gpt-5.4"
+builder:
+  strategy: "prefix_merging"
+evaluator:
+  strategy: "swebench_harness"
+  refresh_runtime: true
+  config:
+    repo_dir: "/testbed"
+    patch_command: "cd /polar/session/workspace && git add -A && git diff --cached --binary"
+    instance: "{sample.metadata.instance}"
+    # Strip per-harness config/session dirs and stray artifacts that would
+    # otherwise get swept into `git add -A` and bloat the patch.
+    exclude_patterns:
+      - "trajectories/**"
+      - "**/trajectories/**"
+      - "node_modules/**"
+      - "**/node_modules/**"
+      - ".cache/**"
+      - "**/.cache/**"
+      - ".venv/**"
+      - "**/.venv/**"
+      - ".claude/**"
+      - "**/.claude/**"
+      - ".codex/**"
+      - "**/.codex/**"
+      - ".gemini/**"
+      - "**/.gemini/**"
+      - ".opencode/**"
+      - "**/.opencode/**"
+      - ".config/opencode/**"
+      - ".pi/**"
+      - "**/.pi/**"
+      - ".qwen/**"
+      - "**/.qwen/**"
+      - "$HOME/**"
+      - "**/$HOME/**"
