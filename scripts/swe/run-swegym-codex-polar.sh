@@ -8,7 +8,7 @@
 # ── 与 35B-math 的差异(仅"模型相关"块,polar/eval/LB/session_pool/vime_bridge 一字不改)──
 #   · 模型: source models/qwen3-8B.sh(dense 36L/hidden4096/GQA8)替 qwen3.5-35B-A3B.sh(MoE+GDN)
 #   · 权重: HF=/home/docker/Qwen3-8B  REF_LOAD=/home/docker/Qwen3-8B_torch_dist(convert-qwen3-8B.sh 产物)
-#   · 并行: TP=2 / PP=1 / CP=1 / EP=1(dense 无 MoE/context-parallel);去 --chunked-lm-head / --log-probs-chunk-size
+#   · 并行: TP=2 / PP=1 / CP=1 / EP=1(dense 无 MoE/context-parallel);去 --chunked-lm-head(MoE 专属);log-probs-chunk-size 256 保留(dense 也用)
 #   · vLLM: 去 --qwen-gdn-backend / --model-name qwen3_5moe / --vllm-hf-overrides(dense=Qwen3ForCausalLM,vLLM 自识别)
 #   · MISC: 去 --moe-token-dispatcher-type(dense 无 MoE 分发)
 #   · env:  去 QWEN36_CP_MODE / QWEN36_CAUSAL_CONV1D_IMPL / QWEN36_CHUNK_LMHEAD(GDN/35B 专属)
@@ -186,7 +186,8 @@ POLAR_ARGS=(
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
 )
 
-# 8B dense:去 CP/EP/chunked-lm-head/log-probs-chunk-size(MoE/GDN 专属),值取自 8B ref。
+# 8B dense:去 CP/EP/chunked-lm-head(MoE/GDN 专属),值取自 8B ref。
+# log-probs-chunk-size 256 对齐同事(dense 也用,分块算 logprob 省显存,非 MoE 专属)。
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"
    --pipeline-model-parallel-size "${PP:-1}"
@@ -199,17 +200,20 @@ PERF_ARGS=(
    --recompute-num-layers 1
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-4096}"
+   --log-probs-chunk-size 256
    --micro-batch-size 1
    --seq-length "${SEQ_LENGTH:-32768}"
 )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
+   --normalize-advantages
    --use-kl-loss
    --kl-loss-coef 0.001
    --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
+   --eps-clip-high 0.28
    --use-tis
 )
 

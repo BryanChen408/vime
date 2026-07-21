@@ -40,25 +40,27 @@ export ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}   # 4 引�
 export ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-4}
 export TP=${TP:-4}                                                      # 训练 TP=4(4 actor 卡)
 
-# ── 冒烟规模(SWE 比 math 重:codex 多轮 + 容器跑测,故 batch / active-sessions 保守)──
-#   SWE 域值取自同事 run.sh:rollout-max-response-len=16000。context/seq/max-tokens 用 8B-NPU 已验预算
-#     (start_math_8b 同款 SEQ 40960 / MAX_TOKENS_PER_GPU 32768,不照抄同事 GPU 的 20000)。
-#   n_samples=8 造 GRPO 组内方差(swebench resolved=0/1,组内需偶有解出才有 advantage 信号,见 Risk #3)。
-#   POLAR_MAX_ASYNC_LEVEL=1(对齐 math-8b、更 on-policy 便于看涨;同事 SWE 用 2 → 设 2 追其 staleness/吞吐)。
+# ── 完整训练规模(对齐同事 slime SWE:rollout-batch 4 × n-samples 16 = 64 traj/rollout)──
+#   对齐同事 run.sh/polar_config:response=16000、batch 4×16、async-level 2、min-complete 0.6;
+#     另三项在 run 脚本 args:eps-clip-high 0.28、normalize-advantages、log-probs-chunk-size 256。
+#   context/seq/max-tokens 用 8B-NPU 已验预算(SEQ 40960 / MAX_TOKENS_PER_GPU 32768,NPU 显存,
+#     不照抄同事 GPU 的 20000);tool-parser 用 hermes(8B-instruct,非同事 qwen3_coder)。
+#   n_samples=16:swebench resolved=0/1 稀疏,大组更易组内有解出 → 有 advantage 信号(见 Risk #3)。
 RUN_ID=${RUN_ID:-swegym_codex_8b_$(date +%Y%m%d-%H%M%S)} \
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8} \
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8} \
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-4} \
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16} \
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-64} \
 NUM_ROLLOUT=${NUM_ROLLOUT:-50} \
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-32768} \
 SEQ_LENGTH=${SEQ_LENGTH:-40960} \
 VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-32} \
 VLLM_GPU_MEM_UTIL=${VLLM_GPU_MEM_UTIL:-0.85} \
-VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-40960} \
-ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-40960} \
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32000} \
+ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-32000} \
 ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-16000} \
 POLAR_MAX_ACTIVE_SESSIONS=${POLAR_MAX_ACTIVE_SESSIONS:-16} \
-POLAR_MAX_ASYNC_LEVEL=${POLAR_MAX_ASYNC_LEVEL:-1} \
+POLAR_MAX_ASYNC_LEVEL=${POLAR_MAX_ASYNC_LEVEL:-2} \
+POLAR_MIN_COMPLETE_ACCEPT_FRACTION=${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6} \
 VIME_MEM_PROBE=1 FEAT_TRAIN_EXPANDABLE=1 VIME_EMPTY_CACHE_PER_STEP=1 \
 FEAT_PREFIX_CACHE=1 FEAT_STATIC_KERNEL=1 FEAT_HCCL_AIV=1 \
 FEAT_LB_PROXY=1 \
