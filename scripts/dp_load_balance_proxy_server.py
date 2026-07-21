@@ -92,6 +92,7 @@ import asyncio
 import functools
 import hashlib
 import heapq
+import json
 import os
 import sys
 import uuid
@@ -101,7 +102,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -250,43 +251,56 @@ def with_cancellation(handler_func):
 app = FastAPI(lifespan=lifespan)
 
 
-async def stream_service_response_with_retry(
+async def _forward_upstream_with_retry(
     client: httpx.AsyncClient,
     endpoint: str,
     req_data: dict,
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
-):
+) -> tuple[httpx.Response | None, tuple[int, bytes] | None]:
+    """向上游 vLLM 转发并 retry;用 client.send(stream=True) 先拿响应头,据 status 决定:
+      - 2xx: 返回 (response, None) —— 已确认可流式,body 由调用方 aiter_bytes 消费后 aclose。
+      - 最终非 2xx / 连不上: 返回 (None, (status_code, body)) —— 调用方原样回传真实 status。
+
+    ⚠️ 关键(对齐无 proxy 的 sglang router 行为): 上游 4xx/5xx 绝不能被吞成 200+空 body。
+    否则 operator gateway 的 completion() 对空 body 做 resp.json() 抛 JSONDecodeError,而
+    gateway 只 except UpstreamError → 失败 session 无法干净 errored → session_pool 达不到
+    min_complete → rollout hang(agentic 长跑撞 context 上限时必现)。原样透传 status 后,
+    gateway 的 _raise_for_status 会抛 UpstreamHTTPError → session 秒级 errored → drop-and-continue。
+    """
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
     for attempt in range(1, max_retries + 1):
+        req = client.build_request("POST", endpoint, json=req_data, headers=headers)
         try:
-            async with client.stream("POST", endpoint, json=req_data, headers=headers) as response:
-                response.raise_for_status()
-                first_chunk_sent = False
-                async for chunk in response.aiter_bytes():
-                    first_chunk_sent = True
-                    yield chunk
-                return  # Success, exit after streaming
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            response = await client.send(req, stream=True)
+        except httpx.RequestError as e:
             if attempt < max_retries:
-                logger.warning("Attempt %s failed for streaming %s: %s", attempt, endpoint, e)
+                logger.warning("Attempt %s failed connecting %s: %s", attempt, endpoint, e)
                 await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-            else:
-                logger.error("All %s attempts failed for streaming %s.", max_retries, endpoint)
-                raise e
-        except Exception as e:
-            # If any chunk has been sent, do not retry, just log and drop
-            if "first_chunk_sent" in locals() and first_chunk_sent:
-                logger.error("Streaming to client interrupted after response started: %s", e)
-                return
-            else:
-                if attempt < max_retries:
-                    logger.warning("Attempt %s failed for streaming %s: %s", attempt, endpoint, e)
-                    await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
-                else:
-                    logger.error("All %s attempts failed for streaming %s.", max_retries, endpoint)
-                    raise e
+                continue
+            logger.error("All %s attempts failed connecting %s: %s", max_retries, endpoint, e)
+            body = json.dumps(
+                {"error": {"message": f"upstream connect failed after {max_retries} attempts: {e}",
+                           "type": "upstream_transport_error"}}
+            ).encode()
+            return None, (502, body)
+        if response.status_code < 400:
+            return response, None
+        # 上游 4xx/5xx: 读错误体、关闭连接(下面据 attempt 决定 retry 还是原样透传)
+        body = await response.aread()
+        await response.aclose()
+        if attempt < max_retries:
+            logger.warning("Attempt %s got HTTP %s from %s", attempt, response.status_code, endpoint)
+            await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
+            continue
+        logger.error(
+            "All %s attempts got HTTP %s from %s; propagating upstream status (not swallowing).",
+            max_retries, response.status_code, endpoint,
+        )
+        return None, (response.status_code, body)
+    return None, (502, json.dumps(
+        {"error": {"message": "upstream retry exhausted", "type": "upstream_error"}}).encode())
 
 
 async def _select_instance(api: str, req_data: Any, request_length: int, session_id: str | None = None):
@@ -335,29 +349,38 @@ async def _handle_completions(api: str, request: Request):
         session_id = request.headers.get("x-session-id")
         instance_info = await _select_instance(api, req_data, request_length, session_id=session_id)
 
+        response, error = await _forward_upstream_with_retry(
+            instance_info.server_state.client,
+            api,
+            req_data,
+            request_id=instance_info.request_id,
+            max_retries=global_args.max_retries,
+            base_delay=global_args.retry_delay,
+        )
+        if error is not None:
+            # 上游最终非 2xx: 原样回传真实 status + 错误体,绝不吞成 200+空 body(见
+            # _forward_upstream_with_retry)。令 operator gateway 走 UpstreamError → session
+            # 秒级 errored → drop-and-continue,而不是 resp.json() 崩 JSONDecodeError → hang。
+            proxy_state.release_server(instance_info.server_idx, instance_info.priority_score)
+            status_code, body = error
+            return Response(content=body, status_code=status_code, media_type="application/json")
+
         async def generate_stream():
-            nonlocal instance_info
-            # Only one await per chunk, minimal logic in loop
+            # 2xx 已确认;流式透传 body(stream=False 时上游返完整 JSON,一样字节透传)。
             try:
-                async for chunk in stream_service_response_with_retry(
-                    instance_info.server_state.client,
-                    api,
-                    req_data,
-                    request_id=instance_info.request_id,
-                    max_retries=global_args.max_retries,
-                    base_delay=global_args.retry_delay,
-                ):
+                async for chunk in response.aiter_bytes():
                     yield chunk
             except Exception as e:
                 logger.error(
-                    "Error during streaming from server %s: %s, the aborted request is: %s.",
+                    "Streaming interrupted after response started from %s: %s, request %s.",
                     instance_info.server_state.url,
                     e,
                     instance_info.request_id,
                 )
-
-            # After streaming done, release tokens
-            proxy_state.release_server(instance_info.server_idx, instance_info.priority_score)
+            finally:
+                await response.aclose()
+                # After streaming done, release tokens
+                proxy_state.release_server(instance_info.server_idx, instance_info.priority_score)
 
         return StreamingResponse(generate_stream(), media_type="application/json")
     except Exception as e:
