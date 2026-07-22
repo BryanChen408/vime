@@ -25,11 +25,13 @@ export FEAT_GDN=1
 export VLLM_MODEL_NAME=qwen3_5forconditionalgeneration
 export VLLM_HF_OVERRIDES='{"architectures":["Qwen3_5ForConditionalGeneration"]}'
 
-# ── context:4B native 256k → 设 40960 远离 native edge ──
-#   8B 那个 32001/40961 off-by-one 是 40960=8B native max 的边界效应;4B native 256k,40960 不是边界 → 天然无此坑,
-#   truncated 也会比 8B(22%)少(codex 对话很少涨到 40960)。不设 256k:KV cache 显存会爆,40960 够 codex 用。
-export VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-40960}
-export ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-40960}
+# ── context:对齐同事 sglang-context-length 32000(用户要求严格对齐)──
+#   4B native 256k,32000 远离 native edge → 天然无 8B 那种 40960=native-max 的 32001 off-by-one 坑。
+export VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32000}
+export ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-32000}
+
+# ── 迭代:num-rollout 200(用户指定;同事 num-epoch 20≈320)──
+export NUM_ROLLOUT=${NUM_ROLLOUT:-200}
 
 # ── 标识 ──
 export RUN_ID=${RUN_ID:-swegym_codex_4b_$(date +%Y%m%d-%H%M%S)}
