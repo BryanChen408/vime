@@ -261,7 +261,13 @@ MISC_ARGS=(
 # 4B(Qwen3.5,VLM+GDN)专属:FEAT_GDN=1 补 GDN backend + VLM model-name/hf-overrides —— 照抄用户已验证
 #   能跑的 run-qwen36-35b-polar-ppo.sh(35B MoE+GDN),4B 用 dense 版 model-name/architectures。
 #   8B dense 默认 OFF(vLLM 从 config.json 自识别 Qwen3ForCausalLM,不需 GDN backend)。
-[ "${FEAT_GDN:-0}" = "1" ] && VLLM_ARGS+=(--qwen-gdn-backend npu --model-name "${VLLM_MODEL_NAME:-qwen3_5forconditionalgeneration}" --vllm-hf-overrides "${VLLM_HF_OVERRIDES:-{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}}")
+#   ⚠️ default 必须用 if 赋值,不能写 ${VAR:-{...}} —— JSON 里的 } 会让 bash 提前闭合 ${},
+#      当上游(start_swegym_4b.sh)已 export VLLM_HF_OVERRIDES 时会多吐一个字面 } → JSON 变 ...]}} 解析失败(踩过)。
+if [ "${FEAT_GDN:-0}" = "1" ]; then
+   [ -z "${VLLM_MODEL_NAME:-}" ] && VLLM_MODEL_NAME=qwen3_5forconditionalgeneration
+   [ -z "${VLLM_HF_OVERRIDES:-}" ] && VLLM_HF_OVERRIDES='{"architectures":["Qwen3_5ForConditionalGeneration"]}'
+   VLLM_ARGS+=(--qwen-gdn-backend npu --model-name "${VLLM_MODEL_NAME}" --vllm-hf-overrides "${VLLM_HF_OVERRIDES}")
+fi
 [ "${FEAT_PREFIX_CACHE:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-prefix-caching --vllm-enable-chunked-prefill)
 ADDCFG_PARTS=()
 [ "${FEAT_STATIC_KERNEL:-0}" = "1" ] && ADDCFG_PARTS+=('"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":true}')
