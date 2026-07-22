@@ -48,7 +48,16 @@ def finish_tracking(args):
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:
-        wandb.log(metrics)
+        # wandb "shared" 模式下,非 primary 进程(RolloutManager 用 primary=False)不能读全局
+        # step 去自增 → wandb.log(metrics) 会抛 "Cannot read the W&B step in shared mode",
+        # rollout/eval 指标被静默丢掉(实测看板缺 rollout/rewards、eval/aime)。显式传 step
+        # (每进程单调:rollout/eval=compute_rollout_step(rollout_id),train=accumulated_step_id;
+        # 就是下面 TensorBoard 用的同一个值)就不需要读全局 step,secondary 也能正常写。
+        step = metrics.get(step_key)
+        if step is not None:
+            wandb.log(metrics, step=int(step))
+        else:
+            wandb.log(metrics)
 
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
