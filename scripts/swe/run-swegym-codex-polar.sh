@@ -75,9 +75,9 @@ export TASK_QUEUE_ENABLE=0                     # 两份 ref 都设 0;dense 无�
 export TORCHDYNAMO_DISABLE=1                   # 昇腾 inductor get_gpu_type() 断言 → 走 eager
 export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}
 export VLLM_ASCEND_ENABLE_NZ=0                 # RL 权重同步每步换权重与 NZ 冲突,必须 0
-# Qwen3-8B(instruct,非 Coder)发 Hermes 式 <tool_call> → 必须用 hermes parser;
-#   用 35B 的 qwen3_coder(认 <function=> XML)会解不了 → tool turn 坏 → completions:0 轨迹空。
-export VLLM_TOOL_CALL_PARSER=hermes
+# Qwen3-8B(instruct,非 Coder)发 Hermes 式 <tool_call> → 默认 hermes parser;
+#   4B(Qwen3.5)发 <function=> XML → start_swegym_4b.sh 设 VLLM_TOOL_CALL_PARSER=qwen3_coder(治 8B hermes JSON 报错)。
+export VLLM_TOOL_CALL_PARSER=${VLLM_TOOL_CALL_PARSER:-hermes}
 export VLLM_REASONING_PARSER=qwen3
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=1
@@ -97,7 +97,7 @@ export POLAR_KEEP_SESSION_DIR=${POLAR_KEEP_SESSION_DIR:-1}
 export POLAR_TRAJECTORY_PG_STRICT=${POLAR_TRAJECTORY_PG_STRICT:-1}
 export POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS=${POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS:-12288}
 
-source "${VIME_ROOT}/scripts/models/qwen3-8B.sh"     # → MODEL_ARGS(dense 8B)
+source "${VIME_ROOT}/scripts/models/${MODEL_ARGS_SCRIPT:-qwen3-8B.sh}"   # → MODEL_ARGS(默认 dense 8B;4B 设 MODEL_ARGS_SCRIPT=qwen3.5-4B.sh)
 
 if [ -n "${SOCKET_IFNAME}" ]; then
    CURRENT_IP=${CURRENT_IP:-$(ip -o -4 addr show "${SOCKET_IFNAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)}
@@ -258,6 +258,10 @@ MISC_ARGS=(
 
 # ─── 特性开关(默认全 OFF = baseline;仅保留 dense+polar 相关,MoE 专属项已删)───
 [ "${FEAT_ASYNC_SCHED:-0}" = "1" ] && VLLM_ARGS+=(--vllm-async-scheduling)
+# 4B(Qwen3.5,VLM+GDN)专属:FEAT_GDN=1 补 GDN backend + VLM model-name/hf-overrides —— 照抄用户已验证
+#   能跑的 run-qwen36-35b-polar-ppo.sh(35B MoE+GDN),4B 用 dense 版 model-name/architectures。
+#   8B dense 默认 OFF(vLLM 从 config.json 自识别 Qwen3ForCausalLM,不需 GDN backend)。
+[ "${FEAT_GDN:-0}" = "1" ] && VLLM_ARGS+=(--qwen-gdn-backend npu --model-name "${VLLM_MODEL_NAME:-qwen3_5forconditionalgeneration}" --vllm-hf-overrides "${VLLM_HF_OVERRIDES:-{\"architectures\":[\"Qwen3_5ForConditionalGeneration\"]}}")
 [ "${FEAT_PREFIX_CACHE:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-prefix-caching --vllm-enable-chunked-prefill)
 ADDCFG_PARTS=()
 [ "${FEAT_STATIC_KERNEL:-0}" = "1" ] && ADDCFG_PARTS+=('"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":true}')
