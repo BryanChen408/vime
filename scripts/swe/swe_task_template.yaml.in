@@ -39,6 +39,26 @@ runtime:
   env:
     HOME: "/polar/session/home"
     PATH: "/polar/session/home/.venv/bin:/opt/node/bin:/opt/miniconda3/envs/testbed/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    # Eval `pip install -e .` (PEP517 build isolation) was NOT a slow-mirror problem
+    # but NO network: the fresh eval container has no proxy, so direct PyPI times out
+    # (000) and pip retries forever ("Installing build dependencies: still running")
+    # -> postrun stalls to hundreds of seconds. With the Huawei proxy it drops to ~3s
+    # (verified in-container).
+    # ⚠️ The proxy MUST reach ONLY the eval container, NEVER the shell/polar/vllm
+    # process env -- otherwise vllm inherits http_proxy and its :8001 internal
+    # inference calls break. So run-swegym-codex-polar.sh reads the proxy from a
+    # separate file (/home/docker/.swe_eval_proxy), keeps it in a LOCAL var (never
+    # exported), and only sed-injects it here. Password lives in that file only --
+    # not in this tracked template, not in the terminal, not in any process env.
+    # These env keys are inherited by the fresh eval runtime (node.py
+    # _resolve_eval_runtime_spec) and injected on every docker exec (docker.py:203).
+    # Default PyPI kept (authoritative source, no mirror-lag risk).
+    http_proxy: "${HTTP_PROXY}"
+    https_proxy: "${HTTPS_PROXY}"
+    HTTP_PROXY: "${HTTP_PROXY}"
+    HTTPS_PROXY: "${HTTPS_PROXY}"
+    no_proxy: "${NO_PROXY}"
+    NO_PROXY: "${NO_PROXY}"
   kwargs:
     volumes:
       # Node 22 + codex CLI, provisioned into ${AGENT_CLI_DIR} on the polar host.

@@ -115,10 +115,29 @@ POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
 LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
 mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
 
-# ─── task_request 模板渲染:只替字面 ${AGENT_CLI_DIR}(保留 $HOME 给容器内展开)。
-#   用 sed 而非 envsubst —— 本机无 gettext/envsubst;sed 精确匹配 ${AGENT_CLI_DIR},不碰 $HOME。
+# ─── task_request 模板渲染:替字面 ${AGENT_CLI_DIR} + 代理占位(保留 $HOME 给容器内展开)。
+#   用 sed 而非 envsubst —— 本机无 gettext/envsubst;sed 精确匹配,不碰 $HOME。
+#   代理:eval 容器默认无代理、直连 PyPI 超时(000)→ pip install -e . 的 build isolation 卡死重试
+#   到超时(实测加代理后 ~3s)。⚠️代理【只】能注入 eval 容器,【绝不】export 到本 shell/进程环境 ——
+#   否则 polar/vllm 会继承 http_proxy,vllm 的 :8001 内部推理请求走华为代理就坏了。故从独立文件读、
+#   用局部变量(不 export)、仅 sed 注入 task_template。密码只落该文件(非 tracked),不进终端、不进进程。
+SWE_EVAL_PROXY_FILE=${SWE_EVAL_PROXY_FILE:-/home/docker/.swe_eval_proxy}
+_EVAL_PROXY=""
+[ -f "${SWE_EVAL_PROXY_FILE}" ] && _EVAL_PROXY=$(head -1 "${SWE_EVAL_PROXY_FILE}" 2>/dev/null | tr -d '[:space:]')
+if [ -z "${_EVAL_PROXY}" ]; then
+   echo "[swe][WARN] ${SWE_EVAL_PROXY_FILE} 空/缺 → eval 容器无代理 → 评测 pip install -e . 会卡死到超时。" \
+        "把代理 URL(http://user:pwd@ip:port)写进该文件(单行);它只注入 eval 容器,不碰终端/polar/vllm。" >&2
+fi
+# ⚠️ no_proxy 必须排掉所有内网推理端点(80.48.5.88 的 :8080/:8100/:8001)——否则容器里的
+#   codex 请求 $OPENAI_BASE_URL(内网 vllm)会走华为外网代理、连不上 → traces=0 推理全崩。
+#   只有外网 PyPI(eval 容器 pip)才该走代理。多机时把其它节点 IP 也加进来。
+_EVAL_NO_PROXY="127.0.0.1,localhost,.huawei.com,.local,80.48.5.88,${MASTER_ADDR:-80.48.5.88}"
 mkdir -p "$(dirname "${SWE_TASK_TEMPLATE}")"
-sed "s|\${AGENT_CLI_DIR}|${AGENT_CLI_DIR}|g" "${SWE_TASK_TEMPLATE_IN}" > "${SWE_TASK_TEMPLATE}"
+sed -e "s|\${AGENT_CLI_DIR}|${AGENT_CLI_DIR}|g" \
+    -e "s|\${HTTP_PROXY}|${_EVAL_PROXY}|g" \
+    -e "s|\${HTTPS_PROXY}|${_EVAL_PROXY}|g" \
+    -e "s|\${NO_PROXY}|${_EVAL_NO_PROXY}|g" \
+    "${SWE_TASK_TEMPLATE_IN}" > "${SWE_TASK_TEMPLATE}"
 if grep -q '\${AGENT_CLI_DIR}' "${SWE_TASK_TEMPLATE}"; then
    echo "[swe][FATAL] AGENT_CLI_DIR 未替换干净: ${SWE_TASK_TEMPLATE}" >&2; exit 1
 fi
