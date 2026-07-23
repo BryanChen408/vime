@@ -16,12 +16,14 @@ stdlib only — runs with the agent host's python3.
 import json
 import os
 import subprocess
+import sys
 
 NPU_QUEUE = "ascend-a3"
-CI_IMAGE = os.environ.get("IMAGE_BUILD", "quay.io/ascend/vime:0.3.0-a3-vllm0.22.1rc1")
+DEFAULT_CI_IMAGE = "quay.io/ascend/vime:0.3.0-a3-vllm0.22.1rc1"
 IMAGE_REGISTRY = "swr.cn-southwest-2.myhuaweicloud.com/modelfoundry"
 IMAGE_NAME = "vime-ci-npu"
 VIME_IMAGE_TAG = os.environ.get("BUILDKITE_COMMIT", "latest")
+BUILDKITE_SOURCE = os.environ.get("BUILDKITE_SOURCE", "")
 
 # (test_name, resource_class, extra_args, env_overrides)
 SUITES = {
@@ -33,7 +35,7 @@ SUITES = {
 }
 
 
-def selected_suites() -> list:
+def _read_suite_values() -> list[str]:
     raw = os.environ.get("NPU_SUITES")
     if raw is None:
         try:
@@ -45,10 +47,24 @@ def selected_suites() -> list:
             ).stdout
         except subprocess.CalledProcessError:
             raw = ""
-    values = [v.strip() for v in raw.replace(",", "\n").splitlines()]
-    unknown = [v for v in values if v and v not in SUITES]
+    return [v.strip() for v in raw.replace(",", "\n").splitlines()]
+
+
+def _ci_image() -> str:
+    values = _read_suite_values()
+    if ("image-build" in values) or (BUILDKITE_SOURCE == "schedule"):
+        return f"{IMAGE_REGISTRY}/{IMAGE_NAME}:{VIME_IMAGE_TAG}"
+    return DEFAULT_CI_IMAGE
+
+
+def selected_suites() -> list:
+    values = _read_suite_values()
+    unknown = [v for v in values if v and v not in SUITES and v != "image-build"]
     if unknown:
         raise SystemExit(f"unknown suite(s) {unknown}; expected {sorted(SUITES)}")
+    if "image-build" in values:
+        # image-build auto-includes smk tests
+        values.append("smk")
     return [s for s in SUITES if s in values]
 
 
@@ -81,13 +97,14 @@ def npu_step(suite: str, test_name: str, resource_class: str, extra_args: str, e
     label = f":fire: {suite}: {test_name}{' ' + extra_args if extra_args else ''}"
     step = {
         "label": label,
+        "depends_on": "image-build-npu",
         "command": command,
         "agents": {
             "queue": NPU_QUEUE,
             "resource_class": resource_class,
         },
         "timeout_in_minutes": 180,
-        "image": CI_IMAGE,
+        "image": _ci_image(),
         "plugins": [
             {
                 "kubernetes": {
@@ -104,7 +121,12 @@ def npu_step(suite: str, test_name: str, resource_class: str, extra_args: str, e
 
 def main() -> None:
     steps = [npu_step(suite, *entry) for suite in selected_suites() for entry in SUITES[suite]]
-    print(json.dumps({"steps": steps}, indent=2))
+    json_str = json.dumps({"steps": steps}, indent=2)
+
+    print("--- Generated Pipeline JSON:", file=sys.stderr)
+    print(json_str, file=sys.stderr)
+
+    print(json_str)
 
 
 if __name__ == "__main__":
