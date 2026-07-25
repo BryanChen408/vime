@@ -16,7 +16,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 export MODEL_ARGS_SCRIPT=qwen3.5-4B.sh
 # ── ① 权重路径 ──
 export HF_CKPT=/home/docker/Qwen3.5-4B
-export REF_LOAD=/home/docker/Qwen3.5-4B_torch_dist
+# export REF_LOAD=/home/docker/Qwen3.5-4B_torch_dist
+export REF_LOAD=/home/docker/Qwen3.5-4B_torch_dist_new
 export SAVE=${SAVE:-/workspace/Qwen3.5-4B_vime_swegym}
 # ── ② tool-parser:4B 发 <function=> XML(治 8B-instruct 的 hermes JSON 转义报错)──
 export VLLM_TOOL_CALL_PARSER=qwen3_coder
@@ -25,10 +26,13 @@ export FEAT_GDN=1
 export VLLM_MODEL_NAME=qwen3_5forconditionalgeneration
 export VLLM_HF_OVERRIDES='{"architectures":["Qwen3_5ForConditionalGeneration"]}'
 
-# ── context:对齐同事 sglang-context-length 32000(用户要求严格对齐)──
-#   4B native 256k,32000 远离 native edge → 天然无 8B 那种 40960=native-max 的 32001 off-by-one 坑。
-export VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32000}
-export ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-32000}
+# ── context:回归【官方上游 run.sh 默认】engine=50000(缓冲垫设计,非同事 override 的 32000)──
+#   官方 run.sh 默认 SGLANG_CONTEXT_LENGTH=50000;同事在 launch_e2e 把它 override 降到 32000(省 GPU 显存)。
+#   官方缓冲垫:engine 50000 ≥ prompt 累积(~32000)+ response 16000 → 多轮 agentic prompt 撞不到硬限,
+#   消除 32001 reject/截断;NPU 显存够开 50000(用户确认)。
+#   vime 侧 engine 硬限由 --vllm-max-model-len 决定(rollout-max-context-len 为 fallback),两个一起提到 50000。
+export VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-50000}
+export ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-50000}
 
 # ── 迭代:num-rollout 200(用户指定;同事 num-epoch 20≈320)──
 export NUM_ROLLOUT=${NUM_ROLLOUT:-200}

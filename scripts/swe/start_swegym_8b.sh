@@ -67,8 +67,9 @@ FEAT_LB_PROXY=1 \
 FEAT_WANDB=${FEAT_WANDB:-1} \
 WANDB_KEY=${WANDB_KEY:-} \
 WANDB_PROJECT=${WANDB_PROJECT:-polar-swegym-8b} \
-TRAIN_EXTRA_ARGS=${TRAIN_EXTRA_ARGS:-"--skip-eval-before-train --save-debug-rollout-data /home/docker/logs/dbgroll_swegym_{rollout_id}.pt"} \
+TRAIN_EXTRA_ARGS=${TRAIN_EXTRA_ARGS:-"--skip-eval-before-train"} \
 bash "${SCRIPT_DIR}/run-swegym-codex-polar.sh"
+# --save-debug-rollout-data /home/docker/logs/dbgroll_swegym_{rollout_id}.pt"
 
 # ── 看什么(判据,SWE 冒烟)────────────────────────────────────────────
 #   ✅ Risk #1 闸:completions≠0 —— codex↔vllm-ascend(/responses)通 + hermes 解到 <tool_call>;
