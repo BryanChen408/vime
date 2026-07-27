@@ -111,3 +111,34 @@ value-head 一律走原实现(no-op)。开关复用 `QWEN36_CHUNK_LMHEAD=1`,块�
 ## 8. 备选与不采纳
 - 移植 blackwell triton fused CE 到 Ascend:成本远高于 P1–P3,不采纳。
 - 仅调小 `max-tokens-per-gpu` / 靠 recompute:OOM 根因是 `[seq, vocab]` 全量 logits,与之无关,不解决。
+
+## 9. 启用与验证状态
+
+### 启用
+脚本带以下即自动生效(async math 脚本已含 `--chunked-lm-head`):
+```
+--chunked-lm-head              # 自动置 QWEN36_CHUNK_LMHEAD=1(arguments.py:170 / model.py:289)
+--enable-mtp-training          # 触发 MTP + 本设计的分块 CE(model.py:299 apply_chunked_mtp_ce_patch)
+--mtp-num-layers 1             # MTP 层数(enable_mtp_training 必须设,arguments.py:1948)
+```
+可调:`QWEN36_MTP_CE_CHUNK`(MTP CE 每块 seq 长,默认 1024)。
+
+### 实现状态(commit)
+- C1 `2c222e73` 设计文档 ✅
+- C2 `4352dcd1` P0 门控(logprob 路径在 MTP 下恢复分块)✅ — 消除 compute_log_prob OOM
+- C3 `ee3f86c0` 分块 MTP-CE patch(`chunked_mtp_ce_patch.py`,单一拦截点)✅
+- C4 `6ad0cc6e` model 构建处接线(`--enable-mtp-training` 时应用)✅
+- C5 `2bc3b162` 数值等价单测(前向+反向,TP=1 参照)✅ 已通过
+- C6 (本次) 启用/验证文档 + 确认 CI 钩子接线
+
+### CI 钩子(已在 model.py 就位,`--ci-test` + MTP 时跑)
+- `check_mtp_only_grad`(model.py:666-669):截断时只有 MTP 参数有非零梯度。
+- `check_mtp_loss`(model.py:879-882):MTP loss 在合理界内。
+
+### 端到端验证(C6,需 NPU run,由使用者执行)
+用 MTP async 脚本跑一步,检查:
+1. **不再 OOM** 在 `compute_output_layer_and_language_model_loss`(MTP 头分块生效);
+2. 日志有 `train/mtp_loss`(model.py:891),量级与非分块一致;
+3. 加 `--ci-test` 时上面两个 CI 校验通过。
+若开 static-kernel/ACL-graph 后仍在解码中途静默崩,先回退那两项(与本设计无关,见 [[run 记录]])。
+TP2/CP4/SP 组合下的数值等价以此 run 为准(C5 只覆盖 TP=1 机制层)。
