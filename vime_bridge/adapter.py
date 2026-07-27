@@ -109,6 +109,29 @@ def session_result_to_samples(
     )]
 
 
+def _is_non_agent_side_trace(trace: "Trace") -> bool:
+    """True when a trace's prompt cannot have come from the agent loop.
+
+    Training-side backstop for polar's ``record_filters`` exclusion, so a polar
+    deployment that predates that fix cannot feed these into GRPO. Judged on
+    prompt *shape* only: every agent-side turn carries the harness system prompt,
+    so a lone user message without one is a bare completion the harness emitted
+    outside the agent loop — typically the body of a file the agent just Read.
+
+    Deliberately does NOT key off tool-call count or trace length: legitimate
+    trailing turns (woken by a task-notification or an output-token-limit resume)
+    answer in prose and call no tools.
+    """
+    messages = trace.prompt_messages
+    if not isinstance(messages, list) or len(messages) != 1:
+        return False
+    message = messages[0]
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    tools = getattr(trace, "tools", None)
+    return not (isinstance(tools, list) and tools)
+
+
 def _build_sample(
     *,
     Sample: Any,
@@ -136,6 +159,14 @@ def _build_sample(
         logger.warning(
             "Dropping trace %d from session %s: total_len=%d > max_tokens=%d",
             trace_index, result.session_id, total_len, max_tokens,
+        )
+        return None
+
+    if _is_non_agent_side_trace(trace):
+        logger.warning(
+            "Dropping trace %d from session %s: non-agent-side prompt shape "
+            "(single user message, no system prompt); response_len=%d",
+            trace_index, result.session_id, len(response_ids),
         )
         return None
 
