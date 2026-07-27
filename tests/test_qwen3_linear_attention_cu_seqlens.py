@@ -27,6 +27,12 @@ def install_megatron_stubs() -> None:
     spec_utils_mod = types.ModuleType("megatron.core.transformer.spec_utils")
     transformer_block_mod = types.ModuleType("megatron.core.transformer.transformer_block")
     transformer_layer_mod = types.ModuleType("megatron.core.transformer.transformer_layer")
+    transformer_utils_mod = types.ModuleType("megatron.core.transformer.utils")
+    ssm_mod = types.ModuleType("megatron.core.ssm")
+    gated_delta_net_mod = types.ModuleType("megatron.core.ssm.gated_delta_net")
+    mamba_cp_mod = types.ModuleType("megatron.core.ssm.mamba_context_parallel")
+    tensor_parallel_mod = types.ModuleType("megatron.core.tensor_parallel")
+    tensor_parallel_layers_mod = types.ModuleType("megatron.core.tensor_parallel.layers")
 
     class PackedSeqParams:
         def __init__(self, **kwargs):
@@ -43,7 +49,19 @@ def install_megatron_stubs() -> None:
             self.module = module
             self.params = params or {}
 
+    class ParallelLinear(nn.Module):
+        """Stands in for Column/RowParallelLinear: same call signature, no parallelism."""
+
+        def __init__(self, input_size, output_size, *, config=None, bias=False, **kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(output_size, input_size))
+            self.bias = nn.Parameter(torch.zeros(output_size)) if bias else None
+
+        def forward(self, x):
+            return nn.functional.linear(x, self.weight, self.bias), None
+
     mpu_stub = types.SimpleNamespace(
+        is_initialized=lambda: False,
         get_context_parallel_world_size=lambda: 1,
         get_context_parallel_group=lambda: None,
         get_context_parallel_rank=lambda: 0,
@@ -62,6 +80,16 @@ def install_megatron_stubs() -> None:
     transformer_block_mod.get_num_layers_to_build = lambda *args, **kwargs: 0
     transformer_layer_mod.get_transformer_layer_offset = lambda *args, **kwargs: 0
 
+    transformer_utils_mod.ensure_metadata_has_dp_cp_group = lambda *args, **kwargs: None
+    transformer_utils_mod.make_sharded_tensors_for_checkpoint = lambda *args, **kwargs: {}
+    transformer_utils_mod.sharded_state_dict_default = lambda *args, **kwargs: {}
+    gated_delta_net_mod._split_tensor_factory = lambda *args, **kwargs: None
+    for _name in ("_all_to_all_cp2hp", "_all_to_all_hp2cp",
+                  "_undo_attention_load_balancing", "_redo_attention_load_balancing"):
+        setattr(mamba_cp_mod, _name, lambda *args, **kwargs: None)
+    tensor_parallel_layers_mod.ColumnParallelLinear = ParallelLinear
+    tensor_parallel_layers_mod.RowParallelLinear = ParallelLinear
+
     core_mod.mpu = mpu_stub
     core_mod.tensor_parallel = tensor_parallel_stub
 
@@ -78,6 +106,12 @@ def install_megatron_stubs() -> None:
     sys.modules["megatron.core.transformer.spec_utils"] = spec_utils_mod
     sys.modules["megatron.core.transformer.transformer_block"] = transformer_block_mod
     sys.modules["megatron.core.transformer.transformer_layer"] = transformer_layer_mod
+    sys.modules["megatron.core.transformer.utils"] = transformer_utils_mod
+    sys.modules["megatron.core.ssm"] = ssm_mod
+    sys.modules["megatron.core.ssm.gated_delta_net"] = gated_delta_net_mod
+    sys.modules["megatron.core.ssm.mamba_context_parallel"] = mamba_cp_mod
+    sys.modules["megatron.core.tensor_parallel"] = tensor_parallel_mod
+    sys.modules["megatron.core.tensor_parallel.layers"] = tensor_parallel_layers_mod
 
 
 class FakeShortConvolution(nn.Module):

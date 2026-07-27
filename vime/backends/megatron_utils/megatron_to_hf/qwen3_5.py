@@ -1,6 +1,47 @@
 import re
+from types import SimpleNamespace
 
 import torch
+
+from vime_plugins.mbridge.gdn_param_mapping import (
+    _split_gdn_grouped_to_separate,
+    deinterleave_gdn_conv1d,
+    split_gdn_linear_weights,
+)
+
+
+def _gdn_cfg(args):
+    """Duck-typed config for gdn_param_mapping, which only reads these five fields."""
+    return SimpleNamespace(
+        hidden_size=args.hidden_size,
+        linear_key_head_dim=args.linear_key_head_dim,
+        linear_value_head_dim=args.linear_value_head_dim,
+        linear_num_key_heads=args.linear_num_key_heads,
+        linear_num_value_heads=args.linear_num_value_heads,
+    )
+
+
+def _split_in_proj_weight(param, prefix, args):
+    """Gathered fused in_proj -> HF's separate in_proj_qkv/z/b/a.
+
+    De-interleaves by the TP size and then ungroups, the exact inverse of
+    ``merge_gdn_linear_weights`` on the mbridge side.
+    """
+    cfg = _gdn_cfg(args)
+    qkvz, ba = split_gdn_linear_weights(cfg, param, tp_size=args.tensor_model_parallel_size)
+    qkv, z, b, a = _split_gdn_grouped_to_separate(cfg, qkvz, ba)
+    return [
+        (f"{prefix}.linear_attn.in_proj_qkv.weight", qkv),
+        (f"{prefix}.linear_attn.in_proj_z.weight", z),
+        (f"{prefix}.linear_attn.in_proj_b.weight", b),
+        (f"{prefix}.linear_attn.in_proj_a.weight", a),
+    ]
+
+
+def _deinterleave_conv1d(param, prefix, args):
+    """Gathered conv1d [conv_dim, 1, k] -> HF's flat [q|k|v] layout."""
+    new_param = deinterleave_gdn_conv1d(param, _gdn_cfg(args), args.tensor_model_parallel_size)
+    return [(f"{prefix}.linear_attn.conv1d.weight", new_param)]
 
 
 def _convert_mtp_layer(args, name, param, layer_idx):
@@ -167,6 +208,15 @@ def convert_qwen3_5_to_hf(args, name, param):
             return [(f"{prefix}.self_attn.q_norm.weight", param)]
         elif rest == "self_attention.k_layernorm.weight":
             return [(f"{prefix}.self_attn.k_norm.weight", param)]
+        # The model keeps a fused in_proj and a TP-interleaved conv1d; split them back out.
+        elif rest == "self_attention.linear_attn.in_proj.weight":
+            return _split_in_proj_weight(param, prefix, args)
+        elif rest == "self_attention.linear_attn.conv1d.weight":
+            return _deinterleave_conv1d(param, prefix, args)
+        # vLLM declares A_log as an fp32 parameter and the Ascend fused GDN gating kernel takes
+        # it as fp32; ship it upcast so the receiving side never has to widen it.
+        elif rest in ("self_attention.linear_attn.A_log", "self_attention.linear_attn.norm.weight"):
+            return [(f"{prefix}.{rest[len('self_attention.') :]}", param.float())]
         elif rest.startswith("self_attention.") and rest[len("self_attention.") :] in [
             "input_layernorm.weight",
             # linear attn (Qwen3.5 uses separate in_proj_b/in_proj_a)

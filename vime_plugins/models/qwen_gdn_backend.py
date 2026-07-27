@@ -43,4 +43,34 @@ def get_chunk_gated_delta_rule(backend: str):
         _validate_flashqla_runtime()
         return chunk_gated_delta_rule
 
+    if backend == "npu":
+        # Ascend NPU path: AscendC-hybrid GDN op shipped with MindSpeed
+        # (mindspeed.ops.chunk_gated_delta_rule). This is the proven slime-ascend
+        # training kernel; it has the same call signature as the fla op.
+        try:
+            from mindspeed.ops.chunk_gated_delta_rule import chunk_gated_delta_rule
+        except ImportError as exc:
+            raise ImportError(
+                "Qwen GDN backend 'npu' requires mindspeed.ops.chunk_gated_delta_rule "
+                "(MindSpeed with GDN support + fla_npu AscendC kernels)."
+            ) from exc
+        return chunk_gated_delta_rule
+
     raise ValueError(f"Unsupported Qwen GDN backend: {backend}")
+
+
+def get_causal_conv1d(backend: str, impl: str = "triton"):
+    """Return the external depthwise causal-conv1d kernel, or None to use eager conv1d.
+
+    Only the Ascend NPU backend has one; the GPU backends stay on eager conv1d.
+    """
+    if backend != "npu" or impl != "triton":
+        return None
+    try:
+        from mindspeed.ops.causal_conv1d import causal_conv1d
+    except ImportError as exc:
+        raise ImportError(
+            "Qwen GDN backend 'npu' requires mindspeed.ops.causal_conv1d; "
+            "pass --qwen-gdn-conv1d-impl=eager to use the eager fallback instead."
+        ) from exc
+    return causal_conv1d

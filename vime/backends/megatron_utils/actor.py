@@ -80,6 +80,28 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if is_npu():
             repatch(args)
+            # init() above already ran initialize_model_parallel, but repatch() only now
+            # installs MindSpeed's wrapper around it — the one that builds the ring-attention
+            # window groups. Without them the full-attention layers fail under CP with
+            # "Context parallel ranks for ring intra window not initialized". Build them here
+            # instead; each helper checks the CP algorithm itself, so this is a no-op for
+            # configurations that do not use the ring.
+            if args.context_parallel_size > 1:
+                from mindspeed.core.context_parallel.model_parallel_utils import (
+                    initialize_context_parallel_group_for_double_ring,
+                    initialize_context_parallel_group_for_hybrid_cp,
+                    initialize_context_parallel_group_for_send_recv_overlap,
+                )
+
+                cp_group_args = (
+                    args.tensor_model_parallel_size,
+                    args.pipeline_model_parallel_size,
+                    args.context_parallel_size,
+                    {},
+                )
+                initialize_context_parallel_group_for_send_recv_overlap(*cp_group_args)
+                initialize_context_parallel_group_for_hybrid_cp(*cp_group_args)
+                initialize_context_parallel_group_for_double_ring(*cp_group_args)
         if is_megatron_main_rank():
             init_tracking(args, primary=False, role=role)
 

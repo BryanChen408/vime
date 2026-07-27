@@ -7,6 +7,22 @@ from mbridge.core import register_model
 from mbridge.models import Qwen2MoEBridge
 
 
+# Layout conversion helpers live in gdn_param_mapping; see that module for why they are
+# vendored rather than imported from megatron.bridge.
+from .gdn_param_mapping import (
+    _fuse_gdn_separate_to_grouped as _gdn_fuse_separate_to_grouped,
+    _split_gdn_grouped_to_separate as _gdn_split_grouped_to_separate,
+    deinterleave_gdn_conv1d as _deinterleave_gdn_conv1d,
+    interleave_gdn_conv1d as _interleave_gdn_conv1d,
+    merge_gdn_linear_weights as _gdn_merge_linear_weights,
+    split_gdn_linear_weights as _gdn_split_linear_weights,
+)
+
+# Order of the HF tensors that make up the fused in_proj. Single source of truth for both
+# the module mapping and the unpacking in _weight_to_mcore_format.
+_IN_PROJ_HF_ORDER = ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+
+
 @register_model(["qwen3_5", "qwen3_5_moe"])
 class Qwen3_5Bridge(Qwen2MoEBridge):
     """
@@ -38,18 +54,24 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
             "model.language_model.layers.{layer_number}.self_attn.k_proj.bias",
             "model.language_model.layers.{layer_number}.self_attn.v_proj.bias",
         ],
+        # HF's four separate tensors -> one fused megatron in_proj. Order is load-bearing and
+        # comes from _IN_PROJ_HF_ORDER: in_proj_b and in_proj_a are shape-identical, so swapping
+        # them would silently exchange beta and alpha instead of raising.
+        "self_attention.linear_attn.in_proj.weight": [
+            "model.language_model.layers.{layer_number}.linear_attn." + n + ".weight"
+            for n in _IN_PROJ_HF_ORDER
+        ],
+        # HF's flat [q|k|v] conv1d -> one megatron conv1d, interleaved per TP rank
+        "self_attention.linear_attn.conv1d.weight": [
+            "model.language_model.layers.{layer_number}.linear_attn.conv1d.weight"
+        ],
     } | {
         f"self_attention.{weight_name}": ["model.language_model.layers.{layer_number}." + weight_name]
         for weight_name in [
             "input_layernorm.weight",
-            # linear attn
+            # linear attn, passed through directly (in_proj and conv1d are mapped above)
             "linear_attn.A_log",
-            "linear_attn.conv1d.weight",
             "linear_attn.dt_bias",
-            "linear_attn.in_proj_a.weight",
-            "linear_attn.in_proj_b.weight",
-            "linear_attn.in_proj_qkv.weight",
-            "linear_attn.in_proj_z.weight",
             "linear_attn.norm.weight",
             "linear_attn.out_proj.weight",
             # gated attn (full attention layers)
@@ -302,11 +324,37 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
                 expert_w = w[global_expert_id]  # (out_features, in_features)
                 return expert_w.contiguous()
 
+        # HF's separate tensors -> TP-interleaved fused in_proj; mbridge then chunks it over TP.
+        if mcore_weights_name.endswith("linear_attn.in_proj.weight"):
+            tc = self._get_text_config()
+            assert len(hf_weights) == len(_IN_PROJ_HF_ORDER), (
+                f"expected {_IN_PROJ_HF_ORDER}, got {len(hf_weights)} tensors"
+            )
+            qkv, z, b, a = hf_weights  # order fixed by _IN_PROJ_HF_ORDER
+            qkvz, ba = _gdn_fuse_separate_to_grouped(tc, qkv, z, b, a)
+            in_proj = _gdn_merge_linear_weights(tc, qkvz, ba, tp_size=self.mpu.tp_size)
+            return in_proj.contiguous()
+        # conv1d [q|k|v] -> interleaved per TP rank, matching the in_proj qkv segments
+        if mcore_weights_name.endswith("linear_attn.conv1d.weight"):
+            return _interleave_gdn_conv1d(hf_weights[0], self._get_text_config(), self.mpu.tp_size)
+
         return super()._weight_to_mcore_format(mcore_weights_name, hf_weights)
 
     def _weight_to_hf_format(
         self, mcore_weights_name: str, mcore_weights: torch.Tensor
     ) -> tuple[list[str], list[torch.Tensor]]:
+        # gathered fused in_proj -> HF's separate tensors, for the rollout weight update
+        if mcore_weights_name.endswith("linear_attn.in_proj.weight"):
+            tc = self._get_text_config()
+            hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)  # ordered by _IN_PROJ_HF_ORDER
+            qkvz, ba = _gdn_split_linear_weights(tc, mcore_weights, tp_size=self.mpu.tp_size)
+            qkv, z, b, a = _gdn_split_grouped_to_separate(tc, qkvz, ba)
+            return hf_names, [qkv.contiguous(), z.contiguous(), b.contiguous(), a.contiguous()]
+        # gathered conv1d -> de-interleaved back to HF's flat [q|k|v]
+        if mcore_weights_name.endswith("linear_attn.conv1d.weight"):
+            hf_names = self._weight_name_mapping_mcore_to_hf(mcore_weights_name)
+            conv = _deinterleave_gdn_conv1d(mcore_weights, self._get_text_config(), self.mpu.tp_size)
+            return hf_names, [conv]
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 
     def _build_config(self):

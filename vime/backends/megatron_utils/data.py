@@ -121,6 +121,31 @@ def get_batch(
             qkv_format="thd",
         )
 
+        # The linear-attention layers want the cumulative lengths exactly as built above.
+        # Keep a copy under a private name before the ring path repoints cu_seqlens_q.
+        packed_seq_params.cu_seqlens_gdn = cu_seqlens
+
+        # vime drives Megatron core's GPTModel.forward rather than MindSpeed's wrapper, so
+        # nothing fills in what the ring attention needs. Its two consumers disagree on the
+        # convention, which Megatron separates through the *_padded fields:
+        #   cu_seqlens_q_padded  origin lengths with the leading 0, divided by cp_size by the
+        #                        rotary embedding
+        #   cu_seqlens_q         CP-local lengths without the leading 0; a leading zero would
+        #                        give the ring kernel an empty segment
+        # q_index / kv_index are the zigzag half-split indices, which Megatron never sets.
+        if cp_size > 1:
+            packed_seq_params.cu_seqlens_q_padded = cu_seqlens
+            packed_seq_params.cu_seqlens_kv_padded = cu_seqlens
+            ring_cu_seqlens = (cu_seqlens // cp_size)[1:].contiguous()
+            packed_seq_params.cu_seqlens_q = ring_cu_seqlens
+            packed_seq_params.cu_seqlens_kv = ring_cu_seqlens
+
+            from mindspeed.utils import compute_qkv_index
+
+            q_index, kv_index = compute_qkv_index(ring_cu_seqlens.tolist())
+            packed_seq_params.q_index = q_index
+            packed_seq_params.kv_index = kv_index
+
         tokens = tokens.unsqueeze(0)
     else:
         raise ValueError(f"Unsupported qkv_format: {qkv_format}")
