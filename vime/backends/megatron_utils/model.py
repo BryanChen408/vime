@@ -293,6 +293,14 @@ def setup_model_and_optimizer(
 
         apply_chunked_lm_head_patch()
 
+        # [MTP chunked CE] 开了 MTP 训练时,把 MTP 头的 CE 也纳入分块(拦截
+        # compute_output_layer_and_language_model_loss 非融合分支),否则 NPU 上 MTP 头
+        # 全量 [seq,vocab] logits 会 OOM。roll/scale/日志沿用 Megatron 既有机制。见 chunked_mtp_ce_patch。
+        if getattr(args, "enable_mtp_training", False):
+            from vime.backends.megatron_utils.chunked_mtp_ce_patch import apply_chunked_mtp_ce_patch
+
+            apply_chunked_mtp_ce_patch()
+
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Optimizer
