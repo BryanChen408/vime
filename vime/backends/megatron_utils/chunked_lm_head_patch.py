@@ -31,6 +31,17 @@ def _chunked_lm_head_enabled() -> bool:
     return os.environ.get("QWEN36_CHUNK_LMHEAD", "0") == "1"
 
 
+def _mtp_ce_chunk_active() -> bool:
+    """chunked_mtp_ce_patch 是否已应用(MTP 头 CE 走 F.linear 分块,不碰 output_layer.forward)。
+    True 时主头旁路对 MTP 无害 → train forward 也可走旁路让主头分块。"""
+    try:
+        from megatron.core.models.common.language_module.language_module import LanguageModule
+
+        return getattr(LanguageModule, "_chunked_mtp_ce_patched", False)
+    except Exception:
+        return False
+
+
 def apply_chunked_lm_head_patch():
     """对 GPTModel.forward 打 monkey-patch(幂等)。在 model 构建后调用。"""
     from megatron.core.models.gpt.gpt_model import GPTModel
@@ -46,11 +57,18 @@ def apply_chunked_lm_head_patch():
             not _chunked_lm_head_enabled()
             or not getattr(self, "post_process", False)
             or labels is not None
-            # [P0] 从"结构含 MTP(mtp_process)"收窄为"本次 forward 真传了 mtp_labels"。
+            # [P0] guard 从"结构含 MTP(mtp_process)"收窄为"本次 forward 真传了 mtp_labels"。
             # logprob forward(forward_only)不传 mtp_labels → 即使模型结构含 MTP 也应分块,
             # 否则一开 --enable-mtp-training 就把主头分块全局关掉、compute_log_prob 先 OOM。
-            # 带 mtp_labels 的 train forward 仍跳过(MTP 头分块由 chunked_mtp_ce_patch 处理)。
-            or ((kwargs.get("mtp_kwargs") or {}).get("mtp_labels") is not None)
+            # [C8] 带 mtp_labels 的 train forward:仅当 chunked_mtp_ce 未生效时才跳过(那时 MTP 用
+            #   functional_call(output_layer) 会被旁路污染)。C3 生效后 MTP 走 F.linear、不碰
+            #   output_layer.forward → 旁路对 MTP 无害,可照走,让 train 主头也分块(否则主头返回
+            #   全量 [T,V] logits → logits.float() 复现 OOM)。postprocess 里 MTP autoscaler 梯度
+            #   挂在主 hidden 上,旁路返回该 hidden,反向策略梯度 + MTP 梯度都流。
+            or (
+                (kwargs.get("mtp_kwargs") or {}).get("mtp_labels") is not None
+                and not _mtp_ce_chunk_active()
+            )
             # [F-PPO-1] critic 的 value head 是 hidden→1 的 output_layer,别旁路它。旁路只为躲 LM-head
             # 的 [T, vocab] logits OOM;value 出 [T, 1],材料化本就 trivial、永不 OOM。若旁路,
             # critic get_values 会收到 hidden [T, h] 而非 values [T, 1] → get_responses 断言

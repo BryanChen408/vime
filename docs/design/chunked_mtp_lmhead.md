@@ -129,7 +129,13 @@ value-head 一律走原实现(no-op)。开关复用 `QWEN36_CHUNK_LMHEAD=1`,块�
 - C3 `ee3f86c0` 分块 MTP-CE patch(`chunked_mtp_ce_patch.py`,单一拦截点)✅
 - C4 `6ad0cc6e` model 构建处接线(`--enable-mtp-training` 时应用)✅
 - C5 `2bc3b162` 数值等价单测(前向+反向,TP=1 参照)✅ 已通过
-- C6 (本次) 启用/验证文档 + 确认 CI 钩子接线
+- C6 `1c2e17de` 启用/验证文档 + 确认 CI 钩子接线
+- C7 `35492311` P0-fix:跳过旁路时清 stale `_LM_HEAD_WEIGHT`(修 per-forward guard 引入的
+  全局泄漏 → train forward 误把 logits 当 hidden → matmul k 轴崩)
+- C8 (本次) P0 精化:`mtp_labels` 跳过**仅在 C3 未生效时**触发。C3 生效后 MTP 走
+  `F.linear`(不碰 `output_layer.forward`)→ 旁路对 MTP 无害,train forward 照走旁路让**主头也
+  分块**,否则主头返回全量 `[T,V]` logits、`logits.float()` 复现 OOM。已核 postprocess:MTP
+  autoscaler 梯度挂在主 hidden、旁路返回该 hidden,反向策略+MTP 梯度均流(端到端仍以 NPU run 为准)。
 
 ### CI 钩子(已在 model.py 就位,`--ci-test` + MTP 时跑)
 - `check_mtp_only_grad`(model.py:666-669):截断时只有 MTP 参数有非零梯度。
