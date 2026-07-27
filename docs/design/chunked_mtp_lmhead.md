@@ -64,8 +64,17 @@ compute_output_layer_and_language_model_loss` 两条路:
 | **P3 接回总 loss + 日志** | mtp_loss 按 `mtp_loss_scaling_factor/mtp_num_layers` 及 `/num_tokens`(`gpt_model.py:624-631`)缩放,加入 actor 训练 loss;保留/替换 `MTPLossLoggingHelper` 的 `train/mtp_loss` | loss 量级与非分块一致,梯度只进 MTP 参数(`ci_utils.check_mtp_only_grad` 已有校验) |
 
 **关键洞察落地**:MTP CE(`-log p(mtp_label)`)与主头 policy logprob 是同一套逐 token vocab-parallel
-logprob 计算,只是目标 token 换成右移的 `mtp_labels`、并做求和/scale。→ P2 直接复用 `loss.py` 主头分块,
-不重写 CE。
+logprob 计算,只是目标 token 换成右移的 `mtp_labels`、并做求和/scale。
+
+### 4.1 实现精化(C3 落地时发现的更优拦截点)
+读 `gpt_model.py:568-635` 后确认:MTP 的 roll / loss_mask / `MTPLossAutoScaler.apply`(注入反向)/
+`MTPLossLoggingHelper`(记录)**全在 Megatron 的 postprocess 里**,唯一材料化全量 logits 的是
+`compute_output_layer_and_language_model_loss` 的非融合分支。→ **不必把 hidden 导出到 vime**(原 P1),
+只需**拦截 `LanguageModule.compute_output_layer_and_language_model_loss` 的非融合分支做分块**,
+返回同样的逐 token CE `[b,s]`,其余机制原样不动。这把 P1+P2+P3(loss 计算部分)收敛成**单一 patch**
+`chunked_mtp_ce_patch.py`:SP 先 gather 一次 → 按 seq 切块 → 每块真 weight matmul(保梯度)+ 复用
+`self.compute_language_model_loss`(vocab-parallel CE)→ 拼回 `[b,s]`。fused 分支 / 未开 chunked /
+value-head 一律走原实现(no-op)。开关复用 `QWEN36_CHUNK_LMHEAD=1`,块大小 `QWEN36_MTP_CE_CHUNK`(默认 1024)。
 
 ## 5. 正确性雷区(必须逐条验)
 1. **MTP label 的 roll + CP 边界**:Megatron 用 `roll_tensor(shifts=-1, cp_group, packed_seq_params)`
@@ -81,14 +90,14 @@ logprob 计算,只是目标 token 换成右移的 `mtp_labels`、并做求和/sc
 |---|---|---|---|
 | C1 | `docs(mtp): chunked LM-head 接入 MTP 设计文档` | 本文档 | — |
 | C2 | `fix(chunked-lmhead): gate skip on mtp_labels, not mtp_process (P0)` | `chunked_lm_head_patch.py:49` 判据改造 | ✅ 开 MTP 后 compute_log_prob 不再 OOM |
-| C3 | `feat(mtp): export MTP hidden from postprocess for chunked CE (P1)` | 新 `chunked_mtp_ce_patch.py`;patch `_postprocess` MTP 分支延迟 CE、导出 hidden;flag 关时 no-op | ✅ flag 关无行为变化;flag 开能拿到 mtp hidden |
-| C4 | `feat(mtp): chunked MTP-CE reusing main-head chunk (P2)` | `loss.py` 加 MTP CE 分块(复用 `chunked_logprob_entropy_from_hidden`) | ✅ 单测:分块 CE == 非分块 CE(容差) |
-| C5 | `feat(mtp): wire mtp_loss into actor loss + scaling + logging (P3)` | actor 总 loss 接入、scale/归一、`train/mtp_loss` 日志、grad-only-MTP 保持 | ✅ 端到端:MTP 训练不 OOM、loss 量级对、grad 校验过 |
-| C6 | `test(mtp): numerical-equivalence + CI + script enablement` | 等价性单测、`ci_utils` MTP grad/loss 校验接线、脚本开关文档 | ✅ CI 绿 |
+| C3 | `feat(mtp): chunked MTP-CE via compute_output_layer loss patch (P1+P2)` | 新 `chunked_mtp_ce_patch.py`:拦截 `compute_output_layer_and_language_model_loss` 非融合分支做分块(SP-gather→切块→matmul+vocab-parallel CE→拼回);flag 关 no-op。**单一拦截点收敛原 P1+P2** | ✅ flag 关无行为变化(fused/未开/value-head 走原实现) |
+| C4 | `feat(mtp): apply patch at model build + enable in MTP script (P3)` | model 构建处调 `apply_chunked_mtp_ce_patch`(挨着 `apply_chunked_lm_head_patch`);MTP async 脚本置 `QWEN36_CHUNK_LMHEAD=1`;loss/scale/日志沿用 Megatron 既有机制(无需改) | ✅ 端到端:MTP 训练不 OOM |
+| C5 | `test(mtp): numerical-equivalence of chunked vs full MTP-CE` | 小样本单测:分块 CE == 非分块 CE(容差),含 TP/CP/SP 组合 | ✅ 数值等价 |
+| C6 | `test(mtp): CI grad/loss checks + run notes` | `ci_utils` MTP grad/loss 校验接线、脚本开关文档、端到端 run 记录 | ✅ CI 绿 + 跑通 |
 
-**落地顺序**:C1 先落(持久化设计)→ C2 单独验(logprob 路径复活)→ C3+C4+C5 连做(MTP 头分块正解)
-→ C6 收口。C2 零风险,C3-C5 为核心,C4 因复用主头分块而减负,主要工作量在 C3(从 postprocess 干净导出
-MTP hidden)与 C5(scale/日志/grad)。
+**落地顺序**:C1 先落(持久化设计)→ C2 单独验(logprob 路径复活,零风险)→ C3 核心分块 patch → C4 接线+开关
+(端到端不 OOM)→ C5 数值等价(建立正确性)→ C6 收口。因 §4.1 收敛,C3 一件即含原 P1+P2,C4 极薄
+(loss 机制留在 Megatron),主要正确性风险在 C5 的等价验证。
 
 ## 7. 关键文件索引
 - `vime/backends/megatron_utils/chunked_lm_head_patch.py` —— 主头分块 monkey-patch(`:45-58` 跳过条件,`:49` = P0 改点)
