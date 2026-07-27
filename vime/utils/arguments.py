@@ -91,6 +91,19 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--npu-offload-backend",
+                type=str,
+                choices=["auto", "tms", "storage-resize"],
+                default="auto",
+                help=(
+                    "How to release the training weights on NPU while the rollout engine runs. "
+                    "'tms' hands the torch allocator to torch_memory_saver, which requires "
+                    "expandable_segments to be off. 'storage-resize' resizes Megatron's DDP flat "
+                    "buffers instead and leaves the allocator configuration alone. "
+                    "'auto' selects tms. Ignored on GPU, which always uses tms."
+                ),
+            )
+            parser.add_argument(
                 "--offload-rollout",
                 action=argparse.BooleanOptionalAction,
                 help=(
@@ -1629,6 +1642,23 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+def _resolve_npu_offload_backend(args) -> str:
+    """Resolve --npu-offload-backend and warn when it overrides an allocator request."""
+    from vime.utils.common import is_npu
+
+    if not is_npu():
+        return "tms"
+
+    backend = "tms" if args.npu_offload_backend == "auto" else args.npu_offload_backend
+    if backend == "tms" and "expandable_segments:True" in os.environ.get("PYTORCH_NPU_ALLOC_CONF", ""):
+        logger.warning(
+            "PYTORCH_NPU_ALLOC_CONF asks for expandable_segments, but the tms offload backend "
+            "takes over the allocator and starts the training actor with it off. Use "
+            "--npu-offload-backend=storage-resize to keep expandable segments."
+        )
+    return backend
+
+
 def vime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
@@ -1820,6 +1850,8 @@ def vime_validate_args(args):
     if args.offload_train:
         args.disable_grad_buffers_cpu_backup = True
         args.disable_param_buffers_cpu_backup = True
+
+    args.npu_offload_backend = _resolve_npu_offload_backend(args)
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path
