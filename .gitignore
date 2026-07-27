@@ -177,11 +177,17 @@ settings.json
 # PyPI configuration file
 .pypirc
 
+# Run artifacts
 wandb/
+output/
 outputs/
+runs/
 local/
+torch_compile_debug/
 **/rollout_data/
 **/buffer_stats/
+# --save-debug-rollout-data dumps, wherever the path template puts them
+**/*debug_rollout*.pt
 *.out
 *.pkl
 *.code-workspace
