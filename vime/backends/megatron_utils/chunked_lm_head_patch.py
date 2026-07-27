@@ -59,6 +59,11 @@ def apply_chunked_lm_head_patch():
             or getattr(getattr(self, "output_layer", None), "weight", None) is None
             or self.output_layer.weight.shape[0] == 1
         ):
+            # [P0-fix] 不走旁路时必须清掉模块级全局。否则:log-prob forward(旁路命中)设了
+            # _LM_HEAD_WEIGHT,紧接的 train forward(带 mtp_labels → 跳过旁路)返回的是完整
+            # logits [T,V],但 loss.py:421 会回退读这个残留全局 → 误判 logits 为 hidden →
+            # 再乘一次 lm_head → k 轴 [.,V] vs [.,h] 不匹配 matmul 崩。清 None → loss 走全 logits 路径。
+            _LM_HEAD_WEIGHT = None
             return _orig_forward(self, *args, **kwargs)
 
         # 旁路 output_layer:patch 其 .forward(nn.Module.__call__ 内部调 self.forward,
