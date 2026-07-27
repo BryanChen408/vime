@@ -46,7 +46,11 @@ def apply_chunked_lm_head_patch():
             not _chunked_lm_head_enabled()
             or not getattr(self, "post_process", False)
             or labels is not None
-            or getattr(self, "mtp_process", False)  # MTP 路径不走(它在 postprocess 内算 loss)
+            # [P0] 从"结构含 MTP(mtp_process)"收窄为"本次 forward 真传了 mtp_labels"。
+            # logprob forward(forward_only)不传 mtp_labels → 即使模型结构含 MTP 也应分块,
+            # 否则一开 --enable-mtp-training 就把主头分块全局关掉、compute_log_prob 先 OOM。
+            # 带 mtp_labels 的 train forward 仍跳过(MTP 头分块由 chunked_mtp_ce_patch 处理)。
+            or ((kwargs.get("mtp_kwargs") or {}).get("mtp_labels") is not None)
             # [F-PPO-1] critic 的 value head 是 hidden→1 的 output_layer,别旁路它。旁路只为躲 LM-head
             # 的 [T, vocab] logits OOM;value 出 [T, 1],材料化本就 trivial、永不 OOM。若旁路,
             # critic get_values 会收到 hidden [T, h] 而非 values [T, 1] → get_responses 断言
