@@ -275,6 +275,11 @@ def create_training_models(args, pgs, rollout_manager):
         )
         if args.megatron_config_path is None:
             critic_args.disable_param_buffers_cpu_backup = False
+            # Saving reads the checkpoint directory off the global args and knows nothing about
+            # roles, so a copied config would have the critic overwrite the actor. A config
+            # file gives the critic role its own save path already.
+            if getattr(critic_args, "save", None):
+                critic_args.save = critic_args.save.rstrip("/") + "_critic"
 
         critic_model = allocate_train_group(
             args=critic_args,
