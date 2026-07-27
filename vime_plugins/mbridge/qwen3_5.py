@@ -89,13 +89,12 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
         "mlp.experts.linear_fc2": ["model.language_model.layers.{layer_number}.mlp.experts.down_proj"],
     }
 
-    # MTP layer uses individual expert format (not fused)
+    # MTP layer uses the same fused expert tensors as the base Qwen3.6 HF checkpoint.
     _MTP_MLP_MAPPING = {
         "mlp.experts.linear_fc1": [
-            "mtp.layers.{layer_number}.mlp.experts.{expert_id}.gate_proj.weight",
-            "mtp.layers.{layer_number}.mlp.experts.{expert_id}.up_proj.weight",
+            "mtp.layers.{layer_number}.mlp.experts.gate_up_proj",
         ],
-        "mlp.experts.linear_fc2": ["mtp.layers.{layer_number}.mlp.experts.{expert_id}.down_proj.weight"],
+        "mlp.experts.linear_fc2": ["mtp.layers.{layer_number}.mlp.experts.down_proj"],
     }
 
     # Override to make ffn_hidden_size optional (Qwen3.5 MoE has no intermediate_size)
@@ -181,7 +180,7 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
         return convert_names
 
     def _weight_name_mapping_mtp_mlp(self, name: str) -> list[str]:
-        """Handle MTP MLP mappings, keeping per-expert tensors unfused for MoE layers."""
+        """Handle MTP MLP mappings, reusing the checkpoint's fused expert tensors."""
         layer_number = name.split(".")[2]
         mapping = self._MTP_MLP_MAPPING if "mlp.experts.linear_fc" in name else self._MLP_MAPPING
         convert_names = []
