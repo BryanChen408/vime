@@ -215,6 +215,11 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
+    if getattr(args, "chunked_lm_head", False):
+        from vime.backends.megatron_utils.chunked_lm_head_patch import apply_chunked_lm_head_patch
+
+        apply_chunked_lm_head_patch()
+
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Optimizer
