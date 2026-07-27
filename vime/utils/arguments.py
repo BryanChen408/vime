@@ -116,9 +116,19 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--qwen-gdn-backend",
                 type=str,
-                choices=["fla", "flashqla"],
+                choices=["fla", "flashqla", "npu"],
                 default="fla",
                 help="GDN implementation backend for Qwen linear-attention layers.",
+            )
+            parser.add_argument(
+                "--qwen-gdn-conv1d-impl",
+                type=str,
+                choices=["triton", "eager"],
+                default="triton",
+                help=(
+                    "Causal conv1d implementation for the Qwen linear-attention layers. "
+                    "Only applies to --qwen-gdn-backend=npu; 'eager' falls back to conv1d."
+                ),
             )
             parser.add_argument(
                 "--train-env-vars",

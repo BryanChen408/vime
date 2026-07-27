@@ -104,12 +104,19 @@ def install_bridge_stubs():
 
 def load_bridge_module():
     install_bridge_stubs()
-    module_path = Path(__file__).resolve().parents[1] / "vime_plugins" / "mbridge" / "qwen3_5.py"
-    module_name = "test_qwen3_5_bridge_module"
+    # The bridge imports gdn_param_mapping relatively, so it needs a package to be loaded from.
+    package_dir = Path(__file__).resolve().parents[1] / "vime_plugins" / "mbridge"
+    package_name = "test_qwen3_5_bridge_pkg"
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(package_dir)]
+    sys.modules[package_name] = package
+
+    module_name = f"{package_name}.qwen3_5"
     sys.modules.pop(module_name, None)
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    spec = importlib.util.spec_from_file_location(module_name, package_dir / "qwen3_5.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -237,3 +244,108 @@ def test_raw_qwen3_5_mtp_export_keeps_eh_proj_column_order():
     )
 
     assert converted == [("mtp.fc.weight", weight)]
+
+
+def load_gdn_param_mapping_module():
+    """Load gdn_param_mapping directly; it only needs torch, no megatron stubs."""
+    module_path = Path(__file__).resolve().parents[1] / "vime_plugins" / "mbridge" / "gdn_param_mapping.py"
+    module_name = "test_gdn_param_mapping_module"
+    sys.modules.pop(module_name, None)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def gdn_config():
+    """Small GDN geometry whose dims stay divisible by the tp sizes under test."""
+    return types.SimpleNamespace(
+        hidden_size=32,
+        linear_key_head_dim=4,
+        linear_value_head_dim=8,
+        linear_num_key_heads=8,
+        linear_num_value_heads=16,
+    )
+
+
+def gdn_dims(config):
+    return (
+        config.linear_key_head_dim * config.linear_num_key_heads,
+        config.linear_value_head_dim * config.linear_num_value_heads,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_gdn_in_proj_merge_split_roundtrip(tp_size):
+    module = load_gdn_param_mapping_module()
+    config = gdn_config()
+    qk_dim, v_dim = gdn_dims(config)
+    generator = torch.Generator().manual_seed(0)
+    hidden = config.hidden_size
+    qkv = torch.randn(qk_dim * 2 + v_dim, hidden, generator=generator)
+    z = torch.randn(v_dim, hidden, generator=generator)
+    b = torch.randn(config.linear_num_value_heads, hidden, generator=generator)
+    a = torch.randn(config.linear_num_value_heads, hidden, generator=generator)
+
+    qkvz, ba = module._fuse_gdn_separate_to_grouped(config, qkv, z, b, a)
+    in_proj = module.merge_gdn_linear_weights(config, qkvz, ba, tp_size=tp_size)
+    assert in_proj.shape == (qk_dim * 2 + v_dim * 2 + config.linear_num_value_heads * 2, hidden)
+
+    qkvz_back, ba_back = module.split_gdn_linear_weights(config, in_proj, tp_size=tp_size)
+    qkv_back, z_back, b_back, a_back = module._split_gdn_grouped_to_separate(config, qkvz_back, ba_back)
+
+    assert torch.equal(qkv_back, qkv)
+    assert torch.equal(z_back, z)
+    assert torch.equal(b_back, b)
+    assert torch.equal(a_back, a)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_gdn_conv1d_interleave_roundtrip(tp_size):
+    module = load_gdn_param_mapping_module()
+    config = gdn_config()
+    qk_dim, v_dim = gdn_dims(config)
+    conv = torch.randn(qk_dim * 2 + v_dim, 1, 4, generator=torch.Generator().manual_seed(1))
+
+    interleaved = module.interleave_gdn_conv1d(conv, config, tp_size)
+    assert interleaved.shape == conv.shape
+
+    restored = module.deinterleave_gdn_conv1d(interleaved, config, tp_size)
+    assert torch.equal(restored, conv)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_gdn_conv1d_interleave_keeps_ranks_segment_aligned(tp_size):
+    """Each rank's chunk must hold whole [q|k|v] segments, in that order."""
+    module = load_gdn_param_mapping_module()
+    config = gdn_config()
+    qk_dim, v_dim = gdn_dims(config)
+    marker = torch.cat(
+        [torch.zeros(qk_dim, 1, 1), torch.ones(qk_dim, 1, 1), torch.full((v_dim, 1, 1), 2.0)]
+    )
+
+    chunks = module.interleave_gdn_conv1d(marker, config, tp_size).chunk(tp_size, dim=0)
+    expected = torch.cat(
+        [
+            torch.zeros(qk_dim // tp_size),
+            torch.ones(qk_dim // tp_size),
+            torch.full((v_dim // tp_size,), 2.0),
+        ]
+    )
+    for chunk in chunks:
+        assert torch.equal(chunk.flatten(), expected)
+
+
+@pytest.mark.unit
+def test_gdn_conv1d_interleave_rejects_indivisible_tp_size():
+    module = load_gdn_param_mapping_module()
+    config = gdn_config()
+    qk_dim, v_dim = gdn_dims(config)
+    conv = torch.zeros(qk_dim * 2 + v_dim, 1, 4)
+
+    with pytest.raises(AssertionError, match="divisible by tp_size"):
+        module.interleave_gdn_conv1d(conv, config, tp_size=5)
