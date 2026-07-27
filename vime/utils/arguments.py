@@ -173,6 +173,15 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--chunked-lm-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Compute log-probs and entropy per chunk instead of materialising the full "
+                    "[seq, vocab] logits, so the peak no longer scales with sequence length."
+                ),
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",

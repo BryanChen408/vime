@@ -8,10 +8,12 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from vime.backends.megatron_utils.chunked_lm_head_patch import get_captured_lm_head_weight
 from vime.utils.distributed_utils import distributed_masked_whiten
 from vime.utils.misc import load_function
 from vime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
+    chunked_logprob_entropy_from_hidden,
     compute_approx_kl,
     compute_gspo_kl,
     compute_opsm_mask,
@@ -406,7 +408,13 @@ def get_log_probs_and_entropy(
     assert non_loss_data
     qkv_format = args.qkv_format
 
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    # With --chunked-lm-head the model returns decoder hidden states instead of logits, so
+    # `logits` is [b, seq, hidden] in the model dtype. Everything below (reshape, temperature
+    # scaling, per-sample slicing) applies unchanged; only the final projection differs.
+    lm_head_weight = get_captured_lm_head_weight()
+
+    if lm_head_weight is None:
+        assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
@@ -431,14 +439,25 @@ def get_log_probs_and_entropy(
         T, device, unconcat_tokens, total_lengths, response_lengths, qkv_format, max_seq_lens, args.allgather_cp
     )
 
-    # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
-    log_prob_full, entropy_full = calculate_log_probs_and_entropy(
-        logits,
-        full_tokens,
-        tp_group,
-        with_entropy=with_entropy,
-        chunk_size=chunk_size,
-    )
+    if lm_head_weight is not None:
+        # `logits` is hidden [T, h]: project and reduce one chunk at a time so the peak is
+        # [chunk, vocab/tp] rather than [T, vocab/tp].
+        log_prob_full, entropy_full = chunked_logprob_entropy_from_hidden(
+            logits,
+            lm_head_weight,
+            full_tokens,
+            tp_group,
+            chunk_size=chunk_size if chunk_size > 0 else 1024,
+            with_entropy=with_entropy,
+        )
+    else:
+        log_prob_full, entropy_full = calculate_log_probs_and_entropy(
+            logits,
+            full_tokens,
+            tp_group,
+            with_entropy=with_entropy,
+            chunk_size=chunk_size,
+        )
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
     # --- extract per-sample response portions ---
