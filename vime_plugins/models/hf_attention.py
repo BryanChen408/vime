@@ -67,6 +67,11 @@ class HuggingfaceAttention(MegatronModule, ABC):
     "cross attn" specializations.
     """
 
+    # Under CP this base class all-gathers the sequence and runs the duplicated computation.
+    # Subclasses that handle CP themselves (e.g. with an all-to-all inside the kernel) set this
+    # to False and receive the CP-scattered input unchanged.
+    gathers_cp_in_base = True
+
     def __init__(
         self,
         args,
@@ -102,7 +107,9 @@ class HuggingfaceAttention(MegatronModule, ABC):
         inference_params: BaseInferenceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert packed_seq_params is not None
-        cu_seqlens = packed_seq_params.cu_seqlens_q
+        # GDN needs the padded leading-0 cu_seqlens; under CP>1 cu_seqlens_q is repointed to the
+        # MindSpeed ring convention (no leading 0), so read the stashed GDN copy when present.
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_gdn", packed_seq_params.cu_seqlens_q)
 
         if self.args.sequence_parallel:
             # tensor_parallel_output_grad=False: the linear attention after this
@@ -114,8 +121,10 @@ class HuggingfaceAttention(MegatronModule, ABC):
                 group=mpu.get_tensor_model_parallel_group(),
             )
 
-        if mpu.get_context_parallel_world_size() > 1:
-            cp_size = mpu.get_context_parallel_world_size()
+        cp_size = mpu.get_context_parallel_world_size()
+        gather_cp = cp_size > 1 and self.gathers_cp_in_base
+
+        if gather_cp:
             # Use custom all-gather whose backward returns local gradient
             # instead of reduce-scatter, since the computation is duplicated.
             hidden_states_list = _AllGatherForDuplicatedComputation.apply(
@@ -149,7 +158,7 @@ class HuggingfaceAttention(MegatronModule, ABC):
 
         output = output.permute(1, 0, 2)  # [seq_len, bsz, hidden_dim]
 
-        if mpu.get_context_parallel_world_size() > 1:
+        if gather_cp:
             cp_rank = mpu.get_context_parallel_rank()
             output_list = []
             for i in range(len(cu_seqlens) - 1):
