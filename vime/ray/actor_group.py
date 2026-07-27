@@ -64,14 +64,17 @@ class RayTrainGroup:
             import torch_memory_saver
 
             if is_npu():
-                env_vars["TMS_HOOK_MODE"] = "torch"
-                env_vars["TMS_REGION_TAG"] = "training"
-                env_vars["TMS_ENABLE_CPU_BACKUP"] = "1"
-                if self.args.colocate:
-                    env_vars["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:False"
                 cann_python_path = get_cann_python_site_packages()
                 if cann_python_path is not None:
                     prepend_pythonpath(env_vars, cann_python_path)
+                # storage-resize works at the Python level and leaves the allocator alone, so
+                # none of this applies to it.
+                if self.args.npu_offload_backend == "tms":
+                    env_vars["TMS_HOOK_MODE"] = "torch"
+                    env_vars["TMS_REGION_TAG"] = "training"
+                    env_vars["TMS_ENABLE_CPU_BACKUP"] = "1"
+                    if self.args.colocate:
+                        env_vars["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:False"
             else:
                 for path in [
                     "torch_memory_saver_hook_mode_preload_cu12.abi3.so",

@@ -38,6 +38,7 @@ from vime.utils.distributed_utils import get_gloo_group
 from vime.utils.logging_utils import init_tracking
 from vime.utils.memory_utils import clear_memory, print_memory
 from vime.utils.misc import Box
+from vime.utils.npu_weight_offloader import NPUWeightOffloader
 from vime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from vime.utils.routing_replay import RoutingReplay
 from vime.utils.timer import Timer, inverse_timer, timer, with_defer
@@ -116,13 +117,20 @@ class MegatronTrainRayActor(TrainRayActor):
 
         dist.barrier(group=get_gloo_group())
 
-        if args.offload_train:
+        self._offload_backend = args.npu_offload_backend
+        self._weight_offloader = None
+        if args.offload_train and self._offload_backend == "storage-resize":
+            # A colocated engine needs the whole card, so the weights have to go too.
+            self._weight_offloader = NPUWeightOffloader(release_param_buffer=args.colocate)
+
+        if args.offload_train and self._offload_backend == "tms":
             if (x := args.train_memory_margin_bytes) > 0:
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
 
+        # The model has to be built inside the region for pause() to see its allocations.
         tms_region_ctx = None
-        if args.offload_train and is_npu():
+        if args.offload_train and is_npu() and self._offload_backend == "tms":
             tms_region_ctx = torch_memory_saver.region(tag="training", enable_cpu_backup=True)
             tms_region_ctx.__enter__()
 
@@ -232,7 +240,10 @@ class MegatronTrainRayActor(TrainRayActor):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
 
-        torch_memory_saver.pause()
+        if self._weight_offloader is not None:
+            self._weight_offloader.offload(self.model)
+        else:
+            torch_memory_saver.pause()
 
         print_memory("after offload model")
 
@@ -241,7 +252,10 @@ class MegatronTrainRayActor(TrainRayActor):
         assert self.args.offload_train
         print_memory("before wake_up model")
 
-        torch_memory_saver.resume()
+        if self._weight_offloader is not None:
+            self._weight_offloader.onload(self.model)
+        else:
+            torch_memory_saver.resume()
 
         clear_memory()
         reload_process_groups()
