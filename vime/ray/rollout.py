@@ -869,6 +869,60 @@ def _allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):
     return addr_and_ports
 
 
+def _allocate_external_lb_addr_and_ports(*, args, rollout_engines, worker_type="regular", base_port=15000):
+    """[DP #3 P1 / external-LB] Allocate addr/ports for an external-LB DP group.
+
+    Each engine slot IS one vLLM DP rank (§19.1). Every slot gets its own API-server
+    ``port``/``nccl_port`` on its own node; the whole DP group shares a single rendezvous
+    ``(data_parallel_address, data_parallel_rpc_port)`` allocated once from slot 0.
+    ``data_parallel_rank`` = the slot's index within the group; ``data_parallel_size`` = N.
+
+    Ports are drawn through a per-node cursor keyed by node IP so co-located slots (e.g. two
+    TP8 ranks on one 16-card infer node) never collide — the same failure class §5 hit on the
+    ③-replica path. ``dist_init_addr`` is left None: external-LB uses ``--data-parallel-address``
+    for rendezvous, not the single-engine multi-node ``dist_init_addr``.
+    """
+    dp_size = len(rollout_engines)
+    addr_and_ports: dict[int, dict] = {}
+    node_port_cursor: dict[str, int] = {}
+    dp_master_addr: str | None = None
+    dp_rpc_port: int | None = None
+
+    for i, (rank, engine) in enumerate(rollout_engines):
+        node_ip, _ = ray.get(engine._get_current_node_ip_and_free_port.remote(start_port=base_port))
+        start = node_port_cursor.get(node_ip, base_port)
+
+        def _port(consecutive=1):
+            nonlocal start
+            _, p = ray.get(
+                engine._get_current_node_ip_and_free_port.remote(start_port=start, consecutive=consecutive)
+            )
+            start = p + consecutive
+            node_port_cursor[node_ip] = start
+            return p
+
+        entry = {
+            "host": node_ip,
+            "port": _port(),
+            "nccl_port": _port(),
+            "dist_init_addr": None,
+            "data_parallel_size": dp_size,
+            "data_parallel_rank": i,
+        }
+        if worker_type in ("prefill", "decode"):
+            entry["disaggregation_bootstrap_port"] = _port()
+        if i == 0:
+            dp_master_addr = node_ip
+            dp_rpc_port = _port()
+        entry["data_parallel_address"] = dp_master_addr
+        entry["data_parallel_rpc_port"] = dp_rpc_port
+        addr_and_ports[rank] = entry
+
+    for rank, _ in rollout_engines:
+        logger.info(f"Ports for external-LB DP rank {rank}: {addr_and_ports[rank]}")
+    return addr_and_ports, node_port_cursor
+
+
 def _allocate_rollout_engine_addr_and_ports_normal(
     *,
     args,
@@ -878,6 +932,12 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     rank_offset=0,
     base_port=15000,
 ):
+    # Each slot is one DP rank with its own API server plus a shared rendezvous; kept in a
+    # separate helper so the path below stays exactly as it was when the flag is off.
+    if getattr(args, "vllm_data_parallel_external_lb", False):
+        return _allocate_external_lb_addr_and_ports(
+            args=args, rollout_engines=rollout_engines, worker_type=worker_type, base_port=base_port
+        )
     # get ports
     # there are 4 ports we need to allocate
     # 1. server port

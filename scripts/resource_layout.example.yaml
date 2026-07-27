@@ -24,3 +24,7 @@ roles:
 rollout:
   # Cards per inference engine, i.e. its tensor-parallel size.
   num_gpus_per_engine: 4
+
+  # Only read with --vllm-data-parallel-external-lb, where each engine is one DP rank.
+  # Must equal the engine count (rollout devices / num_gpus_per_engine), or startup fails.
+  vllm_dp_size: 2

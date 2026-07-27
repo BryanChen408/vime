@@ -30,6 +30,7 @@ class ResourceLayout:
     rollout: tuple[NodeDevices, ...] = ()
     polar_reserved: tuple[NodeDevices, ...] = ()
     rollout_num_gpus_per_engine: int | None = None
+    vllm_dp_size: int | None = None
 
     @property
     def actor_num_gpus(self) -> int:
@@ -92,6 +93,7 @@ def resource_layout_from_dict(data: dict[str, Any]) -> ResourceLayout:
         rollout=_parse_role(roles, "rollout"),
         polar_reserved=_parse_role(roles, "polar_reserved", required=False),
         rollout_num_gpus_per_engine=_optional_positive_int(data, "rollout", "num_gpus_per_engine"),
+        vllm_dp_size=_optional_positive_int(data, "rollout", "vllm_dp_size"),
     )
     _validate_layout(layout)
     return layout

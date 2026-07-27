@@ -12,3 +12,5 @@ roles:
 rollout:
   # Four TP4 engines, none of them spanning an HCCS domain.
   num_gpus_per_engine: 4
+  # Must stay equal to the engine count above; only read under external-LB DP.
+  vllm_dp_size: 4

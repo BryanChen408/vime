@@ -1732,6 +1732,25 @@ def _apply_resource_layout(args):
     if layout.rollout_num_gpus_per_engine:
         args.rollout_num_gpus_per_engine = layout.rollout_num_gpus_per_engine
 
+    if getattr(args, "vllm_data_parallel_external_lb", False):
+        # Under external LB every engine is one DP rank, so the group size has to match the
+        # engine count exactly. Only consumed here: a non-DP baseline reading dp>1 would shrink
+        # TP to gpus // (pp * dp).
+        num_engines = (
+            args.rollout_num_gpus // args.rollout_num_gpus_per_engine if args.rollout_num_gpus_per_engine else 0
+        )
+        if not layout.vllm_dp_size:
+            raise ValueError(
+                "--vllm-data-parallel-external-lb requires rollout.vllm_dp_size in the resource layout "
+                f"(expected {num_engines} = rollout_num_gpus // rollout_num_gpus_per_engine)"
+            )
+        if layout.vllm_dp_size != num_engines:
+            raise ValueError(
+                f"external-LB DP: rollout.vllm_dp_size ({layout.vllm_dp_size}) must equal the number of "
+                f"rollout engines ({args.rollout_num_gpus} // {args.rollout_num_gpus_per_engine} = {num_engines})"
+            )
+        args.vllm_data_parallel_size = layout.vllm_dp_size
+
 
 def vime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)

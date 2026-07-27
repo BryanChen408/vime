@@ -19,7 +19,7 @@ Cross-DP EP was never separated from that measurement, so it inherits the same d
 |---|---|
 | `_allocate_external_lb_addr_and_ports` and its dispatch | `vime/ray/rollout.py` |
 | `ResourceLayout.vllm_dp_size` plus the engine-count check in `_apply_resource_layout` | `vime/ray/resource_layout.py`, `vime/utils/arguments.py` |
-| DP rank and size plumbing into the engine subprocess | `vime/backends/vllm_utils/vllm_engine.py` |
+| DP rank and size plumbing into the engine subprocess | `vime/backends/vllm_utils/vllm_engine.py` — **not ported yet**, see below |
 | `test_rollout_dp_alloc.py` | `tests/unit/ray/` |
 | Cross-DP EP | Launch scripts only, as `--vllm-additional-config` keys; no library code |
 
@@ -33,3 +33,18 @@ Re-measure on the workload that will actually run. If the rollout is bursty rath
 saturated, expect the loss to reproduce. The reviving change also has to re-apply the
 non-2xx passthrough contract the LB proxy already carries, since a DP fan-out multiplies
 the number of upstreams that can fail.
+
+## What is still missing
+
+The engine-side plumbing has not been brought over. On `feature/swe-tasks` it is roughly 26
+lines inside `vime/backends/vllm_utils/vllm_engine.py`, interleaved with unrelated changes
+from that branch:
+
+- `_resolve_vllm_parallel_sizes` dividing by `pp * dp` under the flag
+- `build_vllm_cmd_and_env` forwarding `--data-parallel-rank`, `--data-parallel-address` and
+  `--data-parallel-rpc-port`
+- the four `data_parallel_*` fields threaded through `_compute_server_args`
+
+Whoever revives this has to separate those hunks from the rest of that diff rather than
+applying it wholesale. Without them the allocator here produces DP addresses that never
+reach the engine, so the feature is inert as it stands.
