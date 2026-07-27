@@ -33,6 +33,25 @@ def _chunk_size() -> int:
         return 1024
 
 
+def chunked_ce_over_seq(hidden, weight, labels, chunk, compute_lm_loss):
+    """按 seq 分块算逐 token CE(纯机制,可单测)。
+
+    Args:
+        hidden: [s, b, h](已 SP-gather);weight: [vocab/tp, h];labels: [b, s]
+        chunk: 每块 seq 长度
+        compute_lm_loss(labels_chunk[b,c], logits_chunk[c,b,vocab/tp]) -> [b,c]
+            (即 LanguageModule.compute_language_model_loss:内部做 vocab-parallel CE)
+    Returns: [b, s] 逐 token CE(拼回),数值等于不分块的 full CE。
+    """
+    s = hidden.size(0)
+    outs = []
+    for start in range(0, s, chunk):
+        end = min(start + chunk, s)
+        logits_chunk = F.linear(hidden[start:end], weight)   # [c, b, vocab/tp]
+        outs.append(compute_lm_loss(labels[:, start:end], logits_chunk))  # [b, c]
+    return torch.cat(outs, dim=1)
+
+
 def apply_chunked_mtp_ce_patch():
     """monkey-patch LanguageModule.compute_output_layer_and_language_model_loss(幂等)。"""
     global _patched
@@ -81,18 +100,10 @@ def apply_chunked_mtp_ce_patch():
         # labels [b, s] 与 gather 后的 seq 对齐(compute_language_model_loss 内部再转 [s,b])
         assert labels.size(1) == s, f"labels seq {labels.size(1)} != hidden seq {s}"
 
-        # 2) 按 seq 切块:每块真 weight matmul(保梯度到 output_layer weight)+ vocab-parallel CE
-        chunk = _chunk_size()
-        loss_chunks = []
-        for start in range(0, s, chunk):
-            end = min(start + chunk, s)
-            logits_chunk = F.linear(hidden[start:end], weight)          # [c, b, vocab/tp]
-            loss_chunk = self.compute_language_model_loss(              # vocab-parallel CE → [b, c]
-                labels[:, start:end], logits_chunk
-            )
-            loss_chunks.append(loss_chunk)
-        # 3) 拼回 [b, s]
-        return torch.cat(loss_chunks, dim=1)
+        # 2)+3) 按 seq 切块 → 每块 matmul(真 weight 保梯度)+ vocab-parallel CE → 拼回 [b,s]
+        return chunked_ce_over_seq(
+            hidden, weight, labels, _chunk_size(), self.compute_language_model_loss
+        )
 
     LanguageModule.compute_output_layer_and_language_model_loss = _patched_fn
     LanguageModule._chunked_mtp_ce_patched = True
