@@ -1,8 +1,11 @@
+import atexit
 import dataclasses
 import itertools
 import logging
 import multiprocessing
 import random
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -1008,6 +1011,69 @@ def _start_router(
     return router_ip, router_port, router_args.prometheus_port
 
 
+_LB_PROXY_PROCS: list = []
+
+
+def _stop_lb_proxies():
+    """Stop the proxies on the way out.
+
+    Unlike the router, which runs as a daemon process and dies with its parent, the proxy is
+    a plain subprocess and would otherwise outlive the driver still holding its port, so the
+    next run cannot bind it.
+    """
+    while _LB_PROXY_PROCS:
+        proc = _LB_PROXY_PROCS.pop()
+        if proc.poll() is not None:
+            continue
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+atexit.register(_stop_lb_proxies)
+
+
+def _start_lb_proxy(router_ip, router_port, engine_urls):
+    """Start the pass-through LB proxy in place of the Rust router.
+
+    The Rust router parses requests into typed models and drops vLLM extensions such as
+    ``return_token_ids``; :mod:`vime.ray.lb_proxy` forwards them untouched. Works with any
+    number of engines. Returns the child process so the caller can stop it.
+    """
+    from urllib.parse import urlparse
+
+    hosts, ports = [], []
+    for url in engine_urls:
+        parsed = urlparse(url if "://" in url else f"http://{url}")
+        hosts.append(parsed.hostname)
+        ports.append(str(parsed.port))
+    if not hosts:
+        raise RuntimeError(f"LB proxy needs at least one engine url, got {engine_urls}")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "vime.ray.lb_proxy",
+        "--host",
+        str(router_ip).strip("[]"),
+        "--port",
+        str(router_port),
+        "--dp-hosts",
+        *hosts,
+        "--dp-ports",
+        *ports,
+    ]
+    logger.info("Launching LB proxy: %s", " ".join(cmd))
+    proc = subprocess.Popen(cmd)
+    time.sleep(3)
+    if proc.poll() is not None:
+        raise RuntimeError(f"LB proxy exited immediately with code {proc.returncode}; check its stderr")
+    logger.info("LB proxy up at %s:%s fronting %s", router_ip, router_port, list(zip(hosts, ports)))
+    return proc
+
+
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
@@ -1052,10 +1118,18 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
 
         has_pd = model_cfg.has_pd_disaggregation
         use_static_pd_router = has_pd
+        use_lb_proxy = getattr(args, "rollout_lb_proxy", False) and not has_pd
         if use_static_pd_router:
             router_ip = _wrap_ipv6(get_host_info()[1])
             router_port = find_available_port(random.randint(3000, 4000))
             prom_port = None  # assigned when the router actually launches, after URL collection
+            engine_router_ip, engine_router_port = None, None
+        elif use_lb_proxy:
+            # Bind the configured port so the operator can be pointed at it, and leave the
+            # engines unregistered: the proxy is handed their URLs directly below.
+            router_ip = _wrap_ipv6(get_host_info()[1])
+            router_port = getattr(args, "vllm_router_port", None) or find_available_port(random.randint(3000, 4000))
+            prom_port = None  # assigned when the proxy launches, after URL collection
             engine_router_ip, engine_router_port = None, None
         else:
             router_ip, router_port, prom_port = _start_router(
@@ -1180,6 +1254,17 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 prefill_urls=prefill_urls,
                 decode_urls=decode_urls,
             )
+        elif use_lb_proxy:
+            lb_urls = []
+            for g in server_groups:
+                for e in g.engines:
+                    if e is None:
+                        continue
+                    url = ray.get(e.get_url.remote())
+                    if url:
+                        lb_urls.append(url)
+            _LB_PROXY_PROCS.append(_start_lb_proxy(router_ip, router_port, lb_urls))
+            prom_port = None
 
         servers[model_cfg.name] = RolloutServer(
             server_groups=server_groups,

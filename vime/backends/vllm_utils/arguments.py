@@ -112,6 +112,18 @@ def add_vllm_router_arguments(parser):
             "session-affinity routing replay via the x-session-id header."
         ),
     )
+    parser.add_argument(
+        "--rollout-lb-proxy",
+        action="store_true",
+        default=False,
+        dest="rollout_lb_proxy",
+        help=(
+            "Front the engines with vime.ray.lb_proxy instead of the Rust vllm-router. The "
+            "router parses requests into typed models and drops vLLM extensions such as "
+            "return_token_ids; the proxy forwards them verbatim, hashes x-session-id onto a "
+            "fixed engine and otherwise balances by in-flight tokens. Binds --vllm-router-port."
+        ),
+    )
     return parser
 
 
@@ -334,6 +346,7 @@ _VIME_ORCHESTRATION_DESTS = frozenset(
         "vllm_router_port",
         "router_request_timeout_secs",
         "router_policy",
+        "rollout_lb_proxy",
         "vllm_server_concurrency",
         "vllm_enable_deterministic_inference",
         "vllm_weight_sync_packed",
