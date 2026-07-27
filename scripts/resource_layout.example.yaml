@@ -1,0 +1,26 @@
+# Schema for --resource-layout: pin every role to explicit nodes and cards instead of
+# letting Ray pick. Setting it makes this file the single source of the per-role GPU counts,
+# so --actor-num-nodes and friends are derived from here. Incompatible with --colocate.
+#
+# Device ids are per node and must match what that node exposes to Ray (on Ascend, the
+# entries in ASCEND_RT_VISIBLE_DEVICES). "0-3", "0,2,4", [0, 2] and a bare int all work.
+# Roles must not overlap, and each role needs the same number of devices on every node it uses.
+roles:
+  actor:
+    - {node: 10.0.0.1, devices: "0-7"}
+
+  # Optional. Left out, the critic shares the actor's cards. Given its own entries it gets a
+  # separate placement, which keeps a node down to one model's optimizer state.
+  critic:
+    - {node: 10.0.0.2, devices: "0-7"}
+
+  rollout:
+    - {node: 10.0.0.2, devices: "8-15"}
+
+  # Optional. Cards held by an external service: checked for overlap but never given to Ray.
+  polar_reserved:
+    - {node: 10.0.0.1, devices: "8-15"}
+
+rollout:
+  # Cards per inference engine, i.e. its tensor-parallel size.
+  num_gpus_per_engine: 4

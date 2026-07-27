@@ -1,0 +1,18 @@
+# Two nodes with actor and critic split across them, so each host holds only one model's
+# optimizer state. Colocating both on a single host overruns its memory once the fp32 Adam
+# step allocates its transients.
+# Each trainer's collectives stay within its own node; actor-to-critic values travel as CPU
+# tensors over Ray RPC, and the weight sync to rollout crosses nodes over HCCL.
+# See resource_layout.example.yaml for the schema.
+roles:
+  actor:
+    - {node: 80.48.5.88, devices: "0-7"}
+  polar_reserved:
+    - {node: 80.48.5.88, devices: "8-15"}
+  critic:
+    - {node: 80.48.5.64, devices: "0-7"}
+  rollout:
+    - {node: 80.48.5.64, devices: "8-15"}
+rollout:
+  # Two TP4 engines over the eight rollout cards.
+  num_gpus_per_engine: 4

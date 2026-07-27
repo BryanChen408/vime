@@ -6,12 +6,21 @@ import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from vime.ray.resource_layout import select_role_bundles
 from vime.utils.common import is_npu
 
 from .actor_group import RayTrainGroup
 from .rollout import RolloutManager
 
 logger = logging.getLogger(__name__)
+
+# Weight of the ``node:<ip>`` resource a layout bundle asks for. Any non-zero amount pins the
+# bundle to that node; keep it small so it never competes with real placements.
+_NODE_PIN_RESOURCE_AMOUNT = 0.001
+
+# The RolloutManager shares a bundle with the engine it fronts, so it takes a token CPU slice
+# rather than the whole CPU the position path gives it.
+_LAYOUT_ROLLOUT_MANAGER_NUM_CPUS = 0.01
 
 
 # @ray.remote(num_gpus=1)
@@ -61,10 +70,13 @@ def sort_key(x):
     return (node_ip_parts, int(gpu_id))
 
 
-def _create_placement_group(num_gpus):
-    """Create a placement group with the specified number of GPUs."""
+def _create_and_probe_placement_group(bundles):
+    """Create a PACK placement group and probe which ``(node, gpu)`` each bundle landed on.
+
+    Returns ``(pg, bundle_infos)`` with ``bundle_infos`` a list of unsorted
+    ``(bundle_index, node_ip, gpu_id)`` triples.
+    """
     device_name = "NPU" if is_npu() else "GPU"
-    bundles = [{device_name: 1, "CPU": 1} for _ in range(num_gpus)]
     pg = placement_group(bundles, strategy="PACK")
     num_bundles = len(bundles)
 
@@ -86,23 +98,117 @@ def _create_placement_group(num_gpus):
         ray.kill(actor)
 
     bundle_infos = [(i, gpu_ids[i][0], gpu_ids[i][1]) for i in range(num_bundles)]
+    return pg, bundle_infos
+
+
+def _log_bundle_order(bundle_infos, reordered_bundle_indices):
+    by_index = {index: (node, gpu_id) for index, node, gpu_id in bundle_infos}
+    for i, actual_bundle_index in enumerate(reordered_bundle_indices):
+        node, gpu_id = by_index[actual_bundle_index]
+        logger.info(
+            f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, node: {node}, gpu: {gpu_id}"
+        )
+
+
+def _create_placement_group(num_gpus):
+    """Create a placement group with the specified number of GPUs."""
+    device_name = "NPU" if is_npu() else "GPU"
+    pg, bundle_infos = _create_and_probe_placement_group([{device_name: 1, "CPU": 1} for _ in range(num_gpus)])
+
     sorted_bundle_infos = sorted(bundle_infos, key=sort_key)
     pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
     # Map from logical index -> physical GPU ID
-    pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
-
-    for i in range(num_bundles):
-        actual_bundle_index = pg_reordered_bundle_indices[i]
-        logger.info(
-            f"  bundle {i:4}, actual_bundle_index: {actual_bundle_index:4}, "
-            f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
-        )
+    pg_reordered_gpu_ids = [info[2] for info in sorted_bundle_infos]
+    _log_bundle_order(bundle_infos, pg_reordered_bundle_indices)
 
     return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
 
 
+def _alive_node_resource_keys():
+    """Map each alive Ray node IP to its built-in ``node:<ip>`` resource key.
+
+    Connects first: unlike ``placement_group()``, ``ray.nodes()`` does not attach to a
+    running cluster on its own, and this is reached before anything else has.
+    """
+    if not ray.is_initialized():
+        ray.init(address="auto", ignore_reinit_error=True)
+
+    keys = {}
+    alive_ips = set()
+    for node in ray.nodes():
+        if not node.get("Alive", True):
+            continue
+        ip = str(node.get("NodeManagerAddress") or "")
+        if not ip:
+            continue
+        alive_ips.add(ip)
+        resource_key = f"node:{ip}"
+        if resource_key in (node.get("Resources") or {}):
+            keys[ip] = resource_key
+    return keys, alive_ips
+
+
+def _build_layout_bundles(layout, device_name):
+    """Build one PACK bundle per requested device, pinned to the node the layout names."""
+    node_resource_keys, alive_ips = _alive_node_resource_keys()
+    bundles = []
+    for role in (layout.actor, layout.critic, layout.rollout):
+        for item in role:
+            node_resource_key = node_resource_keys.get(item.node)
+            if node_resource_key is None:
+                if item.node in alive_ips:
+                    raise ValueError(
+                        f"Ray node {item.node!r} is alive but exposes no 'node:{item.node}' resource, "
+                        "so bundles cannot be pinned to it."
+                    )
+                available = ", ".join(sorted(alive_ips)) or "<none>"
+                raise ValueError(
+                    f"Resource layout requested node {item.node!r}, but it is not an active Ray node. "
+                    f"Available Ray nodes: {available}"
+                )
+            for _ in item.devices:
+                bundles.append({device_name: 1, "CPU": 1, node_resource_key: _NODE_PIN_RESOURCE_AMOUNT})
+    return bundles
+
+
+def _create_placement_groups_from_layout(args):
+    """Pin each role to the exact (node, devices) the layout spells out."""
+    layout = args.resource_layout_spec
+    logger.info(f"Creating placement group from resource layout with {layout.ray_num_gpus} GPUs...")
+    device_name = "NPU" if is_npu() else "GPU"
+    pg, bundle_infos = _create_and_probe_placement_group(_build_layout_bundles(layout, device_name))
+
+    actor_bundle_indices, actor_gpu_ids = select_role_bundles(bundle_infos, layout.actor, role_name="actor")
+    rollout_bundle_indices, rollout_gpu_ids = select_role_bundles(bundle_infos, layout.rollout, role_name="rollout")
+
+    logger.info("Actor placement from resource layout:")
+    _log_bundle_order(bundle_infos, actor_bundle_indices)
+    logger.info("Rollout placement from resource layout:")
+    _log_bundle_order(bundle_infos, rollout_bundle_indices)
+
+    if not args.use_critic:
+        critic_placement = None
+    elif layout.critic:
+        critic_bundle_indices, critic_gpu_ids = select_role_bundles(bundle_infos, layout.critic, role_name="critic")
+        logger.info("Critic placement from resource layout:")
+        _log_bundle_order(bundle_infos, critic_bundle_indices)
+        critic_placement = (pg, critic_bundle_indices, critic_gpu_ids)
+    else:
+        # No critic entries: share the actor's bundles, as the position path does.
+        critic_placement = (pg, actor_bundle_indices, actor_gpu_ids)
+
+    return {
+        "actor": (pg, actor_bundle_indices, actor_gpu_ids),
+        "critic": critic_placement,
+        "rollout": (pg, rollout_bundle_indices, rollout_gpu_ids),
+    }
+
+
 def create_placement_groups(args):
     """Create placement groups for actor, critic, and rollout engines."""
+
+    if getattr(args, "resource_layout_spec", None) is not None:
+        return _create_placement_groups_from_layout(args)
 
     num_gpus = 0
     if args.debug_train_only:
@@ -210,11 +316,18 @@ def create_training_models(args, pgs, rollout_manager):
 
 def create_rollout_manager(args, pg):
     device_name = "NPU" if is_npu() else "GPU"
-    rollout_manager = RolloutManager.options(
-        num_cpus=1,
-        # num_gpus=0,
-        resources={device_name: 0},
-    ).remote(args, pg)
+    options = dict(num_cpus=1, resources={device_name: 0})
+    if getattr(args, "resource_layout_spec", None) is not None:
+        # Put the manager on the first rollout bundle so the engines it spawns inherit the
+        # layout's node and card placement.
+        placement_pg, rollout_bundle_indices, _ = pg
+        options["num_cpus"] = _LAYOUT_ROLLOUT_MANAGER_NUM_CPUS
+        options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+            placement_group=placement_pg,
+            placement_group_capture_child_tasks=True,
+            placement_group_bundle_index=rollout_bundle_indices[0],
+        )
+    rollout_manager = RolloutManager.options(**options).remote(args, pg)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None

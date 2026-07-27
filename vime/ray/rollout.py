@@ -391,7 +391,11 @@ class RolloutManager:
 
         init_tracking(args, primary=False)
         device_name = "NPU" if is_npu() else "GPU"
-        self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0, resources={device_name: 0}).remote()
+        # A plain mutex needs no CPU of its own, and asking for one is actively harmful: this
+        # manager captures its child tasks, so an unpinned child holding CPU:1 takes it from a
+        # bundle some actor needs, and that actor never schedules — the distributed init then
+        # waits for a rank that will never arrive.
+        self.rollout_engine_lock = Lock.options(num_cpus=0, num_gpus=0, resources={device_name: 0}).remote()
         self.rollout_id = -1
 
         self._health_monitors = []

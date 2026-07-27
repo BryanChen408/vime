@@ -1,0 +1,14 @@
+# Two nodes: actor trains on eight cards of the first, rollout serves from all sixteen of the
+# second. The first node's upper eight cards are held by an external service.
+# Weight sync therefore crosses the node boundary over HCCL.
+# See resource_layout.example.yaml for the schema.
+roles:
+  actor:
+    - {node: 80.48.5.88, devices: "0-7"}
+  rollout:
+    - {node: 80.48.5.52, devices: "0-15"}
+  polar_reserved:
+    - {node: 80.48.5.88, devices: "8-15"}
+rollout:
+  # Four TP4 engines, none of them spanning an HCCS domain.
+  num_gpus_per_engine: 4

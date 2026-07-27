@@ -1,0 +1,11 @@
+# Single node: actor on the upper eight cards, rollout on 4-7, another service owns 0-3.
+# Keeping the actor inside one HCCS domain stops its collectives from crossing the 7/8
+# boundary, which would otherwise fall back to inter-domain RoCE.
+# See resource_layout.example.yaml for the schema.
+roles:
+  actor:
+    - {node: 80.48.5.52, devices: "8-15"}
+  rollout:
+    - {node: 80.48.5.52, devices: "4-7"}
+rollout:
+  num_gpus_per_engine: 4

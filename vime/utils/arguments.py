@@ -68,6 +68,16 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--resource-layout",
+                type=str,
+                default=None,
+                help=(
+                    "Path to a YAML file pinning each role to explicit (node, devices). "
+                    "When set it is the single source of the actor/critic/rollout GPU counts; "
+                    "incompatible with --colocate and the debug-only modes."
+                ),
+            )
+            parser.add_argument(
                 "--colocate",
                 action="store_true",
                 default=False,
@@ -1664,6 +1674,54 @@ def _resolve_npu_offload_backend(args) -> str:
     return backend
 
 
+def _apply_resource_layout(args):
+    """Derive the per-role GPU counts from ``--resource-layout``, if one was given.
+
+    Without the flag ``resource_layout_spec`` stays ``None`` and the position-based
+    derivations further down decide the placement instead. Runs before them so a layout
+    always wins.
+    """
+    args.resource_layout_spec = None
+    layout_path = getattr(args, "resource_layout", None)
+    if layout_path is None:
+        # The launch scripts pass RESOURCE_LAYOUT through as --resource-layout. A report of
+        # argparse intermittently losing the flag was never reproduced, so rather than reading
+        # the environment as a second input we fail loudly and keep the CLI authoritative.
+        # Drop this check once the flag has proven reliable in production.
+        if os.environ.get("RESOURCE_LAYOUT"):
+            raise ValueError(
+                "RESOURCE_LAYOUT is set in the environment but --resource-layout did not reach "
+                "the parser; check how the launch script forwards it."
+            )
+        return
+
+    from vime.ray.resource_layout import load_resource_layout
+
+    for flag, enabled in (
+        ("--colocate", args.colocate),
+        ("--debug-train-only", args.debug_train_only),
+        ("--debug-rollout-only", args.debug_rollout_only),
+    ):
+        if enabled:
+            raise ValueError(f"--resource-layout cannot be used with {flag}")
+
+    layout = load_resource_layout(layout_path)
+    args.resource_layout_spec = layout
+    args.actor_num_nodes = layout.actor_num_nodes
+    args.actor_num_gpus_per_node = layout.actor_num_gpus_per_node
+    # Only override the critic's share when the layout gives it cards of its own; otherwise it
+    # keeps the actor's counts and stays colocated.
+    if layout.critic:
+        args.critic_num_nodes = layout.critic_num_nodes
+        args.critic_num_gpus_per_node = layout.critic_num_gpus_per_node
+    args.rollout_num_gpus = layout.rollout_num_gpus
+    # The engine port allocator derives engines-per-node from num_gpus_per_node, so on a
+    # heterogeneous topology it must follow the inference nodes, not the training ones.
+    args.num_gpus_per_node = layout.rollout_num_gpus_per_node
+    if layout.rollout_num_gpus_per_engine:
+        args.rollout_num_gpus_per_engine = layout.rollout_num_gpus_per_engine
+
+
 def vime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
@@ -1794,6 +1852,8 @@ def vime_validate_args(args):
         args.offload_train = True
         args.offload_rollout = True
     del args.offload
+
+    _apply_resource_layout(args)
 
     if args.debug_rollout_only:
         if args.colocate and (not args.rollout_num_gpus):

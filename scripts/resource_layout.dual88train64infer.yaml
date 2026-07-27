@@ -1,0 +1,10 @@
+# Two nodes, one role each: actor trains on the first, rollout serves from the second.
+# Every collective then stays inside a node, so a fixed HCCL port range suffices.
+# See resource_layout.example.yaml for the schema.
+roles:
+  actor:
+    - {node: 80.48.5.88, devices: "0-7"}
+  rollout:
+    - {node: 80.48.5.64, devices: "8-15"}
+rollout:
+  num_gpus_per_engine: 4
