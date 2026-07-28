@@ -9,7 +9,7 @@ from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
 from vime.backends.megatron_utils.chunked_lm_head_patch import get_captured_lm_head_weight
-from vime.utils.distributed_utils import distributed_masked_whiten
+from vime.utils.distributed_utils import distributed_explained_variance, distributed_masked_whiten
 from vime.utils.misc import load_function
 from vime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
@@ -672,6 +672,12 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             rewards.append(k)
         advantages, returns = get_advantages_and_returns_batch(
             total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+        )
+        rollout_data["value_explained_var"] = distributed_explained_variance(
+            torch.cat(returns),
+            torch.cat(values),
+            torch.cat(loss_masks),
+            process_group=mpu.get_data_parallel_group(),
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":

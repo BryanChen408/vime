@@ -487,6 +487,9 @@ class MegatronTrainRayActor(TrainRayActor):
             data_iterator,
             num_microbatches,
             global_batch_sizes,
+            rollout_metrics={
+                key: rollout_data[key] for key in ("value_explained_var",) if key in rollout_data
+            },
         )
 
         if mpu.is_pipeline_last_stage() and "values" in rollout_data:

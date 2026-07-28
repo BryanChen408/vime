@@ -152,3 +152,42 @@ def distributed_masked_whiten(
         whitened_values += global_mean
 
     return whitened_values
+
+
+def distributed_explained_variance(
+    returns: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    process_group: dist.ProcessGroup | None = None,
+    epsilon: float = 1e-8,
+) -> float:
+    """How much of the return variance the critic accounts for, over the whole batch.
+
+    ``1 - Var(returns - values) / Var(returns)``, where both variances come from global
+    statistics rather than this rank's shard. 1 means the critic tracks the returns exactly,
+    0 that it does no better than predicting their mean, and a negative value that it does
+    worse than that.
+
+    Returns a float rather than a tensor: it is a whole-batch ratio, so it must not be fed
+    through the per-sample metric reduction, which would sum and rescale it into nonsense.
+    """
+    error = returns - values
+    stats = torch.tensor(
+        [
+            (returns * mask).sum(),
+            ((returns**2) * mask).sum(),
+            (error * mask).sum(),
+            ((error**2) * mask).sum(),
+            mask.sum(),
+        ],
+        device=returns.device,
+        dtype=torch.float32,
+    )
+    dist.all_reduce(stats, group=process_group)
+    returns_sum, returns_sq_sum, error_sum, error_sq_sum, count = stats.tolist()
+    if count < 2:
+        return 0.0
+
+    returns_var = returns_sq_sum / count - (returns_sum / count) ** 2
+    error_var = error_sq_sum / count - (error_sum / count) ** 2
+    return 1.0 - error_var / (returns_var + epsilon)

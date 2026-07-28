@@ -737,6 +737,8 @@ def train(
         disable=_disable_tqdm_for_non_main_rank(),
     )
 
+    rollout_metrics = rollout_metrics or {}
+
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
 
@@ -803,6 +805,11 @@ def train(
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
+
+            # Whole-batch ratios cannot go through the per-sample reduction, which would sum
+            # and rescale them, so they arrive already reduced and are passed straight on.
+            for key, value in rollout_metrics.items():
+                log_dict[f"train/{role_tag}{key}"] = value
 
             # Per-step gbs — uneven step sizes are easy to miss without this.
             log_dict[f"train/{role_tag}global_batch_size"] = global_batch_sizes[step_id]
