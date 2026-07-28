@@ -9,8 +9,10 @@ except ImportError:
 
 from vime.utils.common import is_npu
 
-if is_npu():
-    import mindspeed.megatron_adaptor  # noqa: F401
+# mindspeed is deliberately not imported here. Importing this package is enough to pull it
+# into the vLLM worker subprocess, which only wants the worker extension from
+# `update_weight`, and mindspeed replaces torch.compile with a no-op — that alone stops
+# vLLM from capturing cudagraphs. Whoever actually runs Megatron imports it themselves.
 
 try:
     import deep_ep

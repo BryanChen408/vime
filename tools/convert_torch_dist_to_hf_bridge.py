@@ -4,6 +4,13 @@ import os
 import megatron.bridge.training.model_load_save as _model_load_save_module
 from megatron.bridge import AutoBridge
 
+from vime.utils.common import is_npu
+
+if is_npu():
+    # Megatron on NPU needs mindspeed's torch patches; the vime package no longer pulls them
+    # in on import so that the vLLM subprocess keeps a working torch.compile.
+    import mindspeed.megatron_adaptor  # noqa: F401
+
 from vime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 
 

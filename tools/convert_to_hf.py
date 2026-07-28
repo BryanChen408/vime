@@ -4,6 +4,13 @@ from megatron.core import mpu
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 import vime.backends.megatron_utils as megatron_utils
+from vime.utils.common import is_npu
+
+if is_npu():
+    # Megatron on NPU needs mindspeed's torch patches; the vime package no longer pulls them
+    # in on import so that the vLLM subprocess keeps a working torch.compile.
+    import mindspeed.megatron_adaptor  # noqa: F401
+
 from vime.backends.megatron_utils import update_weight_utils
 from vime.utils.arguments import parse_args
 

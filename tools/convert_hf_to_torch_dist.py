@@ -9,6 +9,13 @@ from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
 from megatron.training.training import get_model
 
+from vime.utils.common import is_npu
+
+if is_npu():
+    # Megatron on NPU needs mindspeed's torch patches; the vime package no longer pulls them
+    # in on import so that the vLLM subprocess keeps a working torch.compile.
+    import mindspeed.megatron_adaptor  # noqa: F401
+
 import vime_plugins.mbridge  # noqa: F401
 from mbridge import AutoBridge
 from vime.backends.megatron_utils.arguments import set_default_megatron_args

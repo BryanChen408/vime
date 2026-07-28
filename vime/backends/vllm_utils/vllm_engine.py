@@ -358,6 +358,9 @@ def build_vllm_subprocess_env(server_args: dict[str, Any]) -> dict[str, str]:
     args = server_args["args"]
     env = os.environ.copy()
     env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    # The launch scripts disable dynamo for the training actor, which has to run eager on
+    # Ascend. vLLM needs it to capture cudagraphs, so the child does not inherit that.
+    env.pop("TORCHDYNAMO_DISABLE", None)
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
     if is_npu():
         env["ASCEND_RT_VISIBLE_DEVICES"] = server_args["visible_devices"]
