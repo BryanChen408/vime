@@ -165,6 +165,9 @@ PERF_ARGS=(
    --expert-tensor-parallel-size 1
    --sequence-parallel
    --chunked-lm-head
+   # Actor and critic take turns on these cards, so the parameter buffer goes too, not just
+   # the gradients.
+   --offload-release-param-buffer
    --recompute-granularity full
    --recompute-method uniform
    --recompute-num-layers 1
