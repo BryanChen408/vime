@@ -1,0 +1,11 @@
+# Per-role overrides for --megatron-config-path. Only the critic entry is applied to the
+# critic; the actor keeps the arguments it was launched with.
+#
+# The critic generally wants a larger learning rate than the policy: it is fitting a moving
+# target and a value estimate that lags shows up as noisy advantages. Tune it against the
+# value loss and the explained-variance metric.
+megatron:
+  - name: sao-critic
+    role: critic
+    overrides:
+      lr: 5.0e-6
