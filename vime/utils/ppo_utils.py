@@ -163,35 +163,36 @@ class _VocabParallelEntropy(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, vocab_parallel_logits: torch.Tensor, process_group: dist.ProcessGroup) -> torch.Tensor:
-
-        @torch.compile(dynamic=True)
-        def mul_reduce(a, b):
-            return (a * b).sum(dim=-1, keepdim=True)
-
         logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
         dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=process_group)
-        normalized_vocab_parallel_logits = vocab_parallel_logits - logits_max
-        normalized_exp_logits = normalized_vocab_parallel_logits.exp_()
-        normalized_sum_exp_logits = normalized_exp_logits.sum(dim=-1, keepdim=True)
-        dist.all_reduce(normalized_sum_exp_logits, group=process_group)
-        softmax_logits = normalized_exp_logits.div_(normalized_sum_exp_logits)
-        sum_softmax_times_logits = mul_reduce(softmax_logits, vocab_parallel_logits)
-        dist.all_reduce(sum_softmax_times_logits, group=process_group)
-        entropy = logits_max + normalized_sum_exp_logits.log() - sum_softmax_times_logits
-        ctx.save_for_backward(vocab_parallel_logits, softmax_logits, sum_softmax_times_logits)
+
+        # One [*, V/tp] buffer carries the value through normalise -> exp -> softmax -> gradient.
+        workspace = vocab_parallel_logits - logits_max
+        workspace.exp_()
+        sum_exp = workspace.sum(dim=-1, keepdim=True)
+        dist.all_reduce(sum_exp, group=process_group)
+        workspace.div_(sum_exp)  # now the softmax
+
+        weighted_logits = (workspace * vocab_parallel_logits).sum(dim=-1, keepdim=True)
+        dist.all_reduce(weighted_logits, group=process_group)
+        entropy = logits_max + sum_exp.log() - weighted_logits
+
+        # Finish the gradient here — softmax * (weighted_logits - logits) — so backward only
+        # scales it. Saving the finished gradient costs one [*, V/tp] tensor where keeping the
+        # logits and the softmax to combine later would cost two.
+        # Reuses the caller's tensor as scratch, which is why every caller hands over a clone.
+        # The undo below is not bit-exact, so it is a courtesy, not a guarantee.
+        vocab_parallel_logits.sub_(weighted_logits)
+        workspace.mul_(vocab_parallel_logits)
+        vocab_parallel_logits.add_(weighted_logits)
+        workspace.mul_(-1.0)
+        ctx.save_for_backward(workspace)
         return entropy.squeeze(dim=-1)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
-        vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
-        # reuse softmax_logits as grad
-        vocab_parallel_logits.sub_(sum_softmax_times_logits)
-        softmax_logits.mul_(vocab_parallel_logits)
-        softmax_logits.mul_(grad_output.unsqueeze(dim=-1))
-        # recover vocab_parallel_logits
-        vocab_parallel_logits.add_(sum_softmax_times_logits)
-        softmax_logits.mul_(-1)
-        return softmax_logits, None
+        (grad_logits,) = ctx.saved_tensors
+        return grad_logits * grad_output.unsqueeze(dim=-1), None
 
 
 def compute_entropy_from_logits(logits: torch.Tensor, process_group) -> torch.Tensor:
