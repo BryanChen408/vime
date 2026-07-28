@@ -28,7 +28,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from vime.utils import logging_utils
-from vime.utils.memory_utils import clear_memory
+from vime.utils.memory_utils import clear_memory, release_cached_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -597,6 +597,12 @@ def train_one_step(
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
+
+    # Hand the freed blocks back to the device. Zeroing the buffers above only returns them to
+    # the caching allocator, which then sits on them; while the trainer waits for the next
+    # rollout that is gigabytes of memory the engine on the same card cannot see. Expandable
+    # segments do not help, since they address fragmentation rather than the cache itself.
+    release_cached_memory()
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         loss_reduced = reduce_train_step_metrics(

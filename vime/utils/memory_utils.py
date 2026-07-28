@@ -9,6 +9,21 @@ from vime.utils.common import is_npu
 logger = logging.getLogger(__name__)
 
 
+def release_cached_memory():
+    """Return the allocator's free blocks to the device, without collecting on the host.
+
+    For the hot path, where a full ``clear_memory`` would pay for a synchronise and a garbage
+    collection every step.
+    """
+    if is_npu():
+        try:
+            torch.npu.empty_cache()
+        except RuntimeError:
+            pass
+    else:
+        torch.cuda.empty_cache()
+
+
 def clear_memory(clear_host_memory: bool = False):
     if is_npu():
         torch.npu.synchronize()
