@@ -67,7 +67,10 @@ def get_responses(
     """
     qkv_format = args.qkv_format
 
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    # Mixed-precision training hands back bf16 logits on NPU; the log-softmax below needs the
+    # float32 range.
+    if logits.dtype != torch.float32:
+        logits = logits.float()
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
@@ -402,8 +405,8 @@ def get_log_probs_and_entropy(
     per-sample slicing) so backward traverses ``[T, V]`` only once, then
     extracts per-sample response portions.
 
-    When ``entropy_coef == 0``, entropy is computed under ``torch.no_grad()``
-    to avoid retaining the computation graph and to skip cloning.
+    Entropy is only produced when ``with_entropy`` is set; the caller decides that from the
+    coefficients that consume it, so nothing is built for a term that would be scaled to zero.
     """
     assert non_loss_data
     qkv_format = args.qkv_format
@@ -413,8 +416,8 @@ def get_log_probs_and_entropy(
     # scaling, per-sample slicing) applies unchanged; only the final projection differs.
     lm_head_weight = get_captured_lm_head_weight()
 
-    if lm_head_weight is None:
-        assert logits.dtype == torch.float32, f"{logits.dtype}"
+    if lm_head_weight is None and logits.dtype != torch.float32:
+        logits = logits.float()
     assert len(logits.shape) == 3, f"{logits.shape}"
 
     if qkv_format == "thd":
@@ -859,7 +862,10 @@ def policy_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        # Entropy only feeds the loss through its coefficients. With both at zero it would
+        # be built, kept alive for backward and multiplied away, so skip it entirely. The
+        # condition reads args alone, so every micro-batch reports the same keys.
+        with_entropy=args.entropy_coef != 0.0 or args.kl_loss_coef != 0.0,
         max_seq_lens=max_seq_lens,
     )
 
@@ -982,9 +988,11 @@ def policy_loss_function(
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    if "entropy" in log_probs_and_entropy:
+        entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+    else:
+        entropy_loss = torch.zeros((), device=pg_loss.device)
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
