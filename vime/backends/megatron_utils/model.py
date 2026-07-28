@@ -301,6 +301,16 @@ def setup_model_and_optimizer(
 
             apply_chunked_mtp_ce_patch()
 
+    # [MTP + CP fix] 与 chunked-lm-head 无关的独立正确性修复:MTP 的 _roll_tensor_packed_seq 在
+    # CP>1 时硬读 packed_seq_params.cu_seqlens_q,但 vime 的 ring fix(commit e19530af)已把该字段
+    # 重指向成 ring 约定(÷cp、无前导 0),与 roll 期望的 origin 约定冲突 → tensor_recv_list[1]
+    # IndexError。修复:roll 改读 data.py 保留的 cu_seqlens_q_padded(origin 约定)。见 mtp_cp_roll_patch。
+    # 独立于 QWEN36_CHUNK_LMHEAD:开 MTP 即应用(无 CP / 无 MTP 时自然 no-op)。
+    if getattr(args, "enable_mtp_training", False):
+        from vime.backends.megatron_utils.mtp_cp_roll_patch import apply_mtp_cp_roll_patch
+
+        apply_mtp_cp_roll_patch()
+
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
     # Optimizer
