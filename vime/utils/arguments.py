@@ -949,6 +949,16 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "Only changes anything below --lambd 1, and forces the sequential recursion."
                 ),
             )
+            parser.add_argument(
+                "--gae-lambda-alpha",
+                type=float,
+                default=0.0,
+                help=(
+                    "Scale the GAE lambda with the response length: 1 - 1 / (alpha * length). "
+                    "A long response then behaves close to a Monte-Carlo return while a short "
+                    "one leans on the value function. Zero keeps the fixed --lambd."
+                ),
+            )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",

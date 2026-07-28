@@ -593,6 +593,24 @@ def apply_opd_kl_to_advantages(
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
+def _gae_lambda(args: Namespace, response_lengths: list[int], device) -> float | torch.Tensor:
+    """The GAE lambda to use, either the configured constant or one value per sample.
+
+    With ``--gae-lambda-alpha`` above zero, lambda is scaled by the response length:
+    ``1 - 1 / (alpha * length)``. A long response is then close to a Monte-Carlo return, while
+    a short one leans on the value function, which keeps the credit horizon roughly
+    proportional to how much the sample actually contains.
+    """
+    alpha = getattr(args, "gae_lambda_alpha", 0.0)
+    if alpha <= 0:
+        return args.lambd
+    return torch.tensor(
+        [max(0.0, 1.0 - 1.0 / (alpha * max(1, length))) for length in response_lengths],
+        device=device,
+        dtype=torch.float32,
+    )
+
+
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
@@ -676,7 +694,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             values,
             rewards,
             args.gamma,
-            args.lambd,
+            _gae_lambda(args, response_lengths, device=values[0].device),
             loss_masks_list=loss_masks if args.skip_observation_gae else None,
         )
         rollout_data["value_explained_var"] = distributed_explained_variance(
