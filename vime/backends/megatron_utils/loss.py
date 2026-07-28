@@ -671,7 +671,13 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 k[-1] += reward
             rewards.append(k)
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths,
+            response_lengths,
+            values,
+            rewards,
+            args.gamma,
+            args.lambd,
+            loss_masks_list=loss_masks if args.skip_observation_gae else None,
         )
         rollout_data["value_explained_var"] = distributed_explained_variance(
             torch.cat(returns),

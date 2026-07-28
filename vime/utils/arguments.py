@@ -927,6 +927,18 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument(
+                "--skip-observation-gae",
+                action="store_true",
+                default=False,
+                help=(
+                    "Keep positions the policy did not produce out of the GAE recursion, so "
+                    "advantage propagates from one action to the next and rewards landing on "
+                    "tool output are carried back to the preceding action. For multi-turn "
+                    "rollouts, where the value head was never trained on those positions. "
+                    "Only changes anything below --lambd 1, and forces the sequential recursion."
+                ),
+            )
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",
