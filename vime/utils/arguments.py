@@ -255,6 +255,26 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                         """,
             )
             parser.add_argument(
+                "--critic-only-train-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help=(
+                    "Like --only-train-params-name-list, but for the critic alone, replacing "
+                    "the global list for it. Lets the actor train in full while the critic "
+                    "updates only part of itself, which is cheaper and keeps its predictions "
+                    "from drifting as fast as the policy. Example: "
+                    "--critic-only-train-params-name-list mlp.experts output_layer"
+                ),
+            )
+            parser.add_argument(
+                "--critic-freeze-params-name-list",
+                type=str,
+                nargs="*",
+                default=None,
+                help="Like --freeze-params-name-list, but for the critic alone.",
+            )
+            parser.add_argument(
                 "--allgather-cp",
                 action="store_true",
                 default=False,
