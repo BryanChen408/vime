@@ -813,6 +813,16 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 help="Number of initial rollout steps that train critic only; set >= num_rollout for critic-only runs",
             )
             parser.add_argument(
+                "--critic-update-steps",
+                type=int,
+                default=1,
+                help=(
+                    "Critic updates per policy update. Above 1 the critic makes extra passes "
+                    "over the same rollout so its estimates keep up with a policy that has "
+                    "already moved. The learning-rate schedule still advances once per rollout."
+                ),
+            )
+            parser.add_argument(
                 "--megatron-config-path",
                 type=str,
                 default=None,

@@ -55,6 +55,12 @@ def train(args):
         if args.use_critic:
             actor_trains_this_step = rollout_id >= args.num_critic_only_steps
             value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+            # Extra passes over the same rollout, so the value function keeps up with a policy
+            # that has already moved. Each is awaited before the next so it trains against the
+            # weights the previous one left; only the last one's values reach the actor.
+            for _ in range(max(1, args.critic_update_steps) - 1):
+                ray.get(value_refs)
+                value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
             if actor_trains_this_step:
                 ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
             else:

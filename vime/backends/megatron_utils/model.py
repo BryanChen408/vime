@@ -591,7 +591,13 @@ def train_one_step(
         # Update learning rate. Use the per-step global_batch_size when dynamic
         # batching is on so the scheduler's samples-seen counter tracks reality.
         assert update_successful
-        opt_param_scheduler.step(increment=step_global_batch_size)
+        increment = step_global_batch_size
+        if getattr(model[0], "role", "actor") == "critic":
+            # Repeated critic passes revisit one rollout rather than reaching new samples, so
+            # each accounts for a share of it. Counting every pass in full would exhaust the
+            # critic's schedule that many times sooner than the actor's.
+            increment //= max(1, getattr(args, "critic_update_steps", 1))
+        opt_param_scheduler.step(increment=increment)
 
     # release grad
     for model_chunk in model:
