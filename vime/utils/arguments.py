@@ -1844,6 +1844,11 @@ def vime_validate_args(args):
         args.debug_train_only = True
 
     args.use_critic = args.advantage_estimator == "ppo"
+    if args.use_critic and args.kl_coef != 0:
+        # The critic is built without a reference model, so a reward-side KL penalty has no
+        # reference log-probs to work from and only fails once training starts. Put the KL in
+        # the loss with --kl-loss-coef instead.
+        raise ValueError("--kl-coef must be 0 with --advantage-estimator ppo; use --kl-loss-coef instead")
     # Critic always uses the same GPU count as actor.
     args.critic_num_gpus_per_node = args.actor_num_gpus_per_node
     args.critic_num_nodes = args.actor_num_nodes
