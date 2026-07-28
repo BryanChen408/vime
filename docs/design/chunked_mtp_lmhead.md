@@ -148,3 +148,88 @@ value-head 一律走原实现(no-op)。开关复用 `QWEN36_CHUNK_LMHEAD=1`,块�
 3. 加 `--ci-test` 时上面两个 CI 校验通过。
 若开 static-kernel/ACL-graph 后仍在解码中途静默崩,先回退那两项(与本设计无关,见 [[run 记录]])。
 TP2/CP4/SP 组合下的数值等价以此 run 为准(C5 只覆盖 TP=1 机制层)。
+
+## 10. MTP + Context-Parallel:`_roll_tensor_packed_seq` cu_seqlens 约定冲突(独立正确性修复)
+
+> 与 chunked-lm-head(§0-§9,躲 OOM)**无关**的另一条崩溃线。C6 在 CP>1 下开 MTP 会先在这里崩,
+> 不修则永远走不到 §9 的验证。故独立成节、独立 patch。
+
+### 现象
+`--enable-mtp-training` + `--context-parallel-size>1` 时,train forward 崩在
+`megatron/core/transformer/multi_token_prediction.py` 的 `_roll_tensor_packed_seq`:
+`tensor_recv_list[1]` IndexError(cp_size>1 分支,line ~287/289)。CP=1 从不崩。
+
+### 根因(cu_seqlens 约定被 ring fix 重指向)
+vime 直接驱动 Megatron core `GPTModel.forward`(非 MindSpeed `gpt_forward_wrapper`),ring attention
+需要的 `packed_seq_params` 字段由 vime 在 `data.get_batch` 手工填(**commit `e19530af`,作者 ZhihaoSun,
+2026-06-30**,"feat(npu/CP): enable context-parallel ring attention")。ring kernel 要求 `cu_seqlens_q`
+是 **CP-local、无前导 0**(带前导 0 → 零长段 → `npu_fusion_attention` 161001),于是该 commit 把
+`cu_seqlens_q` 重指向成 ring 约定,同时把 **origin(×cp_size、带前导 0)** 保留在:
+
+| 字段 | 约定 | 消费者 |
+|---|---|---|
+| `cu_seqlens_q`(被重指向) | CP-local,无前导 0 | ring attention(`ring_context_parallel`) |
+| `cu_seqlens_q_padded` | origin,带前导 0 | RoPE `_apply_rotary_pos_emb_thd`(内部 `//cp_size`) |
+| `cu_seqlens_gdn` | origin,带前导 0 | GDN `undo_attention_load_balancing_thd` |
+
+该 commit 只盘点了当时三个消费者。**MTP 的 `_roll_tensor_packed_seq` 是第四个消费者**(用户后来才开 MTP):
+它硬读 `cu_seqlens_q`,却按 origin 约定处理 —— `for i in range(len(cu)-1)` 需前导 0、`cu[i]//cp_size`
+需值是 ×cp_size 的。拿到 ring 约定后:迭代错位 + 二次除法 → `tensor_slice` 退化成极短切片 →
+`chunk(2)` 只返回 1 块 → `tensor_recv_list[1]` 越界。**与序列长短无关**(`slice_with_cp` 早已把每条
+per-seq pad 到 `2*cp_size` 的倍数,本地切片本应 `2*chunk_size≥2`;补 padding 修不了此约定冲突)。
+
+### 修复(C9)
+MTP roll 想要的正是 `cu_seqlens_q_padded`。`mtp_cp_roll_patch.py` 在调原 roll 前把
+`packed_seq_params.cu_seqlens_q` 临时换成 `cu_seqlens_q_padded`,调用后 finally 还原(ring attention
+在后续 layer forward 才读,不受影响)。换后每段本地切片 = `2*chunk_size`(front+镜像 tail),
+`chunk(2)` 出对称两块 → 不崩且数学正确(front/tail 布局与 `slice_with_cp` 一致)。
+
+- 作用域:cp==1 时 data.py 不设 `cu_seqlens_q_padded` → `select_roll_cu_seqlens` 回退 `cu_seqlens_q`
+  (本就是 origin)→ no-op(这也解释了为何 CP=1 从不崩)。
+- 接线:`model.py` 在 `enable_mtp_training` 分支应用,**独立于 `QWEN36_CHUNK_LMHEAD`**(纯正确性,
+  不是 OOM 特性)。不动 Megatron 源码;幂等。
+- 单测:`tests/test_mtp_cp_roll_patch.py`(5 例,纯逻辑,不依赖 megatron/distributed)——
+  验字段选择(优先 `_padded`、缺失回退)+ swap/restore(正常 & 异常路径)+ 无 `_padded` 时透传。
+- CP>1 的 isend/irecv 端到端等价仍由 C6 NPU run 覆盖。
+
+### 文件
+- `vime/backends/megatron_utils/mtp_cp_roll_patch.py`(新)
+- `tests/test_mtp_cp_roll_patch.py`(新)
+- `vime/backends/megatron_utils/model.py`(接线,`enable_mtp_training` 分支)
+
+## 11. `chunked_mtp_ce` 权重取错(前向数值 bug,2026-07-28 修复)
+
+### 现象
+开 MTP 训练时 `train/mtp_loss ≈ 14.8`(> 随机基线 `ln(248320)=12.4`),`grad_norm ≈ 10`(不开 MTP 时 ~0.25)。
+而推理侧 MTP 投机解码采信率 **73%**(per-position 0.86/0.73/0.60)——头是好的、官方训练过的。训练侧 loss
+与推理侧质量严重矛盾 → 训练侧 CE 算错。
+
+### 定位(集群 debug,megatron 无法本地起 TP=2 复现)
+CP=1/TP=2/SP,同一 microbatch 三路对照(`QWEN36_MTP_CE_DEBUG=1`):
+- **L_clean**(基线 `type(output_layer).forward` 类方法,绕开 chunked_lm_head 的实例级 bypass)= **0.45** ✅
+- **L_full/L_chunk**(我的 `gather+F.linear`)= **14.77**,`logits_maxdiff(my-vs-clean)=46`
+- `L_full==L_chunk` → **分块机制无罪**;差异在**前向 logits**。
+- CP roll 用仿真证死(§10 相邻);SP-gather(`gather_from_sequence_parallel_region`)与基线内部
+  `dist_all_gather_func` 是同一种沿 dim0 的 all-gather → gather 无罪。
+
+### 根因
+Megatron 基线**非融合分支**(`language_module.py:188-195`)经 `functional_call` 用
+**`column_parallel_linear` 模块自身的权重**(detached);`weight` 参数**只在 fused 分支**用。此模型
+`shared_embedding_or_output_weight()`(即传进来的 `weight` 参数)与 `output_layer` 的权重**不是同一个**,
+我的分块版误用 `weight` 参数做 `F.linear` → 用错矩阵 → logits 全错 → loss 14.8。
+
+### 修复(C10)
+`resolve_mtp_ce_weight(weight_arg, col_linear_kwargs, column_parallel_linear)`:复刻基线取权重优先级
+`col_linear_kwargs['weight']` → 模块 `weight` → `weight_arg` 兜底,并 `detach`(MTP loss 只训 hidden,
+不反传共享输出投影)。bias 一并透传(LM head 通常 None)。修后:`logits_maxdiff=0`、
+`L_chunk==L_clean=0.45`、`mtp_loss≈0.3-0.4`、`grad_norm≈0.12`。
+
+### 状态与开关
+- 默认**启用**;逃生阀 `QWEN36_MTP_CE_CHUNK_OFF=1` 整体跳过走基线全 logits(仅短序列)。
+- `QWEN36_MTP_CE_DEBUG=1`:首个 microbatch 打一次三路对照(需 T 放得下,用 CP=1/T≤4096)。
+- 回归单测 `tests/test_chunked_mtp_ce.py::test_resolve_weight_uses_module_not_arg`——TP=1 数值等价测法
+  抓不到"权重取错",故专门断言选模块权重而非 `weight` 参数 + detach。
+
+### 文件
+- `vime/backends/megatron_utils/chunked_mtp_ce_patch.py`(`resolve_mtp_ce_weight` + `chunked_ce_over_seq` 加 bias + debug 探针)
+- `tests/test_chunked_mtp_ce.py`(加权重来源回归)

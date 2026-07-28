@@ -10,7 +10,46 @@
 import torch
 import torch.nn.functional as F
 
-from vime.backends.megatron_utils.chunked_mtp_ce_patch import chunked_ce_over_seq
+from vime.backends.megatron_utils.chunked_mtp_ce_patch import (
+    chunked_ce_over_seq,
+    resolve_mtp_ce_weight,
+)
+
+
+class _FakeLinear:
+    def __init__(self, weight, skip_bias_add=False, bias=None):
+        self.weight = weight
+        self.skip_bias_add = skip_bias_add
+        self.bias = bias
+
+
+def test_resolve_weight_uses_module_not_arg():
+    """回归 2026-07-28 bug:非融合 CE 必须用模块权重,不是 `weight` 参数。
+
+    构造 weight_arg 与模块 weight 不同的张量,断言取到的是模块权重(或 col_linear_kwargs),
+    而不是 weight 参数——正是当初误用 `weight` 参数导致 logits 全错、mtp_loss 14.8 的那个 bug。
+    """
+    arg = torch.randn(8, 4)          # 假 shared_embedding_or_output_weight():不该被选中
+    mod_w = torch.randn(8, 4)        # output_layer.weight:非融合分支应选它
+    col_w = torch.randn(8, 4)        # col_linear_kwargs['weight']:最高优先级
+
+    # 1) col_linear_kwargs 提供 weight → 选它
+    got = resolve_mtp_ce_weight(arg, {"weight": col_w}, _FakeLinear(mod_w))
+    assert torch.equal(got, col_w), "有 col_linear_kwargs['weight'] 时应优先用它"
+
+    # 2) col_linear_kwargs 无 weight → 回退模块 weight(绝不能用 weight 参数)
+    got = resolve_mtp_ce_weight(arg, {"weight": None}, _FakeLinear(mod_w))
+    assert torch.equal(got, mod_w), "缺 col_linear_kwargs 时应用模块 weight,不是 weight 参数"
+    assert not torch.equal(got, arg), "绝不能选 weight 参数(=当初的 bug)"
+
+    # 3) 模块无 weight(tied/skip_weight_param_allocation)→ 才兜底 weight 参数
+    got = resolve_mtp_ce_weight(arg, {}, _FakeLinear(None))
+    assert torch.equal(got, arg), "两者都缺时才兜底 weight 参数"
+
+    # 4) detach:MTP loss 只训 hidden,不反传输出投影
+    w = torch.randn(8, 4, requires_grad=True)
+    got = resolve_mtp_ce_weight(arg, {}, _FakeLinear(w))
+    assert not got.requires_grad, "返回的权重必须 detached"
 
 
 def _ref_compute_lm_loss(labels_bc: torch.Tensor, logits_cbv: torch.Tensor) -> torch.Tensor:
@@ -55,6 +94,7 @@ def test_chunked_ce_backward_equals_full():
 
 
 if __name__ == "__main__":
+    test_resolve_weight_uses_module_not_arg()
     test_chunked_ce_forward_equals_full()
     test_chunked_ce_backward_equals_full()
-    print("chunked MTP-CE 数值等价(前向+反向)通过 ✅")
+    print("chunked MTP-CE 数值等价(前向+反向)+ 权重来源回归 通过 ✅")
