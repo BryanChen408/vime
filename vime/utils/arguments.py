@@ -114,6 +114,17 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--offload-release-param-buffer",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help=(
+                    "Whether the storage-resize backend also releases the parameter buffer, "
+                    "not just the gradients. Defaults to on under --colocate, where the rollout "
+                    "engine needs the whole card. Set it explicitly when something else shares "
+                    "those cards, such as an actor and a critic taking turns."
+                ),
+            )
+            parser.add_argument(
                 "--offload-rollout",
                 action=argparse.BooleanOptionalAction,
                 help=(
@@ -1922,6 +1933,9 @@ def vime_validate_args(args):
         args.disable_param_buffers_cpu_backup = True
 
     args.npu_offload_backend = _resolve_npu_offload_backend(args)
+
+    if args.offload_release_param_buffer is None:
+        args.offload_release_param_buffer = args.colocate
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path

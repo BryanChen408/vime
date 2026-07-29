@@ -120,8 +120,9 @@ class MegatronTrainRayActor(TrainRayActor):
         self._offload_backend = args.npu_offload_backend
         self._weight_offloader = None
         if args.offload_train and self._offload_backend == "storage-resize":
-            # A colocated engine needs the whole card, so the weights have to go too.
-            self._weight_offloader = NPUWeightOffloader(release_param_buffer=args.colocate)
+            self._weight_offloader = NPUWeightOffloader(
+                release_param_buffer=args.offload_release_param_buffer
+            )
 
         if args.offload_train and self._offload_backend == "tms":
             if (x := args.train_memory_margin_bytes) > 0:
