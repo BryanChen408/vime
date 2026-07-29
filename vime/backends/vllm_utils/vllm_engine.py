@@ -483,6 +483,11 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
         env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = host_for_subprocess
         env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(server_args["disaggregation_bootstrap_port"])
 
+    # vLLM wants the two together, and rejects the requests rather than the launch when
+    # they disagree, so emit them as a pair.
+    if getattr(args, "vllm_enable_auto_tool_choice", False):
+        cmd += ["--enable-auto-tool-choice", "--tool-call-parser", args.vllm_tool_call_parser]
+
     _forward_vllm_cli_args(args, cmd)
     logger.info("Launching vLLM server: %s", redact_cmd_for_log(cmd))
     return cmd, env

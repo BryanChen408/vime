@@ -196,6 +196,17 @@ def add_vllm_arguments(parser):
         default=None,
         help="vLLM tool-call parser name for agent output parsing (e.g. qwen3_coder).",
     )
+    parser.add_argument(
+        "--vllm-enable-auto-tool-choice",
+        dest="vllm_enable_auto_tool_choice",
+        action="store_true",
+        default=False,
+        help=(
+            "Have the server emit structured tool calls, using --vllm-tool-call-parser. "
+            "Needed by environments that send `tools` and read `tool_calls` back; agents "
+            "that parse the raw text themselves should leave this off."
+        ),
+    )
     _vllm_packed = parser.add_mutually_exclusive_group()
     _vllm_packed.add_argument(
         "--vllm-weight-sync-packed",
@@ -262,6 +273,10 @@ def validate_args(args):
 
     if getattr(args, "vllm_router_ip", None):
         args.vllm_router_ip = _wrap_ipv6(args.vllm_router_ip)
+
+    assert not (
+        getattr(args, "vllm_enable_auto_tool_choice", False) and not getattr(args, "vllm_tool_call_parser", None)
+    ), "--vllm-enable-auto-tool-choice needs --vllm-tool-call-parser to name the parser."
 
     assert not (
         getattr(args, "prefill_num_servers", None) is not None and getattr(args, "rollout_external", False)
@@ -351,6 +366,7 @@ _VIME_ORCHESTRATION_DESTS = frozenset(
         "vllm_enable_deterministic_inference",
         "vllm_weight_sync_packed",
         "vllm_tool_call_parser",
+        "vllm_enable_auto_tool_choice",
         "vllm_config",
         "prefill_num_servers",
     }

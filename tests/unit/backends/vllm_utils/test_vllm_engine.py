@@ -201,6 +201,31 @@ def test_build_vllm_cmd_does_not_infer_sleep_mode_from_colocate(vllm_args):
 
 
 @pytest.mark.unit
+def test_build_vllm_cmd_pairs_auto_tool_choice_with_its_parser(vllm_args):
+    vllm_args.vllm_enable_auto_tool_choice = True
+    vllm_args.vllm_tool_call_parser = "qwen3_coder"
+    server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+
+    cmd, _ = mod.build_vllm_cmd_and_env(server_args)
+
+    assert "--enable-auto-tool-choice" in cmd
+    assert cmd[cmd.index("--tool-call-parser") + 1] == "qwen3_coder"
+
+
+@pytest.mark.unit
+def test_build_vllm_cmd_leaves_tool_choice_alone_for_a_parser_only_run(vllm_args):
+    """Agents that parse the raw text pick a parser without wanting structured tool calls."""
+    vllm_args.vllm_enable_auto_tool_choice = False
+    vllm_args.vllm_tool_call_parser = "qwen3_coder"
+    server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)
+
+    cmd, _ = mod.build_vllm_cmd_and_env(server_args)
+
+    assert "--enable-auto-tool-choice" not in cmd
+    assert "--tool-call-parser" not in cmd
+
+
+@pytest.mark.unit
 def test_get_base_gpu_id_colocate(vllm_args):
     vllm_args.colocate = True
     vllm_args.num_gpus_per_node = 8
