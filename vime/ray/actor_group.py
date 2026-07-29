@@ -95,6 +95,20 @@ class RayTrainGroup:
                 env_vars["TMS_INIT_ENABLE"] = "1"
                 env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
+        # Swap the allocator for one that returns freed pages promptly. glibc keeps them in
+        # its per-thread arenas, so the host footprint only ever grows and each optimizer
+        # step's fp32 temporaries pile on top of what was never given back — which is what
+        # runs a single-node job into its memory ceiling. Ray does not pass LD_PRELOAD down
+        # to its actors, so setting it in the launch script would not reach them; it has to
+        # go through runtime_env. Skipped when the offload backend already claimed LD_PRELOAD.
+        if os.environ.get("VIME_JEMALLOC") == "1" and "LD_PRELOAD" not in env_vars:
+            env_vars["LD_PRELOAD"] = os.environ.get(
+                "VIME_JEMALLOC_LIB", "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
+            )
+            env_vars["MALLOC_CONF"] = os.environ.get(
+                "VIME_JEMALLOC_MALLOC_CONF", "background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
+            )
+
         # We cannot do routing replay for critic.
         if self.args.use_routing_replay and self.role == "actor":
             env_vars["ENABLE_ROUTING_REPLAY"] = "1"
