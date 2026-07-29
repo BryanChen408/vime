@@ -700,6 +700,37 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "and should be set to a larger value than `max_tokens_per_gpu` if you want better performance. "
                 ),
             )
+
+            # Rollouts driven by a polar server. Read only by vime_bridge; vime core never
+            # looks at them. The polar-* spellings are the older names for the rollout-* ones.
+            parser.add_argument("--polar-url", type=str, default=None)
+            parser.add_argument("--polar-rollout-url", type=str, default=None)
+            parser.add_argument("--polar-run-id", type=str, default=None)
+            parser.add_argument("--polar-reward-key", type=str, default=None)
+            parser.add_argument(
+                "--polar-task-id-template", type=str, default="polar-slime-{rollout_id}-{sample.group_index}"
+            )
+            parser.add_argument("--polar-instruction-template", type=str, default=None)
+            parser.add_argument("--operator-tasks-dir", type=str, default=None)
+            parser.add_argument("--polar-tasks-dir", type=str, default=None)
+            parser.add_argument("--rollout-max-async-level", type=int, default=None)
+            parser.add_argument("--polar-max-async-level", type=int, default=None)
+            parser.add_argument("--rollout-request-timeout", type=float, default=None)
+            parser.add_argument("--polar-request-timeout", type=float, default=None)
+            parser.add_argument("--rollout-scheduler-mode", type=str, default=None)
+            parser.add_argument("--polar-scheduler-mode", type=str, default=None)
+            parser.add_argument("--rollout-max-active-sessions", type=int, default=None)
+            parser.add_argument("--polar-max-active-sessions", type=int, default=None)
+            parser.add_argument("--rollout-release-on-postrun", action=argparse.BooleanOptionalAction, default=None)
+            parser.add_argument("--rollout-min-complete-accept-fraction", type=float, default=None)
+            parser.add_argument("--polar-min-complete-accept-fraction", type=float, default=None)
+            parser.add_argument("--rollout-session-pool-pause-policy", type=str, default=None)
+            parser.add_argument("--polar-session-pool-pause-policy", type=str, default=None)
+            parser.add_argument("--polar-allow-weight-update-overlap", action=argparse.BooleanOptionalAction, default=None)
+            # A task template selects the task_request submit mode; it is a path to an
+            # OmegaConf file that vime_bridge loads into a mapping.
+            parser.add_argument("--polar-task-template", type=str, default=None)
+            parser.add_argument("--polar-submit-mode", type=str, default=None)
             return parser
 
         def add_eval_arguments(parser):
