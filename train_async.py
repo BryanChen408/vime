@@ -35,6 +35,12 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    # Same baseline evaluation the synchronous loop runs. Here it has to happen before the
+    # loop: that one evaluates at the top of each iteration, while this one evaluates at the
+    # bottom, so a check placed inside would already be a weight update too late.
+    if args.eval_interval is not None and not args.skip_eval_before_train:
+        ray.get(rollout_manager.eval.remote(args.start_rollout_id))
+
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
