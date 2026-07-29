@@ -48,7 +48,15 @@ def finish_tracking(args):
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
     if args.use_wandb:
-        wandb.log(metrics)
+        # Pass the step rather than letting wandb advance its own. In shared mode only the
+        # primary process may read the global step, so everything logged from the rollout
+        # manager or a training actor would otherwise be dropped. This is the same step
+        # TensorBoard is given below, and it only ever moves forward within a process.
+        step = metrics.get(step_key)
+        if step is None:
+            wandb.log(metrics)
+        else:
+            wandb.log(metrics, step=int(step))
 
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
