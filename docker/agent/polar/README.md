@@ -34,10 +34,21 @@ NO_PROXY=127.0.0.1,localhost,<hosts> no_proxy=127.0.0.1,localhost,<hosts> \
   bash deploy/ascend_operator/restart_polar_host.sh
 ```
 
-## Open item
+## Scenarios (profile + runtime)
 
-Branch `feat/ascendc-rl-t2a` is TENTATIVE and does **not exist yet** on
-`BryanChen408/ProRL-Agent-Server` (which currently has only `feat/ascend-smoke`
-and `feat/swe-tasks`). It needs to be created from the curated reorg work and
-pushed before `git checkout feat/ascendc-rl-t2a` above will work. Pin an exact
-commit here once it lands.
+`feat/ascendc-rl-t2a` ships three operator scenarios; pick the matching polar
+profile + runtime dir:
+
+| scenario | profile | runtime dir | sandbox |
+|---|---|---|---|
+| triton  | `deploy/ascend_operator/profile.vime.yaml` | `operator_runtime` | triton sandbox |
+| ascendc (t2a) | `deploy/ascend_operator/profile.t2a.yaml` | `operator_runtime_t2a` | `ascendc-tilelang` |
+
+See `../RUNBOOK.md` for the full launch flow (training container + polar host +
+resource layout). The polar profile's inference endpoint (`sglang_router_url`
+field, legacy name) points at vime's vLLM router `:8001`.
+
+## Pin
+
+Tentative branch `feat/ascendc-rl-t2a` — currently at `4f0e1a4e`. Pin an exact
+commit for reproducibility once it stabilizes.
