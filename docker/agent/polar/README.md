@@ -17,10 +17,8 @@ deploy it alongside the vime training image.
 ```
 git clone https://github.com/BryanChen408/ProRL-Agent-Server.git polar
 cd polar
-# branch: TBD — the repo is being reorganized into curated scenario branches
-#   (main-npu + feat/operator|swe|math). Pin the intended branch/commit here
-#   once finalized.
-pip install -e .          # pure-python; no NPU compile needed
+git checkout feat/ascendc-rl-t2a   # tentative branch for the ascendc/operator + t2a scenario
+pip install -e .                   # pure-python; no NPU compile needed
 ```
 
 ## Deploy
@@ -38,6 +36,8 @@ NO_PROXY=127.0.0.1,localhost,<hosts> no_proxy=127.0.0.1,localhost,<hosts> \
 
 ## Open item
 
-The exact branch to pin and the polar deployment profiles/images are
-team-specific and still in flux (curated reorg in progress). Fill in the pinned
-ref + the concrete profile once decided, so this is reproducible.
+Branch `feat/ascendc-rl-t2a` is TENTATIVE and does **not exist yet** on
+`BryanChen408/ProRL-Agent-Server` (which currently has only `feat/ascend-smoke`
+and `feat/swe-tasks`). It needs to be created from the curated reorg work and
+pushed before `git checkout feat/ascendc-rl-t2a` above will work. Pin an exact
+commit here once it lands.
