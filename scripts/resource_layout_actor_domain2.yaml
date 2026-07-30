@@ -5,8 +5,8 @@
 # 保持 ASCEND_RT_VISIBLE_DEVICES 升序(Ascend 硬约束),不 pop、无 polar 撞卡风险。
 roles:
   actor:
-    - {node: 80.48.5.88, devices: "8-15"}
+    - {node: 80.5.25.119, devices: "0-7"}
   rollout:
-    - {node: 80.48.5.88, devices: "4-7"}
+    - {node: 80.5.25.119, devices: "8-11"}
 rollout:
   num_gpus_per_engine: 4

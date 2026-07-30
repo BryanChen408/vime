@@ -30,7 +30,7 @@ ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
 
 # ─── polar 数据 / 端点 ───
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
-OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189}
+OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/mnt/share/c00937190/datasets/op_tasks/op_assets_cudallm_filtered189}
 OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.jsonl}
 OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
 VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # profile.vime.yaml 推理端点指向它
@@ -54,6 +54,9 @@ export QWEN36_CHUNK_LMHEAD=${QWEN36_CHUNK_LMHEAD:-0}   # =1 chunked LM-head logp
 export VLLM_ASCEND_ENABLE_NZ=0                         # 必须 0:vllm-ascend wake_up 对 NZ+RL 硬 raise、weight-sync 每步换权重与 NZ 格式冲突(精度崩);推理加速收益 RL 下无法安全兑现
 export VLLM_TOOL_CALL_PARSER=qwen3_coder
 export VLLM_REASONING_PARSER=qwen3
+# 本机 vllm = v0.21.0 tag + 2 commits → 自报 0.21.1.dev2,vllm-ascend 的 vllm_version_is("0.21.0")
+# 会误判 → 走 vllm-main 才有的 expert_map_manager 导入 → ModuleNotFound。钉成 0.21.0。
+export VLLM_VERSION=${VLLM_VERSION:-0.21.0}
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=1
 # HCCL(节点内 HCCS + 跨机 socket;长跑 EI0013 容错 + 35B 权重广播大 buffer)
@@ -62,8 +65,8 @@ export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-600}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-2400}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}
-export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
-export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
+#export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
+#export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
 # 跨机 HCCL 必需(对齐 slime;缺则双机权重同步 world>N 卡死在 rendezvous):
 export HCCL_SOCKET_FAMILY=${HCCL_SOCKET_FAMILY:-AF_INET}       # 强制 IPv4(网卡带 IPv6 地址会 socket family mismatch)
 export HCCL_WHITELIST_DISABLE=${HCCL_WHITELIST_DISABLE:-1}     # 禁 IP 白名单(否则跨机对端 IP 不在白名单→连接被拒→卡死)
@@ -90,13 +93,13 @@ if [ -n "${SOCKET_IFNAME}" ]; then
 fi
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
-LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
-mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
+LOG_FILE=${LOG_FILE:-/mnt/share/c00937190/logs/train_${RUN_ID}.log}
+mkdir -p logs "${POLAR_OUTPUT_DIR}" /mnt/share/c00937190/logs
 
 # ─── 参数分组 ───
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
-   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
+   --hf-checkpoint ${HF_CKPT:-/mnt/weight/Qwen3.6-35B-A3B}
+   --ref-load ${REF_LOAD:-/mnt/weight/Qwen3.6-35B-A3B_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
    --save-interval 10
    --no-save-optim

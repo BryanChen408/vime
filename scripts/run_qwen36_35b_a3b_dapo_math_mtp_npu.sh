@@ -1,5 +1,14 @@
 #!/usr/bin/env bash
-# Qwen3.6-35B-A3B (GDN/MoE, Route B port) DAPO-math RL — single node, first 8 Ascend NPUs.
+# Qwen3.6-35B-A3B (GDN/MoE, Route B port) DAPO-math RL + MTP training — single node, 8 Ascend NPUs.
+#
+# Same as run_qwen36_35b_a3b_dapo_math_npu.sh, but ALSO trains the 1 MTP layer online:
+#   --mtp-num-layers 1        -> model_provider builds the MTP block into the GPTModel.
+#   --enable-mtp-training     -> mtp_labels fed to forward, MTP loss computed/logged (train/*mtp_loss).
+#   --mtp-loss-scaling-factor -> MTP loss weight in the total objective (default 0.2).
+# The MTP layer weights come from Qwen3.6-35B-A3B_torch_dist (verified to contain mtp.layers.0.*);
+# the _fused_torch_dist checkpoint has NO MTP tensors and must not be used here.
+# Note: MTP training is incompatible with combined-1f1b pipeline (model.py:594 asserts); this run
+# uses PP=1 so that path is not taken.
 #
 # Validation vehicle for the GDN port + converted checkpoint:
 #   - actor (policy/ref) = vime_plugins.models.qwen3_5 GDN model, loaded from the
@@ -56,7 +65,7 @@ PROMPT_DATA=/mnt/share/l30055792/datasets/dapo-math-17k.jsonl
 source "${VIME_DIR}/scripts/models/qwen3.5-35B-A3B.sh"   # -> MODEL_ARGS
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-RUN_ROOT="${VIME_DIR}/runs/dapo_math_${STAMP}"
+RUN_ROOT="${VIME_DIR}/runs/dapo_math_mtp_${STAMP}"
 mkdir -p "${RUN_ROOT}"
 
 # Start a single-node Ray head on the 8 visible NPUs — train.py connects via
@@ -109,6 +118,10 @@ python ${VIME_DIR}/train.py \
   --rollout-temperature 1.0 \
   --global-batch-size 8 \
   --balance-data \
+  \
+  --mtp-num-layers 1 \
+  --enable-mtp-training \
+  --mtp-loss-scaling-factor 0.2 \
   \
   --advantage-estimator grpo \
   --kl-loss-coef 0.0 \
