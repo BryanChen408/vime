@@ -1,0 +1,162 @@
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index dc761e69b..ef3014220 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -289,6 +289,21 @@ class Qwen3_5Model(Qwen3NextModel):
+         ]
+ 
+         params_dict = dict(self.named_parameters())
++        # [RL weight-sync fix] After process_weights_after_loading, FusedMoE experts.{w13,w2}_weight
++        # are replaced by fresh Parameter objects that lost their weight_loader attr. A *re-load*
++        # of weights (e.g. RL/HCCL weight-sync, per-expert under EP) then reaches the expert path
++        # with a param that has no weight_loader -> AttributeError. Re-attach the owning FusedMoE
++        # module's own (layout-aware, non-local-expert-skipping) weight_loader. No-op on first load
++        # and for modules that already have it. Mirrors sglang's _override_weight_loader.
++        from vllm.model_executor.utils import set_weight_attrs as _set_weight_attrs
++
++        for _module in self.modules():
++            _moe_loader = getattr(_module, "weight_loader", None)
++            if callable(_moe_loader):
++                for _wname in ("w13_weight", "w2_weight"):
++                    _wp = getattr(_module, _wname, None)
++                    if _wp is not None and not hasattr(_wp, "weight_loader"):
++                        _set_weight_attrs(_wp, {"weight_loader": _moe_loader})
+         loaded_params: set[str] = set()
+         expert_params_mapping = self.get_expert_mapping()
+         is_fused_expert = False
+@@ -664,11 +679,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
+         return hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        # Smoke-run compatibility: ignore MTP-only auxiliary weights that are not
++        # represented in the rollout model module tree.
++        filtered_weights = (item for item in weights if not item[0].startswith("mtp."))
+         loader = AutoWeightsLoader(
+             self,
+             skip_prefixes=["mtp."],
+         )
+-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
++        return loader.load_weights(filtered_weights, mapper=self.hf_to_vllm_mapper)
+ 
+     @classmethod
+     def get_mamba_state_dtype_from_config(
+diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
+index 4ec1be336..ad8dc1316 100644
+--- a/vllm/model_executor/models/qwen3_moe.py
++++ b/vllm/model_executor/models/qwen3_moe.py
+@@ -151,14 +151,19 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+         self.ep_group = get_ep_group().device_group
+         self.ep_rank = get_ep_group().rank_in_group
+         self.ep_size = self.ep_group.size()
+-        self.n_routed_experts = config.num_experts
++        self.n_routed_experts = getattr(config, "num_experts", None)
++        if self.n_routed_experts is None:
++            raise ValueError(
++                "Qwen3-MoE config is missing 'num_experts'; refusing to build a "
++                "SparseMoeBlock with 0 experts. Check the checkpoint config."
++            )
+ 
+         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+ 
+-        if self.tp_size > config.num_experts:
++        if self.tp_size > self.n_routed_experts:
+             raise ValueError(
+                 f"Tensor parallel size {self.tp_size} is greater than "
+-                f"the number of experts {config.num_experts}."
++                f"the number of experts {self.n_routed_experts}."
+             )
+ 
+         # Load balancing settings.
+@@ -178,7 +183,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+ 
+         self.gate = ReplicatedLinear(
+             config.hidden_size,
+-            config.num_experts,
++            self.n_routed_experts,
+             bias=False,
+             quant_config=quant_config,
+             prefix=f"{prefix}.gate",
+@@ -212,10 +217,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
+             shared_experts=self.shared_expert,
+             gate=self.gate,
+             num_experts=self.n_routed_experts,
+-            top_k=config.num_experts_per_tok,
++            top_k=getattr(config, "num_experts_per_tok", getattr(config, "moe_router_topk", 1)),
+             hidden_size=config.hidden_size,
+-            intermediate_size=config.moe_intermediate_size,
+-            renormalize=config.norm_topk_prob,
++            intermediate_size=getattr(config, "moe_intermediate_size", getattr(config, "intermediate_size", 0)),
++            renormalize=getattr(config, "norm_topk_prob", True),
+             quant_config=quant_config,
+             prefix=f"{prefix}.experts",
+             enable_eplb=self.enable_eplb,
+@@ -394,8 +399,15 @@ class Qwen3MoeDecoderLayer(nn.Module):
+         mlp_only_layers = (
+             [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
+         )
++        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
++        num_experts = getattr(config, "num_experts", None)
++        if num_experts is None:
++            raise ValueError(
++                "Qwen3-MoE config is missing 'num_experts'; refusing to silently "
++                "build a dense model. Check the checkpoint config field names."
++            )
+         if (layer_idx not in mlp_only_layers) and (
+-            config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
++            num_experts > 0 and (layer_idx + 1) % decoder_sparse_step == 0
+         ):
+             self.mlp = Qwen3MoeSparseMoeBlock(
+                 vllm_config=vllm_config, prefix=f"{prefix}.mlp"
+@@ -403,7 +415,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
+         else:
+             self.mlp = Qwen3MoeMLP(
+                 hidden_size=config.hidden_size,
+-                intermediate_size=config.intermediate_size,
++                intermediate_size=getattr(config, "intermediate_size", getattr(config, "moe_intermediate_size", 0)),
+                 hidden_act=config.hidden_act,
+                 quant_config=quant_config,
+                 prefix=f"{prefix}.mlp",
+@@ -462,8 +474,11 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+             quant_config=quant_config,
+             prefix=f"{prefix}.embed_tokens",
+         )
++        num_hidden_layers = getattr(config, "num_hidden_layers", getattr(config, "n_layer", None))
++        if num_hidden_layers is None:
++            raise AttributeError("Qwen3MoeModel requires num_hidden_layers in the HF text config.")
+         self.start_layer, self.end_layer, self.layers = make_layers(
+-            config.num_hidden_layers,
++            num_hidden_layers,
+             lambda prefix: decoder_layer_type(vllm_config=vllm_config, prefix=prefix),
+             prefix=f"{prefix}.layers",
+         )
+@@ -781,8 +796,12 @@ class Qwen3MoeForCausalLM(
+         return logits
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        # Qwen3.6 checkpoints may carry MTP auxiliary weights that are not
++        # represented in the current vLLM Qwen3MoeForCausalLM module tree.
++        # Skip those weights so the main decoder can still be loaded for rollout.
++        filtered_weights = (item for item in weights if not item[0].startswith("mtp"))
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(weights)
++        return loader.load_weights(filtered_weights)
+ 
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         return self.model.get_expert_mapping()
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8aaeb3970..0a8076787 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1775,6 +1775,12 @@ class Scheduler(SchedulerInterface):
+         return self._pause_state
+ 
+     def set_pause_state(self, pause_state: PauseState) -> None:
++        # [WSYNC-DBG] 记每次 pause-state 转换 + caller 栈,抓 /resume 后的野 re-pause(F-PPO-3a)。调试用,后删。
++        import logging as _lg, traceback as _tb
++        _lg.getLogger("vllm").warning(
++            "[WSYNC-DBG] set_pause_state %s -> %s | caller:\n%s",
++            getattr(self, "_pause_state", None), pause_state, "".join(_tb.format_stack()[-6:-1]),
++        )
+         self._pause_state = pause_state
+ 
+     def get_num_unfinished_requests(self) -> int:

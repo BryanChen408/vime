@@ -1,0 +1,684 @@
+diff --git a/.gitignore b/.gitignore
+index fdbbad5b1..ca538dfcb 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -222,3 +222,6 @@ csrc/third_party/
+ .codegraph/
+ 
+ .vllm_ascend/
++
++# Ascend C build output
++csrc/build_out/
+diff --git a/vllm_ascend/device_allocator/camem.py b/vllm_ascend/device_allocator/camem.py
+index b8ad7cd0b..f05614e38 100644
+--- a/vllm_ascend/device_allocator/camem.py
++++ b/vllm_ascend/device_allocator/camem.py
+@@ -148,11 +148,17 @@ class CaMemAllocator:
+ 
+     def __init__(self):
+         conf = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
+-        assert "expandable_segments:True" not in conf, (
+-            "Expandable segments are not compatible with memory pool. "
+-            "Please track https://github.com/pytorch/pytorch/issues/147851 "
+-            "for the latest updates."
+-        )
++        # [vime 2026-07-15 EXPERIMENTAL] 硬 assert 降为 warning(用户要求,便于实验 expandable+sleep）。
++        #   官方原因保留:expandable_segments 与 CaMemAllocator 内存池不兼容(pytorch#147851),
++        #   sleep/wake(offload)可能出错。仅实验用,验完须还原本行。改此文件后必须同步到 52 并重起 run。
++        if "expandable_segments:True" in conf:
++            import logging as _logging
++
++            _logging.getLogger(__name__).warning(
++                "[vime EXPERIMENTAL] expandable_segments:True set WITH CaMemAllocator pool — "
++                "officially incompatible (pytorch#147851); sleep/wake offload may break. "
++                "Upstream hard assert was relaxed to a warning for experimentation."
++            )
+ 
+         self.pointer_to_data: dict[int, AllocationData] = {}
+         self.current_tag: str = CaMemAllocator.default_tag
+diff --git a/vllm_ascend/distributed/weight_transfer/__init__.py b/vllm_ascend/distributed/weight_transfer/__init__.py
+new file mode 100644
+index 000000000..6300e346a
+--- /dev/null
++++ b/vllm_ascend/distributed/weight_transfer/__init__.py
+@@ -0,0 +1,14 @@
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++
++"""Ascend-specific weight transfer engines."""
++
++from vllm_ascend.distributed.weight_transfer.hccl_engine import (
++    HCCLTrainerSendWeightsArgs,
++    HCCLWeightTransferEngine,
++)
++
++__all__ = [
++    "HCCLTrainerSendWeightsArgs",
++    "HCCLWeightTransferEngine",
++]
+diff --git a/vllm_ascend/distributed/weight_transfer/hccl_engine.py b/vllm_ascend/distributed/weight_transfer/hccl_engine.py
+new file mode 100644
+index 000000000..767fc9181
+--- /dev/null
++++ b/vllm_ascend/distributed/weight_transfer/hccl_engine.py
+@@ -0,0 +1,215 @@
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++"""HCCL-based weight transfer engine for Ascend RL training."""
++
++from __future__ import annotations
++
++from collections.abc import Callable, Iterator
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++
++import torch
++
++if TYPE_CHECKING:
++    from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
++
++from vllm.config.parallel import ParallelConfig
++from vllm.config.weight_transfer import WeightTransferConfig
++from vllm.distributed.weight_transfer.base import (
++    WeightTransferEngine,
++    WeightTransferInitInfo,
++    WeightTransferUpdateInfo,
++)
++
++from vllm_ascend.distributed.device_communicators.pyhccl import PyHcclCommunicator
++
++
++@dataclass
++class HCCLWeightTransferInitInfo(WeightTransferInitInfo):
++    master_address: str
++    master_port: int
++    rank_offset: int
++    world_size: int
++
++
++@dataclass
++class HCCLTrainerSendWeightsArgs:
++    group: Any
++    src: int = 0
++    post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor] | None = None
++    packed: bool = False
++    stream: torch.npu.Stream | None = None
++
++
++@dataclass
++class HCCLWeightTransferUpdateInfo(WeightTransferUpdateInfo):
++    names: list[str]
++    dtype_names: list[str]
++    shapes: list[list[int]]
++    packed: bool = False
++
++    def __post_init__(self):
++        num_params = len(self.names)
++        if len(self.dtype_names) != num_params:
++            raise ValueError(
++                f"`dtype_names` should be of the same size as `names`: got {len(self.dtype_names)} and {len(self.names)}"
++            )
++        if len(self.shapes) != num_params:
++            raise ValueError(
++                f"`shapes` should be of the same size as `names`: got {len(self.shapes)} and {len(self.names)}"
++            )
++
++
++class HCCLWeightTransferEngine(
++    WeightTransferEngine[HCCLWeightTransferInitInfo, HCCLWeightTransferUpdateInfo]
++):
++    init_info_cls = HCCLWeightTransferInitInfo
++    update_info_cls = HCCLWeightTransferUpdateInfo
++
++    def __init__(self, config: WeightTransferConfig, parallel_config: ParallelConfig) -> None:
++        super().__init__(config, parallel_config)
++        self.model_update_group: PyHcclCommunicator | None = None
++
++    def init_transfer_engine(self, init_info: HCCLWeightTransferInitInfo) -> None:
++        dp_rank = self.parallel_config.data_parallel_index
++        world_size_per_dp = self.parallel_config.world_size
++        rank_within_dp = self.parallel_config.rank
++        worker_rank = dp_rank * world_size_per_dp + rank_within_dp
++        rank = worker_rank + init_info.rank_offset
++        device = torch.npu.current_device()
++        self.model_update_group = HCCLWeightTransferEngine._stateless_init_process_group(
++            init_info.master_address,
++            init_info.master_port,
++            rank,
++            init_info.world_size,
++            device=device,
++        )
++
++    def receive_weights(
++        self,
++        update_info: HCCLWeightTransferUpdateInfo,
++        load_weights: Callable[[list[tuple[str, torch.Tensor]]], None],
++    ) -> None:
++        if self.model_update_group is None:
++            raise RuntimeError(
++                "HCCL weight transfer not initialized. Call init_transfer_engine() first."
++            )
++
++        if update_info.packed:
++            # Packed path: pack many params into ~1GB buffers, one broadcast +
++            # one load_weights per buffer (mirrors NCCL packed path). Dominant fix
++            # for the per-tensor serial round-trip cost that made HCCL weight sync
++            # 5-6x slower than sglang.
++            from vllm_ascend.distributed.weight_transfer.packed_tensor_npu import (
++                packed_broadcast_consumer_npu,
++            )
++
++            def state_dict_info_iterator():
++                for name, dtype_name, shape in zip(
++                    update_info.names,
++                    update_info.dtype_names,
++                    update_info.shapes,
++                    strict=True,
++                ):
++                    yield (name, (shape, getattr(torch, dtype_name)))
++
++            packed_broadcast_consumer_npu(
++                iterator=state_dict_info_iterator(),
++                group=self.model_update_group,
++                src=0,
++                post_unpack_func=load_weights,
++            )
++            return
++
++        # Batched receive (sglang-equivalent, non-packed path — the one MoE uses):
++        # enqueue all broadcasts on the stream, then a SINGLE load_weights for the
++        # whole bucket, instead of per-tensor broadcast→load([one])→del. Mirrors
++        # sglang's model_runner (fire all broadcasts async → wait → one
++        # model.load_weights(weights)). Cuts the tens-of-thousands of per-tensor
++        # load_weights Python/dispatch round-trips that made vime→vLLM weight sync
++        # 5-6x slower than slime→sglang. Receiver-only change: the trainer still
++        # broadcasts per tensor in the same order, we just defer the load.
++        # Peak extra = one bucket (bounded by --update-weight-buffer-size), and the
++        # checkpoint-format wrapper already buffers per layer regardless.
++        weights: list[tuple[str, torch.Tensor]] = []
++        for name, dtype_name, shape in zip(
++            update_info.names,
++            update_info.dtype_names,
++            update_info.shapes,
++            strict=True,
++        ):
++            dtype = getattr(torch, dtype_name)
++            weight = torch.empty(shape, dtype=dtype, device="npu")
++            self.model_update_group.broadcast(weight, src=0)
++            weights.append((name, weight))
++        load_weights(weights)
++
++    def shutdown(self) -> None:
++        self.model_update_group = None
++
++    @staticmethod
++    def trainer_send_weights(
++        iterator: Iterator[tuple[str, torch.Tensor]],
++        trainer_args: dict[str, Any] | HCCLTrainerSendWeightsArgs,
++    ) -> None:
++        if isinstance(trainer_args, dict):
++            args = HCCLTrainerSendWeightsArgs(**trainer_args)
++        else:
++            args = trainer_args
++
++        if args.post_iter_func is None:
++            post_iter_func = lambda x: x[1]
++        else:
++            post_iter_func = args.post_iter_func
++
++        if args.packed:
++            # Packed path: pack params into ~1GB buffers, one broadcast per buffer
++            # (mirrors NCCL packed producer). Must stay in lockstep with the
++            # consumer's default buffer_size_bytes/num_buffers.
++            from vllm_ascend.distributed.weight_transfer.packed_tensor_npu import (
++                packed_broadcast_producer_npu,
++            )
++
++            packed_broadcast_producer_npu(
++                iterator=iterator,
++                group=args.group,
++                src=args.src,
++                post_iter_func=post_iter_func,
++            )
++            return
++
++        for item in iterator:
++            tensor = post_iter_func(item)
++            args.group.broadcast(tensor, src=args.src, stream=args.stream)
++
++    @staticmethod
++    def trainer_init(init_info: HCCLWeightTransferInitInfo | dict) -> "PyHcclCommunicator":
++        if isinstance(init_info, dict):
++            master_address = init_info["master_address"]
++            master_port = init_info["master_port"]
++            world_size = init_info["world_size"]
++        else:
++            master_address = init_info.master_address
++            master_port = init_info.master_port
++            world_size = init_info.world_size
++
++        device = torch.npu.current_device()
++        return HCCLWeightTransferEngine._stateless_init_process_group(
++            master_address,
++            master_port,
++            0,
++            world_size,
++            device,
++        )
++
++    @staticmethod
++    def _stateless_init_process_group(master_address, master_port, rank, world_size, device):
++        from vllm.distributed.utils import StatelessProcessGroup
++
++        pg = StatelessProcessGroup.create(
++            host=master_address,
++            port=master_port,
++            rank=rank,
++            world_size=world_size,
++        )
++        return PyHcclCommunicator(pg, device=device)
+diff --git a/vllm_ascend/distributed/weight_transfer/packed_tensor_npu.py b/vllm_ascend/distributed/weight_transfer/packed_tensor_npu.py
+new file mode 100644
+index 000000000..b112113be
+--- /dev/null
++++ b/vllm_ascend/distributed/weight_transfer/packed_tensor_npu.py
+@@ -0,0 +1,179 @@
++# Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
++# This file is a part of the vllm-ascend project.
++"""Packed tensor utilities for efficient HCCL weight transfer on Ascend NPU.
++
++NPU mirror of ``vllm/distributed/weight_transfer/packed_tensor.py`` (which is
++CUDA-only: ``torch.cuda.Stream`` / ``device="cuda"``).  Same double-buffered
++pack→broadcast→unpack→load pipeline, but on NPU streams so the HCCL weight-sync
++path can batch many small tensors (e.g. per-expert MoE weights) into ~1GB
++broadcasts + one ``load_weights`` per buffer instead of one broadcast+load per
++tensor.  This is the dominant fix for vime→vLLM weight-sync being 5-6x slower
++than slime→sglang (tens-of-thousands of serial per-tensor round-trips).
++
++``group.broadcast(tensor, src)`` is the ``PyHcclCommunicator`` broadcast, which
++enqueues on the current NPU stream (async); the double buffering overlaps buffer
++N's broadcast with buffer N-1's unpack+load.
++"""
++
++from __future__ import annotations
++
++import math
++from collections.abc import Callable, Iterator
++from typing import Any
++
++import torch
++
++# Must match the CUDA defaults so a mixed (unlikely) or documented config lines up.
++DEFAULT_PACKED_BUFFER_SIZE_BYTES = 1024 * 1024 * 1024  # 1GB
++DEFAULT_PACKED_NUM_BUFFERS = 2
++
++
++def packed_broadcast_producer_npu(
++    iterator: Iterator[tuple[str, torch.Tensor]],
++    group: Any,
++    src: int,
++    post_iter_func: Callable[[tuple[str, torch.Tensor]], torch.Tensor],
++    buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
++    num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
++) -> None:
++    """Trainer side: pack tensors into ~``buffer_size_bytes`` uint8 buffers and
++    broadcast each buffer once.  Double-buffered across NPU streams so packing
++    the next buffer overlaps broadcasting the current one.
++    """
++    target_packed_tensor_size = buffer_size_bytes
++
++    streams = [torch.npu.Stream() for _ in range(num_buffers)]
++    buffer_idx = 0
++
++    packing_tensor_list: list[list[torch.Tensor]] = [[] for _ in range(num_buffers)]
++    packing_tensor_sizes: list[int] = [0 for _ in range(num_buffers)]
++    packed_tensors: list[torch.Tensor] = [
++        torch.empty(0, dtype=torch.uint8, device="npu") for _ in range(num_buffers)
++    ]
++
++    while True:
++        streams[buffer_idx].synchronize()
++        with torch.npu.stream(streams[buffer_idx]):
++            try:
++                packing_tensor_list[buffer_idx] = []
++                packing_tensor_sizes[buffer_idx] = 0
++                while True:
++                    tensor = (
++                        post_iter_func(next(iterator))
++                        .contiguous()
++                        .view(torch.uint8)
++                        .view(-1)
++                    )
++                    packing_tensor_list[buffer_idx].append(tensor)
++                    packing_tensor_sizes[buffer_idx] += tensor.numel()
++                    if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
++                        break
++                packed_tensors[buffer_idx] = torch.cat(
++                    packing_tensor_list[buffer_idx], dim=0
++                )
++                group.broadcast(packed_tensors[buffer_idx], src=src)
++                buffer_idx = (buffer_idx + 1) % num_buffers
++            except StopIteration:
++                if len(packing_tensor_list[buffer_idx]) > 0:
++                    packed_tensors[buffer_idx] = torch.cat(
++                        packing_tensor_list[buffer_idx], dim=0
++                    )
++                    group.broadcast(packed_tensors[buffer_idx], src=src)
++                break
++
++
++def packed_broadcast_consumer_npu(
++    iterator: Iterator[tuple[str, tuple[list[int], torch.dtype]]],
++    group: Any,
++    src: int,
++    post_unpack_func: Callable[[list[tuple[str, torch.Tensor]]], None],
++    buffer_size_bytes: int = DEFAULT_PACKED_BUFFER_SIZE_BYTES,
++    num_buffers: int = DEFAULT_PACKED_NUM_BUFFERS,
++) -> None:
++    """vLLM worker side: for each ~``buffer_size_bytes`` group of params, allocate
++    a packed uint8 buffer, broadcast it once, unpack into views and call
++    ``post_unpack_func`` (= ``model.load_weights``) once per buffer.  Double
++    buffered so buffer N's broadcast overlaps buffer N-1's unpack+load.
++    """
++
++    def unpack_tensor(
++        packed_tensor: torch.Tensor,
++        names: list[str],
++        shapes: list[list[int]],
++        dtypes: list[torch.dtype],
++        tensor_sizes: list[int],
++    ) -> list[tuple[str, torch.Tensor]]:
++        unpacked_tensors = packed_tensor.split(tensor_sizes)
++        return [
++            (name, tensor.contiguous().view(dtype).view(*shape))
++            for name, shape, dtype, tensor in zip(
++                names, shapes, dtypes, unpacked_tensors
++            )
++        ]
++
++    target_packed_tensor_size = buffer_size_bytes
++
++    streams = [torch.npu.Stream() for _ in range(num_buffers)]
++    buffer_idx = 0
++
++    packing_tensor_meta_data: list[list[tuple[str, list[int], torch.dtype, int]]] = [
++        [] for _ in range(num_buffers)
++    ]
++    packing_tensor_sizes: list[int] = [0 for _ in range(num_buffers)]
++    packed_tensors: list[torch.Tensor] = [
++        torch.empty(0, dtype=torch.uint8, device="npu") for _ in range(num_buffers)
++    ]
++
++    while True:
++        streams[buffer_idx].synchronize()
++        with torch.npu.stream(streams[buffer_idx]):
++            packing_tensor_meta_data[buffer_idx] = []
++            packing_tensor_sizes[buffer_idx] = 0
++            try:
++                while True:
++                    name, (shape, dtype) = next(iterator)
++                    tensor_size = math.prod(shape) * dtype.itemsize
++                    packing_tensor_meta_data[buffer_idx].append(
++                        (name, shape, dtype, tensor_size)
++                    )
++                    packing_tensor_sizes[buffer_idx] += tensor_size
++                    if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
++                        break
++                packed_tensors[buffer_idx] = torch.empty(
++                    packing_tensor_sizes[buffer_idx], dtype=torch.uint8, device="npu"
++                )
++                group.broadcast(packed_tensors[buffer_idx], src=src)
++                names, shapes, dtypes, tensor_sizes = zip(
++                    *packing_tensor_meta_data[buffer_idx]
++                )
++                post_unpack_func(
++                    unpack_tensor(
++                        packed_tensors[buffer_idx],
++                        list(names),
++                        list(shapes),
++                        list(dtypes),
++                        list(tensor_sizes),
++                    )
++                )
++                buffer_idx = (buffer_idx + 1) % num_buffers
++            except StopIteration:
++                if len(packing_tensor_meta_data[buffer_idx]) > 0:
++                    packed_tensors[buffer_idx] = torch.empty(
++                        packing_tensor_sizes[buffer_idx],
++                        dtype=torch.uint8,
++                        device="npu",
++                    )
++                    group.broadcast(packed_tensors[buffer_idx], src=src)
++                    names, shapes, dtypes, tensor_sizes = zip(
++                        *packing_tensor_meta_data[buffer_idx]
++                    )
++                    post_unpack_func(
++                        unpack_tensor(
++                            packed_tensors[buffer_idx],
++                            list(names),
++                            list(shapes),
++                            list(dtypes),
++                            list(tensor_sizes),
++                        )
++                    )
++                break
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index a431057bf..77b9a307d 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -33,6 +33,7 @@ from vllm.distributed import ensure_model_parallel_initialized, init_distributed
+ from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
+ from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized, get_kv_transfer_group, has_kv_transfer_group
+ from vllm.distributed.parallel_state import Handle, get_pp_group, get_tp_group
++from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+ from vllm.logger import logger
+ from vllm.lora.request import LoRARequest
+ from vllm.sequence import IntermediateTensors
+@@ -141,6 +142,21 @@ class NPUWorker(WorkerBase):
+         if "UnquantizedLinearMethod" in WEIGHT_LOADER_V2_SUPPORTED:
+             WEIGHT_LOADER_V2_SUPPORTED.remove("UnquantizedLinearMethod")
+ 
++        if self.vllm_config.weight_transfer_config is None:
++            self.weight_transfer_engine = None
++        elif self.vllm_config.weight_transfer_config.backend == "nccl":
++            from vllm_ascend.distributed.weight_transfer.hccl_engine import HCCLWeightTransferEngine
++
++            self.weight_transfer_engine = HCCLWeightTransferEngine(
++                self.vllm_config.weight_transfer_config,
++                self.vllm_config.parallel_config,
++            )
++        else:
++            self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
++                self.vllm_config.weight_transfer_config,
++                self.vllm_config.parallel_config,
++            )
++
+         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
+         if self.use_v2_model_runner and vllm_version_is("0.21.0"):
+             logger.warning("VLLM_USE_V2_MODEL_RUNNER is not supported on vllm 0.21.0; falling back to v1 model runner.")
+@@ -215,6 +231,46 @@ class NPUWorker(WorkerBase):
+             used_bytes / GiB_bytes,
+         )
+ 
++    @staticmethod
++    def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
++        """Copy vLLM custom attributes set via ``set_weight_attrs`` from *src*
++        param to *dst* param.  ``torch.nn.Parameter(src_data, …)`` creates a
++        fresh tensor that drops every non-std attribute, so this must be
++        called whenever a param is re-created during wake_up.
++        """
++        # Standard torch.Tensor / nn.Parameter builtins to skip
++        _SKIP = frozenset(
++            {
++                "data",
++                "dtype",
++                "device",
++                "grad",
++                "grad_fn",
++                "layout",
++                "name",
++                "names",
++                "ndim",
++                "output_nr",
++                "requires_grad",
++                "retains_grad",
++                "shape",
++                "size",
++            }
++        )
++        for key in dir(src):
++            if key.startswith("_") or key in _SKIP:
++                continue
++            try:
++                val = getattr(src, key)
++            except (AttributeError, RuntimeError):
++                continue
++            if callable(val) and key not in ("weight_loader",):
++                continue  # skip methods (except the crucial weight_loader)
++            try:
++                setattr(dst, key, val)
++            except (AttributeError, TypeError, RuntimeError):
++                pass  # read-only or non-settable
++
+     def wake_up(self, tags: list[str] | None = None) -> None:
+         nz_mode = get_ascend_config().weight_nz_mode
+         if nz_mode:
+@@ -225,29 +281,19 @@ class NPUWorker(WorkerBase):
+         allocator = CaMemAllocator.get_instance()
+         allocator.wake_up(tags=tags)
+ 
+-        hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
+-        model = self.model_runner.model
+-        if self.vllm_config.quant_config is None and (tags is None or "weights" in tags):
+-            for name, param in model.named_parameters():
+-                if "w2_weight" in name and param.shape[2] == hidden_size:
+-                    parts = name.split(".")
+-                    param_name = parts[-1]
+-                    parent_module = model.get_submodule(".".join(parts[:-1]))
+-
+-                    w2_data = param.transpose(1, 2)
+-                    w2_data = torch.nn.Parameter(w2_data, requires_grad=False)
+-                    setattr(parent_module, param_name, w2_data)
+-                elif "w13_weight" in name and param.shape[1] == hidden_size:
+-                    parts = name.split(".")
+-                    param_name = parts[-1]
+-                    parent_module = model.get_submodule(".".join(parts[:-1]))
+-
+-                    w13_data = param.transpose(1, 2)
+-                    w13_data = torch.nn.Parameter(w13_data, requires_grad=False)
+-                    setattr(parent_module, param_name, w13_data)
++        # NOTE: The MoE w2/w13 weight transpose previously here is REMOVED.
++        # It was a layout optimization for npu_grouped_matmul that is NOT
++        # required for correctness (vllm-ascend standalone serve runs without
++        # it because wake_up is only called via vime's POST /wake_up).
++        # For colocated RL the transpose broke both layerwise-reload
++        # (_copy_and_restore_kernel_tensors shape mismatch) AND the
++        # post-sync forward pass (npu_grouped_matmul error 161002).
++        # The grouped-matmul kernel handles the original safetensors layout
++        # correctly — verified by the working --no-offload-rollout config.
+ 
+         # Restore the buffers after level 2 sleep
+         if len(self._sleep_saved_buffers):
++            model = self.model_runner.model
+             for name, buffer in model.named_buffers():
+                 if name in self._sleep_saved_buffers:
+                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
+@@ -471,6 +517,98 @@ class NPUWorker(WorkerBase):
+             self.torch_allocated / GiB_bytes,
+         )
+ 
++    def _check_weight_transfer_engine(self) -> None:
++        if self.weight_transfer_engine is None:
++            raise RuntimeError(
++                "Weight transfer not configured. Please set weight_transfer_config to enable weight transfer."
++            )
++
++    def init_weight_transfer_engine(self, init_info: dict) -> None:
++        self._check_weight_transfer_engine()
++        assert self.weight_transfer_engine is not None
++        typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
++        self.weight_transfer_engine.init_transfer_engine(typed_init_info)
++
++    def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
++        self._check_weight_transfer_engine()
++        if getattr(self, "_weight_update_active", False):
++            raise RuntimeError(
++                "start_weight_update called while a weight update is already active. "
++                "Call finish_weight_update first."
++            )
++
++        if is_checkpoint_format:
++            from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
++
++            model = self.model_runner.model
++            with torch.device(self.device):
++                initialize_layerwise_reload(model)
++
++        self._is_checkpoint_format = is_checkpoint_format
++        self._weight_update_active = True
++
++    def update_weights(self, update_info: dict) -> None:
++        self._check_weight_transfer_engine()
++        assert self.weight_transfer_engine is not None
++
++        if not getattr(self, "_weight_update_active", False):
++            raise RuntimeError("start_weight_update must be called before update_weights.")
++
++        typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
++        model = self.model_runner.model
++
++        with torch.device(self.device):
++            if self._is_checkpoint_format:
++                self.weight_transfer_engine.receive_weights(
++                    typed_update_info,
++                    load_weights=model.load_weights,
++                )
++            else:
++                def load_weights_direct(weights: list[tuple[str, torch.Tensor]]) -> None:
++                    # Raw path does no MoE fused-expert remapping or w13/w2
++                    # transpose: the trainer must send tensors already laid out
++                    # as the rollout engine loaded them. Validate shape so a
++                    # mismatch fails loudly instead of silently broadcasting or
++                    # raising a cryptic low-level copy error.
++                    for name, weight in weights:
++                        param = model.get_parameter(name)
++                        if tuple(param.shape) != tuple(weight.shape):
++                            raise ValueError(
++                                f"weight-sync shape mismatch for '{name}': "
++                                f"rollout param {tuple(param.shape)} != incoming "
++                                f"{tuple(weight.shape)}"
++                            )
++                        param.copy_(weight)
++
++                self.weight_transfer_engine.receive_weights(
++                    typed_update_info,
++                    load_weights=load_weights_direct,
++                )
++
++        torch.accelerator.synchronize()
++
++    def finish_weight_update(self) -> None:
++        self._check_weight_transfer_engine()
++
++        if not getattr(self, "_weight_update_active", False):
++            raise RuntimeError("start_weight_update must be called before finish_weight_update.")
++
++        if getattr(self, "_is_checkpoint_format", True):
++            from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
++
++            model = self.model_runner.model
++            with torch.device(self.device):
++                finalize_layerwise_reload(model, self.model_config)
++
++        self._weight_update_active = False
++        self._is_checkpoint_format = True
++
++    def shutdown(self) -> None:
++        if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
++            weight_transfer_engine.shutdown()
++        if model_runner := getattr(self, "model_runner", None):
++            model_runner.shutdown()
++
+     def execute_model(
+         self,
+         scheduler_output: "SchedulerOutput",

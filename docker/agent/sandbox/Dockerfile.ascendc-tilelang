@@ -1,0 +1,133 @@
+# =============================================================================
+# ascendc-tilelang — Polar sandbox image (A3 / aarch64, CANN 9.0.0, py3.11)
+#
+# Multi-stage:
+#   Stage 1  wheel-builder : compile the TileLang wheel from source
+#   Stage 2  runtime       : install that wheel + torch/torch_npu/cmake<4/claude
+#
+# Build context is prepared by build_ascendc_tilelang.sh (rsyncs the
+# tilelang-ascend source — submodules checked out, .git stripped — into a temp
+# context, then runs docker build). Do not build by hand.
+# =============================================================================
+
+ARG BASE_IMAGE=quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11
+ARG TORCH_VERSION=2.8.0
+ARG TORCH_NPU_VERSION=2.8.0.post4
+ARG CLAUDE_VERSION=2.1.168
+
+# Shared pip index args (public torch cpu wheels + Huawei Ascend mirror)
+ARG PIP_EXTRA="--extra-index-url https://download.pytorch.org/whl/cpu/ --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi/"
+
+# =============================================================================
+# Stage 1: wheel-builder — compile the TileLang wheel
+# =============================================================================
+FROM ${BASE_IMAGE} AS wheel-builder
+
+ARG TORCH_VERSION
+ARG TORCH_NPU_VERSION
+ARG PIP_EXTRA
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest \
+    USE_ASCEND=true
+
+# build deps: git is required by apply_tvm_patches.sh (`git apply`)
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      build-essential git libpython3.11-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# torch + torch_npu (TileLang compile-time deps)
+RUN pip install --no-cache-dir ${PIP_EXTRA} \
+      "torch==${TORCH_VERSION}" "torch_npu==${TORCH_NPU_VERSION}"
+
+# cmake >=3.26 (TileLang requires) and <4 (AscendC CMakeLists back-compat)
+RUN pip install --no-cache-dir "cmake>=3.26,<4" patchelf auditwheel
+
+# TileLang source (build script already stripped .git, kept checked-out submodules)
+COPY tilelang-src/ /tmp/tilelang-src/
+WORKDIR /tmp/tilelang-src
+
+# Python build deps
+RUN pip install --no-cache-dir -r requirements-build.txt -r requirements.txt
+
+# apply_tvm_patches.sh patches 3rdparty/tvm via `git -C 3rdparty/tvm apply`.
+# The context has no .git, so init a throwaway repo to let `git apply` run.
+# Patches are idempotent (reverse-check-then-skip / apply).
+RUN git init -q 3rdparty/tvm && \
+    git -C 3rdparty/tvm add -A && \
+    git -C 3rdparty/tvm -c user.email=build@build -c user.name=build \
+        commit -q -m src
+
+# compile the wheel (setup.py runs apply_tvm_patches.sh -> builds TVM -> packages)
+RUN { source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null \
+      || source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null || true; }; \
+    python setup.py bdist_wheel 2>&1 | tail -5 && \
+    echo "=== wheel ===" && ls -lh dist/
+
+# =============================================================================
+# Stage 2: runtime — polar agent runtime image
+# =============================================================================
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG TORCH_VERSION
+ARG TORCH_NPU_VERSION
+ARG CLAUDE_VERSION
+ARG PIP_EXTRA
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest \
+    ASCEND_OPP_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp \
+    ASCEND_AICPU_PATH=/usr/local/Ascend/ascend-toolkit/latest \
+    ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+
+# system packages:
+#   libpython3.11-dev : Python.h for pybind11 / cpp_extension
+#   libjemalloc2      : reduce memory fragmentation on long-running polar sessions
+#   Node 20           : Claude Code CLI needs Node >= 18 (Ubuntu22 apt ships Node 12)
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      build-essential curl git libjemalloc2 libpython3.11-dev && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    node --version && npm --version
+
+# torch + torch_npu
+RUN pip install --no-cache-dir ${PIP_EXTRA} \
+      "torch==${TORCH_VERSION}" "torch_npu==${TORCH_NPU_VERSION}" && \
+    python3 -c "import torch, torch_npu; print('torch', torch.__version__, '/ torch_npu', torch_npu.__version__)"
+
+# cmake < 4  (cmake 4.x breaks AscendC CMakeLists cmake_minimum_required back-compat)
+RUN pip install --no-cache-dir "cmake<4" && cmake --version | head -1
+
+# Claude Code CLI
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}" && \
+    claude --version 2>/dev/null | head -1 || true
+
+# TileLang wheel (from stage 1)
+COPY --from=wheel-builder /tmp/tilelang-src/dist/tilelang-*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/tilelang-*.whl && \
+    rm -f /tmp/tilelang-*.whl && \
+    python3 -c "import tilelang; print('tilelang', tilelang.__version__)"
+
+# toolchain sanity check
+RUN { source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null \
+      || source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null || true; }; \
+    cmake --version | head -1 && \
+    which ccec bishengir-compile && \
+    python3 -c "import torch, torch_npu, tilelang; print('ALL OK')"
+
+# runtime env:
+#   ACL_OP_INIT_MODE=1 : required by TileLang jit init (from tilelang/set_env.sh)
+#   LD_PRELOAD jemalloc: reduce long-session memory fragmentation
+#   NOTE: base is aarch64 -> jemalloc lives under aarch64-linux-gnu (NOT x86_64).
+ENV ACL_OP_INIT_MODE=1 \
+    LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2
+
+CMD ["/bin/bash"]

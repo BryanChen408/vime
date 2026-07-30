@@ -1,0 +1,11 @@
+# Large / externally-downloaded artifacts — do NOT commit to the vime repo.
+# The triton-ascend wheel is downloaded per training/README.md (gitcode releases).
+training/wheels/*.whl
+
+# build junk
+**/__pycache__/
+**/*.pyc
+**/build/
+**/dist/
+**/*.egg-info/
+*.log

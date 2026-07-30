@@ -1,0 +1,225 @@
+# [TEST VARIANT] BASE_IMAGE=cann:900 (local py3.11). TRITON_ASCEND_WHEEL defaults to the
+# cp311 wheel in wheels/. NPU kernels (vllm-ascend/fla) are built post-image via
+# build_npu_kernels.sh — see README.
+#
+# =============================================================================
+# vime dev image — RELEASE / one-click build for external hand-off
+# Target: A3 (Ascend 910_93-class) / aarch64, CANN 9.0.0
+#
+# Dependency model: clone each dep from its OFFICIAL public upstream at a pinned
+# ref, then apply a small vime patch (patches/*.patch). No private forks, no
+# local COPY of repos. Deliverable = this Dockerfile + patches/ (+ optional
+# wheels/). Build context is tiny; build from a minimal dir (see BUILD below).
+#
+# Official baselines + patch sizes (each verified to apply cleanly on the
+# pristine baseline via `git apply --check`):
+#   vllm         vllm-project/vllm            @ v0.21.0     + patch  3 files
+#   vllm-ascend  vllm-project/vllm-ascend     @ v0.21.0rc1  + patch  5 files
+#   Megatron-LM  NVIDIA/Megatron-LM           @ 3714d81d    + patch 22 files
+#   MindSpeed    gitcode Ascend/MindSpeed     @ fc63de5c    + patch 26 files (GDN kernels)
+#   fla_npu      flashserve/flash-linear-attention-npu @ v26.1.0   (no patch)
+#   vime         github.com/BryanChen408/vime @ feature/swe-tasks (no patch)
+#
+# Baseline provenance: Megatron 3714d81d + MindSpeed fc63de5c are the exact pins
+# from the Ascend slime-ascend qwen3.5-9B tutorial; vllm / vllm-ascend use their
+# official release tags. The MindSpeed patch is large (~5.5k lines) because it
+# carries the GDN triton kernel set (official code, added on top of fc63de5c
+# which predates GDN landing upstream) — if that patch's upkeep is not worth it,
+# fall back to a private MindSpeed fork for that one repo only.
+#
+# Baked-in runtime fixes (previously applied by hand in the container):
+#   ENV VLLM_VERSION=0.21.0 ; patchelf $$ORIGIN->$ORIGIN on vllm_ascend_C*.so.
+# Base note: quay.io/ascend/cann:9.0.0-a3-* ships the ascend910_93 op kernels,
+#   so no separate A3-ops .run is needed. CANN env at ascend-toolkit/set_env.sh.
+#   triton-ascend==3.2.1 is not on public PyPI (from PIP_INDEX_URL or ./wheels/).
+#   Base is py3.12 (local build was py3.11); pins are py3.12-compatible.
+#
+# BUILD (minimal context — avoids shipping /workspace):
+#   mkdir -p /tmp/vime-release && cp -r Dockerfile.release patches wheels /tmp/vime-release/
+#   docker build -f Dockerfile.release -t vime:a3-release /tmp/vime-release
+# =============================================================================
+
+ARG BASE_IMAGE=cann:900
+FROM ${BASE_IMAGE}
+
+# --- proxy / pip-mirror / optional wheel ---
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG NO_PROXY="localhost,127.0.0.1,::1"
+ARG no_proxy
+ARG PIP_INDEX_URL
+ARG PIP_TRUSTED_HOST
+ARG GIT_SSL_NO_VERIFY=1
+ARG TRITON_ASCEND_WHEEL=triton_ascend-3.2.1-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+
+# --- dependency sources: OFFICIAL upstream repo + pinned baseline ref ---
+# (override with --build-arg to repoint; refs are pinned for reproducibility)
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_REF=v0.21.0
+ARG VLLM_ASCEND_REPO=https://github.com/vllm-project/vllm-ascend.git
+ARG VLLM_ASCEND_REF=v0.21.0rc1
+ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM.git
+ARG MEGATRON_REF=3714d81d
+ARG MINDSPEED_REPO=https://gitcode.com/Ascend/MindSpeed.git
+ARG MINDSPEED_REF=fc63de5c
+ARG FLA_REPO=https://github.com/flashserve/flash-linear-attention-npu.git
+ARG FLA_REF=v26.1.0
+# vime — public repo, branch feature/swe-tasks (fe4cb78c). No push needed.
+ARG VIME_REPO=https://github.com/BryanChen408/vime.git
+ARG VIME_REF=feature/swe-tasks
+
+# A3 SoC + fla_npu GDN op set
+ARG FLA_SOC=ascend910_93
+ARG FLA_OPS=chunk_bwd_dv_local,chunk_bwd_dqkwg,chunk_gated_delta_rule_bwd_dhu,prepare_wy_repr_bwd_da,prepare_wy_repr_bwd_full,chunk_fwd_o,chunk_gated_delta_rule_fwd_h,recurrent_gated_delta_rule,recompute_wu_fwd,causal_conv1d
+
+ENV HTTP_PROXY=${HTTP_PROXY:-} \
+    HTTPS_PROXY=${HTTPS_PROXY:-} \
+    http_proxy=${http_proxy:-} \
+    https_proxy=${https_proxy:-} \
+    NO_PROXY="${NO_PROXY}" \
+    no_proxy="${no_proxy}" \
+    PIP_INDEX_URL=${PIP_INDEX_URL:-} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-} \
+    GIT_SSL_NO_VERIFY=${GIT_SSL_NO_VERIFY}
+
+ENV CANN_HOME=/usr/local/Ascend/ascend-toolkit/latest
+ENV CANN_SETENV_A=/usr/local/Ascend/ascend-toolkit/set_env.sh
+ENV CANN_SETENV_B=/usr/local/Ascend/cann-9.0.0/set_env.sh
+
+# apt deps: base tools + fla_npu build deps + patchelf (RUNPATH fix)
+RUN set -ex; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    # some base images ship apt keyrings not readable by the '_apt' user, which
+    # makes apt-get update fail with NO_PUBKEY; make them world-readable. No-op
+    # on a healthy base. Fall back to an insecure update only if that isn't enough.
+    chmod 0644 /etc/apt/trusted.gpg.d/*.gpg /etc/apt/keyrings/*.gpg 2>/dev/null || true; \
+    apt-get update \
+      || apt-get -o Acquire::AllowInsecureRepositories=true \
+                 -o Acquire::AllowDowngradeToInsecureRepositories=true update; \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        sshpass kmod numactl libjemalloc2 patchelf \
+        git gawk pigz dos2unix libgtest-dev libgmock-dev pkg-config \
+        build-essential cmake make patch \
+    && rm -rf /var/lib/apt/lists/*
+# NOTE: the above covers what fla_npu's install_deps.sh would install
+# (gawk/pigz/dos2unix/gtest/cmake/make/gcc/patch); we install them directly and
+# skip install_deps.sh, which uses sudo + interactive prompts that stall in a
+# non-interactive docker build.
+
+# --- PyTorch stack (keep torch-npu STOCK 2.10.0 for fla_npu torchnpugen) ---
+RUN pip install --no-cache-dir \
+        torch==2.10.0 torch-npu==2.10.0 torchvision==0.25.0 torchaudio==2.10.0
+
+RUN pip install --no-cache-dir \
+        accelerate==1.13.0 datasets==4.8.5 einops==0.8.2 gpytorch==1.15.2 \
+        jsonargparse==4.49.0 mbridge==0.15.1 safetensors==0.7.0 \
+        tokenizers==0.22.2 transformers==5.12.1 huggingface_hub==1.21.0 \
+        sentencepiece==0.2.1 peft==0.19.1 timm==1.0.27 scipy==1.13.1 \
+        scikit-learn==1.9.0 pandas==3.0.3 numpy==1.26.4 ninja==1.13.0 \
+        pybind11==3.0.4 protobuf==6.33.6
+
+# triton-ascend — the vime stack was validated on 3.2.1, which is NOT on public
+# PyPI: download the aarch64 wheel from https://gitcode.com/Ascend/triton-ascend/releases
+# (3.2.1 needs CANN 9.0.0 B160+), drop it in ./wheels/, and pass
+#   --build-arg TRITON_ASCEND_WHEEL=<that-wheel-filename>
+# See README.md. NO fallback: 3.2.1 is not on public PyPI, so if neither a wheel
+# nor a 3.2.1-serving PIP_INDEX_URL is given the build ERRORS OUT (by design).
+COPY wheels/ /tmp/wheels/
+RUN set -ex; \
+    if [ -n "${TRITON_ASCEND_WHEEL}" ] && [ -f "/tmp/wheels/${TRITON_ASCEND_WHEEL}" ]; then \
+        pip install --no-cache-dir "/tmp/wheels/${TRITON_ASCEND_WHEEL}"; \
+    elif [ -n "${PIP_INDEX_URL}" ]; then \
+        pip install --no-cache-dir triton-ascend==3.2.1; \
+    else \
+        echo "ERROR: triton-ascend 3.2.1 is required and is NOT on public PyPI." >&2; \
+        echo "  Put the wheel in wheels/ and pass --build-arg TRITON_ASCEND_WHEEL=<file>," >&2; \
+        echo "  or pass --build-arg PIP_INDEX_URL=<mirror-with-3.2.1>." >&2; \
+        exit 1; \
+    fi
+
+RUN pip install --no-cache-dir \
+        ray[default]==2.48.0 vllm-router==0.1.14 blobfile==3.2.0 wandb==0.27.2 \
+        memray==1.19.3 tabulate==0.10.0 ring-flash-attn==0.1.8
+
+RUN pip install --no-cache-dir --no-deps latex2sympy2==1.9.1
+RUN pip install --no-cache-dir \
+        pylatexenc==2.10 omegaconf==2.3.1 antlr4-python3-runtime==4.9.3 \
+        openai==2.43.0 pyarrow av==17.0.1 hf_xet==1.5.0 modelscope==1.37.1 \
+        aiohttp==3.14.0 fastapi==0.123.10 uvicorn==0.49.0 httpx==0.28.1 \
+        tiktoken==0.13.0 pyzmq==27.1.0 sentencepiece==0.2.1 GitPython==3.1.50 \
+        xgrammar==0.2.2 partial-json-parser==0.2.1.1.post7 llguidance==1.3.0 \
+        outlines-core==0.2.14
+
+RUN pip install -U setuptools pip setuptools_rust setuptools_scm nanobind
+RUN ln -sf "$(command -v ninja)" /usr/local/bin/ninja && /usr/local/bin/ninja --version
+
+# vime patches applied on top of the pinned official baselines
+COPY patches/ /tmp/patches/
+
+WORKDIR /workspace
+
+# --- vime (your own repo; no patch) ---
+RUN git clone "${VIME_REPO}" /workspace/vime && git -C /workspace/vime checkout "${VIME_REF}"
+RUN { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    pip install --no-cache-dir -e /workspace/vime --no-build-isolation
+
+# --- vllm: official v0.21.0 + patch (device-less build) ---
+RUN git clone "${VLLM_REPO}" /workspace/vllm && git -C /workspace/vllm checkout "${VLLM_REF}" && \
+    git -C /workspace/vllm apply /tmp/patches/vllm-vime.patch
+RUN { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    VLLM_TARGET_DEVICE=empty pip install --no-cache-dir -v -e /workspace/vllm --no-build-isolation
+
+# Re-pin numpy (vllm pulls 2.3.5 unpinned → breaks triton-ascend numpy-1 ABI)
+RUN pip install --no-cache-dir "numpy==1.26.0"
+
+# --- vllm-ascend: official v0.21.0rc1 + patch — SOURCE ONLY (clone + patch +
+# catlass submodule). The custom AscendC kernel compile is DEFERRED to
+# build_npu_kernels.sh (run inside the container on an NPU host), because it
+# needs npu-smi + the bisheng compiler + a real NPU env that a docker build
+# lacks. See README "first run".
+RUN git clone --recursive "${VLLM_ASCEND_REPO}" /workspace/vllm-ascend && \
+    git -C /workspace/vllm-ascend checkout "${VLLM_ASCEND_REF}" && \
+    git -C /workspace/vllm-ascend submodule update --init --recursive && \
+    git -C /workspace/vllm-ascend apply /tmp/patches/vllm-ascend-vime.patch
+
+# --- MindSpeed: official Ascend/MindSpeed @ fc63de5c + patch (GDN kernels) ---
+RUN git clone "${MINDSPEED_REPO}" /workspace/MindSpeed && git -C /workspace/MindSpeed checkout "${MINDSPEED_REF}" && \
+    git -C /workspace/MindSpeed apply /tmp/patches/mindspeed-vime.patch
+RUN { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    find /workspace/MindSpeed -name CMakeCache.txt -delete 2>/dev/null || true; \
+    pip install -v --no-cache-dir -e /workspace/MindSpeed --no-build-isolation
+
+# --- fla_npu: MindSpeed hard-imports it. SOURCE ONLY (clone + checkout). Its
+# AscendC op build (build.sh --soc --pkg --ops -> install .run ->
+# torch_custom/fla_npu/build.sh) is DEFERRED to build_npu_kernels.sh — it needs
+# bisheng + NPU env like vllm-ascend. Follows the slime-ascend tutorial there.
+RUN git clone "${FLA_REPO}" /workspace/flash-linear-attention-npu && \
+    git -C /workspace/flash-linear-attention-npu checkout "${FLA_REF}"
+# fla_npu vendor-op lib path at runtime (populated by build_npu_kernels.sh's .run
+# install). Both CANN layouts covered (ascend-toolkit/latest and cann-9.0.0).
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
+
+# --- Megatron-LM: official NVIDIA @ 3714d81d + patch (in-place, on PYTHONPATH) ---
+RUN git clone "${MEGATRON_REPO}" /workspace/Megatron-LM && git -C /workspace/Megatron-LM checkout "${MEGATRON_REF}" && \
+    git -C /workspace/Megatron-LM apply /tmp/patches/megatron-vime.patch
+ENV PYTHONPATH=/workspace/Megatron-LM:${PYTHONPATH}
+
+# Deferred NPU-kernel build script — run ONCE inside the container on an NPU host
+# to compile vllm-ascend custom AscendC kernels + fla_npu ops. See README.
+COPY build_npu_kernels.sh /workspace/build_npu_kernels.sh
+RUN chmod +x /workspace/build_npu_kernels.sh
+
+# A3 chip + fla op set for build_npu_kernels.sh (npu-smi also auto-detects at runtime)
+ENV SOC_VERSION=ascend910_9391
+ENV FLA_SOC=${FLA_SOC}
+ENV FLA_OPS=${FLA_OPS}
+
+# vllm-ascend's vllm_version_is("0.21.0") guard: this vllm self-reports 0.21.1.dev2
+ENV VLLM_VERSION=0.21.0
+
+# Scrub build-time proxy so it never leaks into the running container
+ENV http_proxy= https_proxy= no_proxy= HTTP_PROXY= HTTPS_PROXY= NO_PROXY=
+
+CMD ["bash"]
