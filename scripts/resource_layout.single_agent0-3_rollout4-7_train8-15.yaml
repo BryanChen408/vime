@@ -1,0 +1,12 @@
+# Single-host layout: polar agent 0-3 | vime vllm rollout 4-7 | train (actor) 8-15.
+# The training container must expose ONLY 4-15 to Ray (ASCEND_RT_VISIBLE_DEVICES=4..15);
+# 0-3 are left to the host-side polar agent/eval subcontainers and are NOT joined to Ray.
+roles:
+  actor:
+    - {node: <train-host>, devices: "8-15"}
+  rollout:
+    - {node: <train-host>, devices: "4-7"}
+  polar_reserved:            # reserved for host-side polar agent/eval; not used by Ray placement
+    - {node: <train-host>, devices: "0-3"}
+rollout:
+  num_gpus_per_engine: 4     # vLLM engine TP size (ROLLOUT_NUM_GPUS_PER_ENGINE)
