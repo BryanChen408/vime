@@ -17,7 +17,7 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 # ─── 运行标识 / 多节点 ───
 RUN_ID=${RUN_ID:-qwen36_polar_$(date +%Y%m%d-%H%M%S)}
-MASTER_ADDR=${MASTER_ADDR:-80.5.25.119}   # [本机] ray master + 派生 polar-url(http://${MASTER_ADDR}:8080);与 profile.t2a 主机一致,换机改这里
+MASTER_ADDR=${MASTER_ADDR:-80.48.5.88}     # 由 start.sh 控制(start.sh 设 CURRENT_IP=MASTER_ADDR=本机 IP)
 CURRENT_IP=${CURRENT_IP:-}
 SOCKET_IFNAME=${SOCKET_IFNAME:-}
 NNODES=${NNODES:-1}
