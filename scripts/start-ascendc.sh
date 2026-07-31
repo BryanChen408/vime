@@ -8,6 +8,7 @@
 # 前置:宿主机先用 profile.t2a.yaml 起 polar(npu_lease 0-3);采集用 deploy 里的 start_telemetry_run.sh。
 # 换机:改 CURRENT_IP / MASTER_ADDR / SOCKET_IFNAME(三者本机值)。
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
+# 注:采集由 polar 侧 start_telemetry_run.sh 负责(exporter + engine_metrics 目录);此处不重复起。
 
 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7,8,9,10,11,12,13,14,15 \
 CURRENT_IP=80.5.25.119  MASTER_ADDR=80.5.25.119  NNODES=1  NPUS_PER_NODE=12  SOCKET_IFNAME=enp48s3u1u1 \
