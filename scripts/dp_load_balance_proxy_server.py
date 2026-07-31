@@ -258,6 +258,7 @@ async def _forward_upstream_with_retry(
     request_id: str,
     max_retries: int = 3,
     base_delay: float = 0.2,
+    extra_headers: dict | None = None,
 ) -> tuple[httpx.Response | None, tuple[int, bytes] | None]:
     """向上游 vLLM 转发并 retry;用 client.send(stream=True) 先拿响应头,据 status 决定:
       - 2xx: 返回 (response, None) —— 已确认可流式,body 由调用方 aiter_bytes 消费后 aclose。
@@ -270,6 +271,8 @@ async def _forward_upstream_with_retry(
     gateway 的 _raise_for_status 会抛 UpstreamHTTPError → session 秒级 errored → drop-and-continue。
     """
     headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}", "X-Request-Id": request_id}
+    if extra_headers:  # 透传 polar telemetry trace 头(x-polar-trace-id)等,供引擎侧 join
+        headers.update({str(k): str(v) for k, v in extra_headers.items() if v})
     for attempt in range(1, max_retries + 1):
         req = client.build_request("POST", endpoint, json=req_data, headers=headers)
         try:
@@ -356,6 +359,7 @@ async def _handle_completions(api: str, request: Request):
             request_id=instance_info.request_id,
             max_retries=global_args.max_retries,
             base_delay=global_args.retry_delay,
+            extra_headers={"x-polar-trace-id": request.headers.get("x-polar-trace-id")},
         )
         if error is not None:
             # 上游最终非 2xx: 原样回传真实 status + 错误体,绝不吞成 200+空 body(见
