@@ -156,7 +156,7 @@ POLAR_ARGS=(
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"
    --pipeline-model-parallel-size "${PP:-1}"
-   --context-parallel-size "${CP:-4}"
+   --context-parallel-size "${CP:-8}"
    --expert-model-parallel-size "${EP:-8}"
    --expert-tensor-parallel-size 1
    --sequence-parallel
@@ -172,17 +172,17 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.001
-   --kl-loss-type low_var_kl
-   --entropy-coef 0.00
+   #--use-kl-loss
+   #--kl-loss-coef 0.001
+   #--kl-loss-type low_var_kl
+   --entropy-coef 0.001
    --eps-clip 0.2
    --use-tis
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 2e-6
+   --lr 1e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9

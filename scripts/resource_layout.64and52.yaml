@@ -1,0 +1,24 @@
+# [多节点 layout] actor 训练在 node-88 卡 0-7;rollout 推理在 node-52 全 16 卡;
+# polar operator agent 用 node-88 卡 8-15(独立于 vime,不在 ray)。
+#
+# 启动(照 slime 双机;head=MASTER 节点):
+#   head@88:   ASCEND_RT_VISIBLE_DEVICES=0-7  CURRENT_IP=80.48.5.88 MASTER_ADDR=80.48.5.88 NNODES=2 NPUS_PER_NODE=8  SOCKET_IFNAME=ens1f3
+#   worker@52: ASCEND_RT_VISIBLE_DEVICES=0-15 CURRENT_IP=80.48.5.52 MASTER_ADDR=80.48.5.88 NNODES=2 NPUS_PER_NODE=16 SOCKET_IFNAME=<52网卡>
+#
+# device 号 = 各节点 ASCEND_RT_VISIBLE_DEVICES 暴露的物理卡:
+#   - 88 只给 vime 暴露 0-7(actor);8-15 留给 polar,不在 vime ray。
+#   - 52 全暴露 0-15(rollout)。
+# router/LB proxy 起在 driver(88)本地 → polar(88)走 88:8001 同机,profile.vime.yaml 端点不变。
+# 权重同步:88 actor →(HCCL 跨机)→ 52 rollout,world_size = 16 + 1 = 17。
+roles:
+  actor:
+    - {node: 80.48.5.52, devices: "0-15"}
+  rollout:
+    - {node: 80.48.5.64, devices: "12-15"}
+  polar_reserved:
+    - {node: 80.48.5.64, devices: "8-11"}      # ← 补上
+rollout:
+  num_gpus_per_engine: 4                 # 16 卡 → 4 个 tp4 engine(0-3/4-7/8-11/12-15,不跨 HCCS 域);要 2 个 tp8 改成 8
+  vllm_dp_size: 1                         # external-LB DP 组大小 = 引擎数(rollout 卡数 / num_gpus_per_engine = 16/4)。
+                                          #   仅 FEAT_DP_EXTERNAL_LB=1 时生效(基线忽略);须 == 引擎数,否则 arguments.py 报错。
+                                          #   改 num_gpus_per_engine 时此处同步改(如 TP8 → vllm_dp_size:2)。
