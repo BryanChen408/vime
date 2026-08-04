@@ -107,6 +107,23 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+# 落盘诊断日志:把 LB proxy 的 502/transport 现场(连不上 engine 的真实 httpx 异常、
+# 重试耗尽、上游 HTTP 码)固定写文件,便于定位 ERROR session 里 502/transport 的根因。
+# 之前这些 WARNING/ERROR 只进 Ray 汇聚的 train log,常被截断/看不全。路径可用 POLAR_LB_PROXY_LOG 覆盖。
+try:
+    import logging as _logging
+    _lb_log = os.environ.get("POLAR_LB_PROXY_LOG",
+                             os.path.join(os.environ.get("POLAR_ENGINE_METRICS_DIR", "/mnt/share/polar_engine_metrics"),
+                                          "lb_proxy.log"))
+    os.makedirs(os.path.dirname(_lb_log), exist_ok=True)
+    _fh = _logging.FileHandler(_lb_log)
+    _fh.setLevel(_logging.WARNING)
+    _fh.setFormatter(_logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_fh)
+    logger.info("LB proxy 诊断日志 → %s", _lb_log)
+except Exception as _e:  # noqa: BLE001
+    logger.warning("LB proxy 落盘日志初始化失败: %s", _e)
+
 # Add uvloop for faster event loop if available
 try:
     import uvloop
