@@ -101,7 +101,7 @@ CKPT_ARGS=(
    --hf-checkpoint ${HF_CKPT:-/mnt/weight/Qwen3.6-35B-A3B}
    --ref-load ${REF_LOAD:-/mnt/weight/Qwen3.6-35B-A3B_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
-   --save-interval 10
+   --save-interval 100
    --no-save-optim
    --megatron-to-hf-mode raw
    # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
@@ -131,7 +131,7 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
    --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-32768}"
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
-   --rollout-temperature 0.7
+   --rollout-temperature 1
    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
    --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
    --save-debug-train-data "${POLAR_OUTPUT_DIR}/vime_debug_train_${RUN_ID}_rollout_{rollout_id}_{rank}.pt"
@@ -152,6 +152,11 @@ POLAR_ARGS=(
    --rollout-release-on-postrun
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
 )
+
+# [FLOOR] 轨迹内 trace 保底权重(vime/ray/rollout.py 的 rollout_mask_sums 分母)。
+# 不设则不传该参,默认纯 token 加权,行为与之前完全一致。
+[ -n "${POLAR_TRAJECTORY_PG_FLOOR:-}" ] && \
+   POLAR_ARGS+=(--polar-trajectory-pg-floor "${POLAR_TRAJECTORY_PG_FLOOR}")
 
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"

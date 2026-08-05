@@ -751,7 +751,37 @@ class RolloutManager:
         rollout_total_mask: dict[int, int] = {}
         for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
             rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
-        train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
+
+        # [FLOOR] --polar-trajectory-pg-floor 设置时,把"纯 token 加权"的分母换成
+        # 保底混合权重 w_i = floor + (1-K*floor)*(T_i/sum_T) 的等效分母 T_i/w_i:
+        #   trace 贡献 = token_sum_i / denom_i = w_i * mean_i。
+        #   floor=0 时 w_i = T_i/sum_T → denom_i = sum_T,与默认行为逐字等价;
+        #   不设(默认 None)则直接用默认分母,行为零变化。
+        #   必须走 args 通道传值:Ray actor 不继承 driver 的 os.environ
+        #   (RolloutManager 在 rollout 节点创建,见 placement_group.create_rollout_manager)。
+        denoms = [rollout_total_mask[rid] for rid in rollout_id_list]
+        _floor = getattr(self.args, "polar_trajectory_pg_floor", None)
+        if _floor is not None and 0.0 <= _floor < 1.0:
+            _groups: dict[int, list[int]] = {}
+            for _idx, _rid in enumerate(rollout_id_list):
+                _groups.setdefault(_rid, []).append(_idx)
+            for _members in _groups.values():
+                _trainable = [i for i in _members if mask_sums_per_sample[i] > 0]
+                if not _trainable:
+                    continue
+                _tt = [float(mask_sums_per_sample[i]) for i in _trainable]
+                _total = sum(_tt) or 1.0
+                _k = len(_trainable)
+                _ws = ([1.0 / _k] * _k) if _k * _floor >= 1.0 else [
+                    _floor + (1.0 - _k * _floor) * (t / _total) for t in _tt
+                ]
+                for i, _wi in zip(_trainable, _ws):
+                    denoms[i] = mask_sums_per_sample[i] / max(_wi, 1e-9)
+            logger.info(
+                "[pg-floor] floor=%.3f active: %d trajectories, %d samples, denoms=%s",
+                _floor, len(_groups), len(denoms), [round(float(d), 1) for d in denoms],
+            )
+        train_data["rollout_mask_sums"] = denoms
 
         # Overwrite raw_reward when available. Mixed-source batches may only
         # populate this field for a subset of samples (e.g. SWE but not code).

@@ -668,6 +668,16 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--polar-run-id", type=str, default=None)
             parser.add_argument("--polar-reward-key", type=str, default=None)
             parser.add_argument("--polar-task-id-template", type=str, default="polar-slime-{rollout_id}-{sample.group_index}")
+            parser.add_argument(
+                "--polar-trajectory-pg-floor",
+                type=float,
+                default=None,
+                help="Per-trace floor weight within a Polar trajectory: "
+                     "w_i = floor + (1-K*floor)*(tokens_i/tokens_total). "
+                     "0 = pure token weighting (identical to default); 0.05 = each "
+                     "trace keeps >=5%% of its trajectory's PG weight. Must be passed "
+                     "via this arg — Ray actors do not inherit driver env.",
+            )
             parser.add_argument("--polar-instruction-template", type=str, default=None)
             parser.add_argument("--operator-tasks-dir", type=str, default=None)
             parser.add_argument("--polar-tasks-dir", type=str, default=None)
