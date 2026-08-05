@@ -1001,6 +1001,7 @@ class AsyncPolarRolloutWorker:
     def set_rollout_context(self, rollout_id: int) -> None:
         with self._state_lock:
             self._current_rollout_id = max(self._current_rollout_id, int(rollout_id))
+            self._policy_version = max(self._policy_version, int(rollout_id))
 
     def update_policy_version(self, policy_version: int) -> None:
         with self._state_lock:
