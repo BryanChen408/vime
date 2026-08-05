@@ -201,3 +201,8 @@ torch_compile_debug
 *-local-command-caveat*.txt
 *this-session-is-being-continued*.txt
 output/
+
+# Core dumps (e.g. vLLM worker crashes: core_VLLM::Worker_TP_*)
+core
+core.*
+core_*
