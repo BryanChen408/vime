@@ -273,6 +273,22 @@ ADDCFG_PARTS=()
 [ "${#ADDCFG_PARTS[@]}" -gt 0 ] && VLLM_ARGS+=(--vllm-additional-config "{$(IFS=,; echo "${ADDCFG_PARTS[*]}")}")
 [ "${FEAT_HCCL_AIV:-0}" = "1" ] && export HCCL_OP_EXPANSION_MODE=AIV
 [ "${REPRO_DETERMINISTIC:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-deterministic-inference)
+# PROFILE_OP=1:开启昇腾算子级 profiling(Ascend PyTorch Profiler,经 vLLM --profiler-config)。
+#   默认 OFF = baseline 逐位不变。开启后:
+#     - export VLLM_RPC_TIMEOUT(默认 1800000=30min):stop_profile 落盘可达数分钟,默认 10s 会截断。
+#     - --vllm-profiler-config 经 _vllm_raw_values 原样转发给 vllm serve(worker 落 <host>_<pid>_<ts>_ascend_pt)。
+#     - ignore_frontend=true:仅 profile worker(用 max_iterations 时必须,否则 vLLM 报错)。
+#     - max_iterations=N(默认 20):每 worker 记 N 个 engine step 后自动 stop 落盘。
+#     - with_stack=false:关 python 调用栈,防数据爆炸;record_shapes=true:留 shape 供亲和分析。
+#   采集/解析见 tools/op_profile_collect.sh 与 docs/zh/developer_guide/profiling_npu_op.md。
+if [ "${PROFILE_OP:-0}" = "1" ]; then
+   export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-1800000}"
+   PROFILE_DIR="${PROFILE_DIR:-/mnt/share/polar_engine_metrics/opprof/$(date +%Y%m%d-%H%M%S)}"
+   mkdir -p "${PROFILE_DIR}"
+   _PROF_JSON="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${PROFILE_DIR}\",\"ignore_frontend\":true,\"max_iterations\":${PROFILE_MAX_ITERS:-20},\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}"
+   VLLM_ARGS+=(--vllm-profiler-config "${_PROF_JSON}")
+   echo "[profile-op] ON dir=${PROFILE_DIR} max_iters=${PROFILE_MAX_ITERS:-20} rpc_timeout=${VLLM_RPC_TIMEOUT}" >&2
+fi
 # [vime 2026-07-15 EXPERIMENTAL] FEAT_TRAIN_EXPANDABLE=1:把 expandable_segments forward 进训练 actor
 #   (ray actor 不继承父 env,必须经 --train-env-vars)。这是 OOM 所在的 88 训练侧,不碰 vLLM/CaMem/assert。
 #   默认 0 = 不变。与 vLLM 侧的 VIME_VLLM_KEEP_EXPANDABLE 独立。

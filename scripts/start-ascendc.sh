@@ -7,6 +7,9 @@
 #   - 调 run-qwen36-35b-polar-ascendc.sh(已内置 数据集/context 262144/--num-gpus-per-node)
 # 前置:宿主机先用 profile.t2a.yaml 起 polar(npu_lease 0-3);采集用 deploy 里的 start_telemetry_run.sh。
 # 换机:改 CURRENT_IP / MASTER_ADDR / SOCKET_IFNAME(三者本机值)。
+# 算子级 profiling(可选,默认关):在本行前加 PROFILE_OP=1 [PROFILE_DIR=... PROFILE_MAX_ITERS=20] 即可,
+#   例: PROFILE_OP=1 ASCEND_RT_VISIBLE_DEVICES=... bash scripts/start-ascendc.sh
+#   开启后引擎会注册 /start_profile;采集与解析用 tools/op_profile_collect.sh。见 docs/zh/developer_guide/profiling_npu_op.md。
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
 # 注:采集由 polar 侧 start_telemetry_run.sh 负责(exporter + engine_metrics 目录);此处不重复起。
 
