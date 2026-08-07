@@ -10,7 +10,7 @@ cd "${VIME_ROOT}"
 
 ASCEND_ROOT=${ASCEND_ROOT:-/usr/local/Ascend}
 CANN_ROOT=${CANN_ROOT:-${ASCEND_ROOT}/cann}
-CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.2.0"
+CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.0.0"
 CANN_BIN_DIR="${CANN_ROOT}/bin"
 CANN_LIB_DIR="${CANN_ROOT}/lib64"
 CANN_PYTHON_SITE_PACKAGES="${CANN_ROOT}/python/site-packages"
@@ -94,7 +94,7 @@ KV_CONNECTOR=${KV_CONNECTOR:-MooncakeConnectorV1}
 export PYTHONBUFFERED=16
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 # Prepend /usr/local/lib/python3.11/site-packages for newly compiled mooncake
-export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm-023:/workspace/vllm-ascend-023:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
