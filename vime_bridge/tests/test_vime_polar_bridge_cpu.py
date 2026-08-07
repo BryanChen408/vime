@@ -16,6 +16,7 @@ from vime_bridge import wire
 from vime_bridge.adapter import _trajectory_rollout_id, session_result_to_samples
 from vime_bridge.config import resolve_polar_slime_config, resolve_vllm_router_base_url
 from vime_bridge.reward_post_process import post_process_rewards
+from vime_bridge.rollout import _build_rollout_benchmark_metrics
 
 
 def _trace(resp_ids, reward, finish="stop"):
@@ -32,12 +33,13 @@ def _trace(resp_ids, reward, finish="stop"):
     )
 
 
-def _session(session_id, traces, status=wire.SessionStatus.COMPLETED):
+def _session(session_id, traces, status=wire.SessionStatus.COMPLETED, timing=None):
     return wire.SessionResult(
         session_id=session_id,
         task_id="t-" + session_id,
         status=status,
         trajectory=wire.Trajectory(status="COMPLETED", traces=traces),
+        timing=timing or wire.SessionTiming(),
     )
 
 
@@ -90,6 +92,37 @@ def test_post_process_rewards_returns_one_per_sample():
     raw, rewards = post_process_rewards(args, s)
     assert len(raw) == len(s)
     assert len(rewards) == len(s)
+
+
+def test_build_rollout_benchmark_metrics_matches_basic_benchmark_semantics():
+    result = _session(
+        "sbench",
+        [_trace([10, 11, 12], 1.0)],
+        timing=wire.SessionTiming(
+            register_to_init_queue_ms=400.0,
+            init_ms=600.0,
+            run_ms=1000.0,
+            postrun_ms=0.0,
+        ),
+    )
+    samples = session_result_to_samples(result, group_index=0, trajectory_index=0, reward_key="score")
+    metrics = _build_rollout_benchmark_metrics(samples)
+    assert metrics["rollout_bench/total_input_tokens"] == 3.0
+    assert metrics["rollout_bench/total_generated_tokens"] == 3.0
+    assert abs(metrics["rollout_bench/request_throughput"] - 0.5) < 1e-9
+    assert abs(metrics["rollout_bench/output_throughput"] - 1.5) < 1e-9
+    assert abs(metrics["rollout_bench/total_token_throughput"] - 3.0) < 1e-9
+    assert metrics["rollout_bench/peak_output_token_throughput"] == 2.0
+    assert metrics["rollout_bench/peak_concurrent_requests"] == 1.0
+    assert metrics["rollout_bench/ttft_mean_ms"] == 1000.0
+    assert metrics["rollout_bench/ttft_median_ms"] == 1000.0
+    assert metrics["rollout_bench/ttft_p99_ms"] == 1000.0
+    assert metrics["rollout_bench/tpot_mean_ms"] == 500.0
+    assert metrics["rollout_bench/tpot_median_ms"] == 500.0
+    assert metrics["rollout_bench/tpot_p99_ms"] == 500.0
+    assert metrics["rollout_bench/itl_mean_ms"] == 500.0
+    assert metrics["rollout_bench/itl_median_ms"] == 500.0
+    assert metrics["rollout_bench/itl_p99_ms"] == 500.0
 
 
 def test_resolve_vllm_router_base_url_and_config():

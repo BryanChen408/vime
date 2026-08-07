@@ -1,0 +1,46 @@
+vllm:
+  - name: default
+    update_weights: true
+    server_groups:
+      - worker_type: prefill
+        num_gpus: 4
+        num_gpus_per_engine: 4
+        overrides:
+          disable_hybrid_kv_cache_manager: false
+          enable_prefix_caching: true
+          pd_topology:
+            prefill:
+              dp_size: 1
+              tp_size: 4
+            decode:
+              dp_size: 1
+              tp_size: 4
+          additional_config:
+            enable_flashcomm1: true
+            enable_fused_mc2: 0
+            enable_cpu_binding: true
+            ascend_compilation_config:
+              enable_npugraph_ex: false
+      - worker_type: decode
+        num_gpus: 12
+        num_gpus_per_engine: 4
+        overrides:
+          disable_hybrid_kv_cache_manager: false
+          enable_prefix_caching: true
+          max_model_len: 131072
+          compilation_config:
+            cudagraph_mode: FULL_DECODE_ONLY
+          pd_topology:
+            prefill:
+              dp_size: 1
+              tp_size: 4
+            decode:
+              dp_size: 1
+              tp_size: 4
+          additional_config:
+            enable_flashcomm1: false
+            enable_fused_mc2: 1
+            enable_cpu_binding: true
+            recompute_scheduler_enable: true
+            ascend_compilation_config:
+              enable_npugraph_ex: true

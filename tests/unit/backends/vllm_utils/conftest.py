@@ -14,6 +14,7 @@ def vllm_args() -> SimpleNamespace:
         hf_checkpoint="/tmp/model",
         vllm_router_ip=None,
         vllm_router_port=None,
+        disaggregation_backend="nixl",
         num_gpus_per_node=8,
         rollout_num_gpus_per_engine=4,
         colocate=False,

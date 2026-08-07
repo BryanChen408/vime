@@ -36,7 +36,7 @@ def update_tracking_open_metrics(args, router_addr):
 
 
 def finish_tracking(args):
-    if not args.use_wandb:
+    if not wandb_utils.should_init_wandb(args):
         return
     try:
         if wandb.run is not None:
@@ -47,7 +47,7 @@ def finish_tracking(args):
 
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str):
-    if args.use_wandb:
+    if wandb_utils.should_init_wandb(args):
         # wandb "shared" 模式下,非 primary 进程(RolloutManager 用 primary=False)不能读全局
         # step 去自增 → wandb.log(metrics) 会抛 "Cannot read the W&B step in shared mode",
         # rollout/eval 指标被静默丢掉(实测看板缺 rollout/rewards、eval/aime)。显式传 step

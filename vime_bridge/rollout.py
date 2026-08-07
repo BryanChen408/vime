@@ -20,6 +20,7 @@ import statistics
 import tempfile
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1240,6 +1241,20 @@ class AsyncPolarRolloutWorker:
                         accumulator = open_groups.get(unit.group_id)
                         try:
                             task_result = task.result()
+                            logger.info(
+                                "PD-DIAG unit_result task=%s status=%s sessions=%d result_paths=%d first_session_id=%s "
+                                "first_result_status=%s first_trajectory_status=%s first_trace_count=%s first_result_error=%r first_trajectory_error=%r",
+                                task_result.task_id,
+                                task_result.status,
+                                len(task_result.results),
+                                len(task_result.result_paths),
+                                (task_result.results[0].session_id if task_result.results else None),
+                                (task_result.results[0].status if task_result.results else None),
+                                (getattr(task_result.results[0].trajectory, "status", None) if task_result.results else None),
+                                (len(task_result.results[0].trajectory.traces) if task_result.results else None),
+                                (task_result.results[0].error if task_result.results else None),
+                                (getattr(task_result.results[0].trajectory, "error", None) if task_result.results else None),
+                            )
                             if accumulator is not None and accumulator.rejected_reason is None:
                                 _record_session_unit_result(
                                     config=self.config,
@@ -2392,6 +2407,133 @@ def _extract_sample_reward(sample: Any, reward_key: str) -> float:
     return 0.0
 
 
+def _percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = (len(sorted_values) - 1) * pct
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return float(sorted_values[lower])
+    weight = rank - lower
+    return float(sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight)
+
+
+
+def _tokens_per_second(tokens: float, duration_s: float) -> float:
+    if duration_s <= 0:
+        return 0.0
+    return float(tokens / duration_s)
+
+
+
+def _build_rollout_benchmark_metrics(flat_samples: list[Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    session_seen: set[str] = set()
+    session_windows: dict[str, tuple[float, float]] = {}
+    second_bucket_counts: Counter[int] = Counter()
+    total_input_tokens = 0
+    total_generated_tokens = 0
+    request_count = 0
+    ttfts: list[float] = []
+    tpots: list[float] = []
+    itls: list[float] = []
+
+    for sample in flat_samples:
+        polar_meta = sample.metadata.get("polar", {})
+        session_id = polar_meta.get("session_id")
+        if not session_id or session_id in session_seen:
+            continue
+        session_seen.add(session_id)
+        if polar_meta.get("placeholder"):
+            continue
+        if _sample_session_status(sample) != "COMPLETED":
+            continue
+
+        timing = polar_meta.get("timing") or {}
+        register_to_init_queue_ms = float(timing.get("register_to_init_queue_ms", 0.0) or 0.0)
+        init_ms = float(timing.get("init_ms", 0.0) or 0.0)
+        run_ms = float(timing.get("run_ms", 0.0) or 0.0)
+        postrun_ms = float(timing.get("postrun_ms", 0.0) or 0.0)
+        ttft_s = (register_to_init_queue_ms + init_ms) / 1000.0
+        run_s = run_ms / 1000.0
+        postrun_s = postrun_ms / 1000.0
+        if ttft_s <= 0.0 or run_s <= 0.0:
+            continue
+
+        token_counts = polar_meta.get("token_counts") or {}
+        prompt_tokens = int(token_counts.get("prompt_tokens", 0) or 0)
+        response_tokens = int(token_counts.get("response_tokens", getattr(sample, "response_length", 0) or 0) or 0)
+        total_input_tokens += prompt_tokens
+        total_generated_tokens += response_tokens
+        request_count += 1
+
+        if response_tokens > 0:
+            ttfts.append(ttft_s * 1000.0)
+        if response_tokens > 1:
+            tpot_s = run_s / (response_tokens - 1)
+            tpots.append(tpot_s * 1000.0)
+            itls.extend([tpot_s * 1000.0] * (response_tokens - 1))
+
+        start_s = 0.0
+        end_s = ttft_s + run_s + postrun_s
+        session_windows[session_id] = (start_s, end_s)
+
+        if response_tokens > 0:
+            first_token_time = ttft_s
+            second_bucket_counts[int(first_token_time)] += 1
+            if response_tokens > 1:
+                tpot_s = run_s / (response_tokens - 1)
+                current_time = first_token_time
+                for _ in range(response_tokens - 1):
+                    current_time += tpot_s
+                    second_bucket_counts[int(current_time)] += 1
+
+    if request_count == 0 or not session_windows:
+        return out
+
+    min_start = min(start for start, _ in session_windows.values())
+    max_end = max(end for _, end in session_windows.values())
+    benchmark_duration_s = max_end - min_start
+    if benchmark_duration_s <= 0.0:
+        benchmark_duration_s = 1e-9
+
+    concurrent_per_second: Counter[int] = Counter()
+    for start_s, end_s in session_windows.values():
+        request_start_second = int(start_s - min_start)
+        request_end_second = int(end_s - min_start)
+        for second in range(request_start_second, request_end_second + 1):
+            concurrent_per_second[second] += 1
+
+    peak_output_tokens_per_s = float(max(second_bucket_counts.values(), default=0))
+    peak_concurrent_requests = float(max(concurrent_per_second.values(), default=0))
+
+    def _summary(values: list[float], prefix: str) -> None:
+        if not values:
+            return
+        sorted_values = sorted(values)
+        out[f"{prefix}_mean_ms"] = float(sum(sorted_values) / len(sorted_values))
+        out[f"{prefix}_median_ms"] = _percentile(sorted_values, 0.5)
+        out[f"{prefix}_p99_ms"] = _percentile(sorted_values, 0.99)
+
+    out["rollout_bench/total_input_tokens"] = float(total_input_tokens)
+    out["rollout_bench/total_generated_tokens"] = float(total_generated_tokens)
+    out["rollout_bench/request_throughput"] = _tokens_per_second(request_count, benchmark_duration_s)
+    out["rollout_bench/output_throughput"] = _tokens_per_second(total_generated_tokens, benchmark_duration_s)
+    out["rollout_bench/peak_output_token_throughput"] = peak_output_tokens_per_s
+    out["rollout_bench/peak_concurrent_requests"] = peak_concurrent_requests
+    out["rollout_bench/total_token_throughput"] = _tokens_per_second(
+        total_input_tokens + total_generated_tokens, benchmark_duration_s
+    )
+    _summary(ttfts, "rollout_bench/ttft")
+    _summary(tpots, "rollout_bench/tpot")
+    _summary(itls, "rollout_bench/itl")
+    return out
+
+
+
 def _polar_extra_metrics(
     flat_samples: list[Any],
     rewards: list[float],
@@ -2464,6 +2606,8 @@ def _polar_extra_metrics(
         graded_sessions = len(session_report)
         resolved = sum(1 for r in session_report.values() if r.get("resolved"))
         out["polar/eval/resolved_rate"] = resolved / graded_sessions
+
+    out.update(_build_rollout_benchmark_metrics(flat_samples))
     return out
 
 

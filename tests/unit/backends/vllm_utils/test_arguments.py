@@ -166,6 +166,7 @@ def _ns(**overrides):
         vllm_pipeline_parallel_size=1,
         rollout_num_gpus_per_engine=4,
         vllm_router_ip=None,
+        disaggregation_backend="nixl",
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -183,6 +184,17 @@ def test_validate_args_pp1(args_mod):
     # now derived per engine in vllm_engine._resolve_vllm_parallel_sizes (covered in
     # test_vllm_engine.py::test_resolve_parallel_sizes_is_per_engine_not_global).
     assert not hasattr(ns, "vllm_tp_size")
+
+
+@pytest.mark.unit
+def test_add_vllm_arguments_registers_disaggregation_backend(args_mod, monkeypatch):
+    monkeypatch.setattr(args_mod.AsyncEngineArgs, "add_cli_args", lambda parser: parser)
+    parser = argparse.ArgumentParser(add_help=False)
+    args_mod.add_vllm_arguments(parser)
+    parsed, _ = parser.parse_known_args([])
+    assert parsed.disaggregation_backend == "nixl"
+    parsed, _ = parser.parse_known_args(["--disaggregation-backend", "mooncake"])
+    assert parsed.disaggregation_backend == "mooncake"
 
 
 @pytest.mark.unit

@@ -19,8 +19,22 @@ def _is_offline_mode(args) -> bool:
     return os.environ.get("WANDB_MODE") == "offline"
 
 
-def init_wandb_primary(args):
+def _is_disabled_mode(args) -> bool:
+    if args.wandb_mode:
+        return args.wandb_mode == "disabled"
+    return os.environ.get("WANDB_MODE") == "disabled"
+
+
+def should_init_wandb(args) -> bool:
     if not args.use_wandb:
+        return False
+    if _is_disabled_mode(args):
+        return False
+    return True
+
+
+def init_wandb_primary(args):
+    if not should_init_wandb(args):
         args.wandb_run_id = None
         return
 
@@ -87,9 +101,7 @@ def reinit_wandb_primary_with_open_metrics(args, router_addr):
     *after* servers are up so the router address is available for scraping
     vLLM Prometheus metrics via the primary process's stats monitor.
     """
-    if not args.use_wandb or _is_offline_mode(args):
-        return
-    if getattr(args, "wandb_mode", None) == "disabled":
+    if (not should_init_wandb(args)) or _is_offline_mode(args):
         return
     if router_addr is None:
         return
@@ -172,7 +184,7 @@ def _compute_secondary_config_for_logging(args, role=None):
 # https://docs.wandb.ai/guides/track/log/distributed-training/#track-all-processes-to-a-single-run
 def init_wandb_secondary(args, role=None):
     wandb_run_id = getattr(args, "wandb_run_id", None)
-    if wandb_run_id is None:
+    if wandb_run_id is None or not should_init_wandb(args):
         return
 
     # Set W&B mode if specified (same as primary)

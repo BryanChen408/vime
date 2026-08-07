@@ -61,12 +61,56 @@ class Trajectory(BaseModel):
 
 
 class SessionTiming(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    """Mirror of Polar's ``SessionTiming``.
 
+    ``extra="ignore"`` (not ``"forbid"``): this model is the consumer side of an
+    independently-versioned producer.  Under ``forbid``, a Gateway that adds one
+    timing field fails ``TaskStatus`` validation for the whole payload, and the
+    rollout group is dropped — losing real training data over a diagnostic field.
+    Unknown fields are dropped from ``model_dump()``, so anything the trainer
+    needs in W&B must be declared here explicitly.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    # ── coarse (backward-compatible aggregates) ──
     register_to_init_queue_ms: float = 0.0
     init_ms: float = 0.0
     run_ms: float = 0.0
     postrun_ms: float = 0.0
+
+    # ── INIT breakdown ──
+    init_runtime_create_ms: float = 0.0
+    init_docker_create_ms: float = 0.0
+    init_docker_start_ms: float = 0.0
+    init_prepare_ms: float = 0.0
+
+    # ── READY wait ──
+    ready_wait_ms: float = 0.0
+
+    # ── RUN breakdown ──
+    run_harness_setup_ms: float = 0.0
+    run_agent_exec_ms: float = 0.0
+    run_harness_postprocess_ms: float = 0.0
+
+    # ── LLM interaction (within run) ──
+    llm_call_count: int = 0
+    llm_total_ms: float = 0.0
+    llm_request_total_ms: float = 0.0
+    llm_agent_side_total_ms: float = 0.0
+    llm_calls: list[dict[str, Any]] = Field(default_factory=list)
+    tool_execs: list[dict[str, Any]] = Field(default_factory=list)
+
+    # ── POSTRUN breakdown ──
+    postrun_build_ms: float = 0.0
+    postrun_eval_ms: float = 0.0
+    postrun_teardown_ms: float = 0.0
+    postrun_docker_kill_ms: float = 0.0
+    postrun_docker_rm_ms: float = 0.0
+    postrun_push_result_ms: float = 0.0
+
+    # ── whole-session wall clock ──
+    total_ms: float = 0.0
 
 
 class SessionResult(BaseModel):

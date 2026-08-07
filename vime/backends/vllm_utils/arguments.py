@@ -14,6 +14,22 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vime.utils.http_utils import _wrap_ipv6
 
 
+_ARGPARSE_313_ONLY_KWARGS = frozenset({"deprecated", "deprecated_aliases"})
+
+
+def _strip_unsupported_argparse_kwargs(kwargs: dict) -> dict:
+    """Drop argparse kwargs unsupported before Python 3.13.
+
+    vLLM's CLI definitions may pass newer argparse metadata such as
+    ``deprecated`` / ``deprecated_aliases``. ``FlexibleArgumentParser`` handles
+    those for the real vLLM parser, but local unit tests intentionally exercise
+    the wrapper with the stdlib ``argparse.ArgumentParser`` on Python 3.11/3.12.
+    """
+    if sys.version_info >= (3, 13):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k not in _ARGPARSE_313_ONLY_KWARGS}
+
+
 def _detect_user_provided_dests(parser, argv: list[str]) -> tuple[set[str], dict[str, str]]:
     """Return (user_provided, raw_values) extracted from ``argv``.
 
@@ -150,7 +166,7 @@ def _make_add_argument_wrapper(target_add_argument):
                 new_flags.append(s)
 
         # prefix dest
-        new_kwargs = kwargs.copy()
+        new_kwargs = _strip_unsupported_argparse_kwargs(kwargs.copy())
         if "dest" in new_kwargs and isinstance(new_kwargs["dest"], str):
             if not new_kwargs["dest"].startswith("vllm_"):
                 new_kwargs["dest"] = f"vllm_{new_kwargs['dest']}"
@@ -239,6 +255,14 @@ def add_vllm_arguments(parser):
         type=int,
         default=None,
         help="Number of prefill servers for PD disaggregation.",
+    )
+    parser.add_argument(
+        "--disaggregation-backend",
+        type=str,
+        default="nixl",
+        choices=["nixl", "mooncake"],
+        dest="disaggregation_backend",
+        help="PD KV-transfer backend (nixl side-channel or mooncake P2P transfer).",
     )
     parser.add_argument(
         "--vllm-config",

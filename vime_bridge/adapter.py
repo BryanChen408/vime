@@ -97,8 +97,19 @@ def session_result_to_samples(
         return samples
 
     logger.warning(
-        "Session %s: no usable trace (traces=%d, max_tokens=%s); emitting dummy placeholder",
-        result.session_id, len(traces), max_tokens,
+        "Session %s: no usable trace (traces=%d, max_tokens=%s); "
+        "result_status=%s result_error=%r trajectory_status=%s trajectory_error=%r "
+        "trace_meta_keys=%s result_meta_keys=%s builder=%s; emitting dummy placeholder",
+        result.session_id,
+        len(traces),
+        max_tokens,
+        result.status,
+        result.error,
+        getattr(result.trajectory, "status", None),
+        getattr(result.trajectory, "error", None),
+        sorted(list((getattr(result.trajectory, "metadata", None) or {}).keys()))[:20],
+        sorted(list((getattr(result, "metadata", None) or {}).keys()))[:20],
+        (getattr(result.trajectory, "metadata", None) or {}).get("builder"),
     )
     return [_build_dummy_sample(
         Sample=Sample,

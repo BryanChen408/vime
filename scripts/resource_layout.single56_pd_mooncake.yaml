@@ -1,0 +1,11 @@
+# [单机 PD baseline 拓扑] actor 训练 8 卡钉后八卡域 8-15。
+# rollout 4 卡钉 4-7，其中 PD 分离为：prefill=4-5、decode=6-7 (由 vllm_config server_groups 顺序决定)。
+# polar operator agent 独占 0-3，不在 vime ray 内。
+# 保持 ASCEND_RT_VISIBLE_DEVICES 升序(Ascend 硬约束)。
+roles:
+  actor:
+    - {node: 80.48.5.56, devices: "8-15"}
+  rollout:
+    - {node: 80.48.5.56, devices: "4-7"}
+rollout:
+  num_gpus_per_engine: 2

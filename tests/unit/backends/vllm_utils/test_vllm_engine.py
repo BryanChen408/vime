@@ -199,6 +199,62 @@ def test_build_vllm_cmd_does_not_infer_sleep_mode_from_colocate(vllm_args):
 
 
 @pytest.mark.unit
+def test_build_mooncake_kv_transfer_config_uses_disaggregation_port(vllm_args):
+    vllm_args.disaggregation_backend = "mooncake"
+    vllm_args.rollout_external = False
+    server_args = mod._compute_server_args(
+        vllm_args,
+        rank=0,
+        dist_init_addr=None,
+        host="127.0.0.1",
+        port=8000,
+        worker_type="prefill",
+        disaggregation_bootstrap_port=16000,
+    )
+    cfg = mod._build_mooncake_kv_transfer_config(server_args)
+    assert cfg["kv_role"] == "kv_producer"
+    assert cfg["kv_rank"] == 0
+    assert cfg["kv_port"] == 16000
+    assert cfg["kv_parallel_size"] == 1
+    assert cfg["kv_connector_extra_config"]["prefill"]["tp_size"] == server_args["tp_size"]
+    assert cfg["kv_connector_extra_config"]["decode"]["tp_size"] == 1
+    assert cfg["kv_connector_extra_config"]["use_ascend_direct"] is True
+
+
+@pytest.mark.unit
+def test_build_vllm_cmd_injects_mooncake_kv_transfer_config(vllm_args):
+    vllm_args.disaggregation_backend = "mooncake"
+    vllm_args.rollout_external = False
+    server_args = mod._compute_server_args(
+        vllm_args,
+        rank=0,
+        dist_init_addr=None,
+        host="127.0.0.1",
+        port=8000,
+        worker_type="decode",
+        disaggregation_bootstrap_port=17000,
+    )
+    cmd, env = mod.build_vllm_cmd_and_env(server_args)
+    idx = cmd.index("--kv-transfer-config")
+    cfg = json.loads(cmd[idx + 1])
+    assert cfg["kv_role"] == "kv_consumer"
+    assert cfg["kv_rank"] == 1
+    assert cfg["kv_port"] == 17000
+    assert cfg["kv_connector_extra_config"]["use_ascend_direct"] is True
+    assert env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] == "17000"
+    assert "VLLM_NIXL_SIDE_CHANNEL_PORT" not in env
+
+
+@pytest.mark.unit
+def test_get_pd_endpoint_returns_http_base_and_side_channel_port(vllm_engine):
+    vllm_engine.server_host = "127.0.0.1"
+    vllm_engine.server_port = 8100
+    vllm_engine.disaggregation_bootstrap_port = 18100
+    vllm_engine.node_rank = 0
+    assert vllm_engine.get_pd_endpoint() == ("http://127.0.0.1:8100", 18100)
+
+
+@pytest.mark.unit
 def test_get_base_gpu_id_colocate(vllm_args):
     vllm_args.colocate = True
     vllm_args.num_gpus_per_node = 8

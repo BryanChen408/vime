@@ -14,7 +14,7 @@ import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from vime.backends.vllm_utils.vllm_config import ModelConfig, ServerGroupConfig, VllmConfig
-from vime.backends.vllm_utils.vllm_engine import VLLMEngine
+from vime.backends.vllm_utils.vllm_engine import VLLMEngine, _resolve_vllm_parallel_sizes
 
 # Memory-type tag strings shared with the vLLM engine's sleep/wake_up API.
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
@@ -42,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 # [ITEM 1 / DP #4 B+] 存活的 Python LB proxy 子进程句柄(随 run 生命周期,避免被 GC)。
 _LB_PROXY_PROCS: list = []
+_MOONCAKE_PD_PROXY_PROCS: list = []
 
 
 @dataclasses.dataclass
@@ -892,7 +893,15 @@ def _allocate_rollout_engine_addr_and_ports_external(args, rollout_engines):
     return addr_and_ports
 
 
-def _allocate_external_lb_addr_and_ports(*, args, rollout_engines, worker_type="regular", base_port=15000):
+def _mooncake_bootstrap_block_size(args, num_gpus_per_engine: int) -> int:
+    tp_size, _ = _resolve_vllm_parallel_sizes(args, gpus_per_engine=num_gpus_per_engine)
+    return max(1, tp_size)
+
+
+
+def _allocate_external_lb_addr_and_ports(
+    *, args, rollout_engines, worker_type="regular", num_gpus_per_engine=None, base_port=15000
+):
     """[DP #3 P1 / external-LB] Allocate addr/ports for an external-LB DP group.
 
     Each engine slot IS one vLLM DP rank (§19.1). Every slot gets its own API-server
@@ -910,6 +919,8 @@ def _allocate_external_lb_addr_and_ports(*, args, rollout_engines, worker_type="
     node_port_cursor: dict[str, int] = {}
     dp_master_addr: str | None = None
     dp_rpc_port: int | None = None
+    _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
+    bootstrap_block = _mooncake_bootstrap_block_size(args, _gpus_per_engine)
 
     for i, (rank, engine) in enumerate(rollout_engines):
         node_ip, _ = ray.get(engine._get_current_node_ip_and_free_port.remote(start_port=base_port))
@@ -933,7 +944,7 @@ def _allocate_external_lb_addr_and_ports(*, args, rollout_engines, worker_type="
             "data_parallel_rank": i,
         }
         if worker_type in ("prefill", "decode"):
-            entry["disaggregation_bootstrap_port"] = _port()
+            entry["disaggregation_bootstrap_port"] = _port(bootstrap_block)
         if i == 0:
             dp_master_addr = node_ip
             dp_rpc_port = _port()
@@ -960,7 +971,11 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     #   byte-identical to before (FEAT_DP_EXTERNAL_LB=0 → getattr default False → no change).
     if getattr(args, "vllm_data_parallel_external_lb", False):
         return _allocate_external_lb_addr_and_ports(
-            args=args, rollout_engines=rollout_engines, worker_type=worker_type, base_port=base_port
+            args=args,
+            rollout_engines=rollout_engines,
+            worker_type=worker_type,
+            num_gpus_per_engine=num_gpus_per_engine,
+            base_port=base_port,
         )
     # get ports
     # there are 4 ports we need to allocate
@@ -969,6 +984,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     # 3. dist_init_addr port
     # 4. other ports for dp_attention, which is of size 4 + dp_size
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
+    bootstrap_block = _mooncake_bootstrap_block_size(args, _gpus_per_engine)
     num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
 
@@ -1020,7 +1036,7 @@ def _allocate_rollout_engine_addr_and_ports_normal(
             addr_and_ports[current_rank]["nccl_port"] = get_port()
 
             if worker_type in ("prefill", "decode"):
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
+                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port(bootstrap_block)
 
         if _gpus_per_engine > args.num_gpus_per_node:
             num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
@@ -1151,6 +1167,75 @@ def _start_lb_proxy(args, router_ip, router_port, engine_urls):
     return proc
 
 
+def _start_mooncake_pd_proxy(args, router_ip, router_port, prefill_urls, decode_urls):
+    """Start the Mooncake PD Python proxy using prefiller-returned kv_transfer_params."""
+    import os
+    import subprocess
+    import sys
+
+    del args
+
+    if not prefill_urls or not decode_urls:
+        raise RuntimeError(
+            f"Mooncake PD proxy needs ≥1 prefiller and ≥1 decoder url (got P={prefill_urls}, D={decode_urls})"
+        )
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    proxy_path = os.path.join(repo_root, "scripts", "pd_mooncake_proxy_server.py")
+
+    cmd = [
+        sys.executable,
+        proxy_path,
+        "--host",
+        str(router_ip).strip("[]"),
+        "--port",
+        str(router_port),
+    ]
+    for url in prefill_urls:
+        cmd += ["--prefill", url]
+    for url in decode_urls:
+        cmd += ["--decode", url]
+
+    logger.info("Launching Mooncake PD proxy: %s", " ".join(cmd))
+    proc = subprocess.Popen(cmd)
+    time.sleep(3)
+    if proc.poll() is not None:
+        raise RuntimeError(f"Mooncake PD proxy exited immediately (code {proc.returncode}); check proxy stderr")
+
+    import httpx
+    ready_url = f"http://{str(router_ip).strip('[]')}:{router_port}/ready"
+    deadline = time.time() + 120
+    last_error = None
+    with httpx.Client(timeout=5.0, trust_env=False) as ready_client:
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError(f"Mooncake PD proxy exited before ready (code {proc.returncode}); check proxy stderr")
+            try:
+                resp = ready_client.get(ready_url)
+                resp.raise_for_status()
+                payload = resp.json()
+                if payload.get("ready") is True:
+                    logger.info(
+                        "Mooncake PD proxy ready at %s:%s (prefillers=%s decoders=%s)",
+                        router_ip,
+                        router_port,
+                        prefill_urls,
+                        decode_urls,
+                    )
+                    return proc
+                last_error = f"proxy not ready yet: {payload}"
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(1)
+
+    logger.warning(
+        "Mooncake PD proxy did not become ready at %s within timeout; continuing for manual testing with last_error=%s",
+        ready_url,
+        last_error,
+    )
+    return proc
+
+
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
@@ -1197,8 +1282,8 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
         use_static_pd_router = has_pd
         use_lb_proxy = getattr(args, "rollout_lb_proxy", False) and not has_pd
         if use_static_pd_router:
-            router_ip = _wrap_ipv6(get_host_info()[1])
-            router_port = find_available_port(random.randint(3000, 4000))
+            router_ip = _wrap_ipv6(getattr(args, "vllm_router_ip", None) or get_host_info()[1])
+            router_port = getattr(args, "vllm_router_port", None) or find_available_port(random.randint(3000, 4000))
             prom_port = None  # assigned when the router actually launches, after URL collection
             engine_router_ip, engine_router_port = None, None
         elif use_lb_proxy:
@@ -1311,27 +1396,44 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
                 ray.get(all_init_handles)
 
         if use_static_pd_router:
-            prefill_urls: list[tuple] = []
+            prefill_urls: list[tuple[str, int | None]] = []
+            prefill_backend_urls: list[str] = []
             decode_urls: list[str] = []
             for g in server_groups:
                 for e in g.engines:
                     if e is None:
                         continue
                     if g.worker_type == "prefill":
-                        url = ray.get(e.get_url.remote())
-                        if url:
-                            prefill_urls.append((url, None))
+                        endpoint = ray.get(e.get_pd_endpoint.remote())
+                        if endpoint is not None:
+                            prefill_urls.append(endpoint)
+                            prefill_backend_urls.append(endpoint[0])
                     elif g.worker_type == "decode":
                         url = ray.get(e.get_url.remote())
                         if url:
                             decode_urls.append(url)
-            _, _, prom_port = _start_router(
-                args,
-                has_pd_disaggregation=True,
-                bind=(router_ip, router_port),
-                prefill_urls=prefill_urls,
-                decode_urls=decode_urls,
-            )
+            disagg_backend = getattr(args, "disaggregation_backend", "nixl")
+            if disagg_backend == "mooncake":
+                if prefill_backend_urls or decode_urls:
+                    logger.info(
+                        "Mooncake PD backend URLs collected for proxy bind %s:%s -> prefill=%s decode=%s",
+                        router_ip,
+                        router_port,
+                        prefill_backend_urls,
+                        decode_urls,
+                    )
+                _MOONCAKE_PD_PROXY_PROCS.append(
+                    _start_mooncake_pd_proxy(args, router_ip, router_port, prefill_backend_urls, decode_urls)
+                )
+                prom_port = None
+            else:
+                _, _, prom_port = _start_router(
+                    args,
+                    has_pd_disaggregation=True,
+                    bind=(router_ip, router_port),
+                    prefill_urls=prefill_urls,
+                    decode_urls=decode_urls,
+                )
         elif use_lb_proxy:
             # [ITEM 1 / DP #4 B+] 收集所有引擎 URL,起 Python LB proxy 替 Rust router
             #   (原样透传 return_token_ids + x-session-id 会话亲和;单引擎也可验透传,多引擎兼做 DP LB)。
@@ -1435,6 +1537,34 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
     logger.info(f"perf {rollout_id}: {log_dict}")
+    rollout_bench_metrics = {k: v for k, v in log_dict.items() if k.startswith("rollout_bench/")}
+    if rollout_bench_metrics:
+        logger.info("=" * 50)
+        logger.info(" Rollout Benchmark Result ")
+        _bench_pairs = [
+            ("Total input tokens:", "rollout_bench/total_input_tokens", False),
+            ("Total generated tokens:", "rollout_bench/total_generated_tokens", False),
+            ("Request throughput (req/s):", "rollout_bench/request_throughput", True),
+            ("Output token throughput (tok/s):", "rollout_bench/output_throughput", True),
+            ("Peak output token throughput (tok/s):", "rollout_bench/peak_output_token_throughput", True),
+            ("Peak concurrent requests:", "rollout_bench/peak_concurrent_requests", False),
+            ("Total token throughput (tok/s):", "rollout_bench/total_token_throughput", True),
+            ("Mean TTFT (ms):", "rollout_bench/ttft_mean_ms", True),
+            ("Median TTFT (ms):", "rollout_bench/ttft_median_ms", True),
+            ("P99 TTFT (ms):", "rollout_bench/ttft_p99_ms", True),
+            ("Mean TPOT (ms):", "rollout_bench/tpot_mean_ms", True),
+            ("Median TPOT (ms):", "rollout_bench/tpot_median_ms", True),
+            ("P99 TPOT (ms):", "rollout_bench/tpot_p99_ms", True),
+            ("Mean ITL (ms):", "rollout_bench/itl_mean_ms", True),
+            ("Median ITL (ms):", "rollout_bench/itl_median_ms", True),
+            ("P99 ITL (ms):", "rollout_bench/itl_p99_ms", True),
+        ]
+        for label, key, as_float in _bench_pairs:
+            if key not in rollout_bench_metrics:
+                continue
+            value = rollout_bench_metrics[key]
+            rendered = f"{float(value):.2f}" if as_float else f"{int(round(float(value)))}"
+            logger.info(f"{label:<40} {rendered:<10}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")

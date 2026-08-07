@@ -1,0 +1,440 @@
+#!/bin/bash
+# vime + polar 算子 RL 启动(qwen3.6-35B-A3B / NPU)—— **双机:.56 训练 8 卡 + .57 rollout 16 卡 PD**。
+#
+# 卡位(单一真源 = ${RESOURCE_LAYOUT},见 resource_layout.dual56train57infer_pd.yaml):
+#   80.48.5.56  0-7   actor 训练(同 HCCS 域,免 EI0013)
+#   80.48.5.56  8-15  polar agent/judge(宿主机子容器,**不进 ray**)
+#   80.48.5.57  0-15  rollout PD:prefill 4 卡(tp4×1)+ decode 12 卡(tp4×3)
+#
+# 前置:宿主机(.56)先起 polar,且 profile 里
+#   sglang_router_url: http://80.48.5.57:8001    ← proxy 起在 **rollout 节点**,不是 head。
+#     原因:layout 路径下 create_rollout_manager(placement_group.py:317)把 RolloutManager 钉在
+#     rollout 首个 bundle → 它进程内起的 PD proxy 也就落在 .57。
+#   npu_pool: "8,9,10,11,12,13,14,15"            ← 避开 actor 的 0-7
+#
+# 启动(两台跑同一个脚本,靠 CURRENT_IP==MASTER_ADDR 分角色;NPUS_PER_NODE/可见卡按角色自动填):
+#   head@56:   SOCKET_IFNAME=ens1f3 bash scripts/run-qwen36-35b-polar-minimal.sh
+#   worker@57: CURRENT_IP=80.48.5.57 SOCKET_IFNAME=<57网卡> bash scripts/run-qwen36-35b-polar-minimal.sh
+#
+# 单机回退:NNODES=1 RESOURCE_LAYOUT=scripts/resource_layout.single52.yaml 并显式给
+#   NPUS_PER_NODE / ASCEND_RT_VISIBLE_DEVICES / FEAT_PD_DISAGG=0。
+set -ex
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+VIME_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
+cd "${VIME_ROOT}"
+
+# ─── CANN 9.2.0(对齐 PD 参考脚本 run-qwen36-35b-polar-minimal-single-rollout-only-pd.sh)───
+# PD/mooncake 只在这套环境验证过(CANN 9.2.0 + vllm-023 + vllm-ascend-023 + 新编 mooncake)。
+ASCEND_ROOT=${ASCEND_ROOT:-/usr/local/Ascend}
+CANN_ROOT=${CANN_ROOT:-${ASCEND_ROOT}/cann}
+CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.2.0"
+CANN_BIN_DIR="${CANN_ROOT}/bin"
+CANN_LIB_DIR="${CANN_ROOT}/lib64"
+CANN_PYTHON_SITE_PACKAGES="${CANN_ROOT}/python/site-packages"
+CANN_TBE_DIR="${CANN_ROOT}/opp/built-in/op_impl/ai_core/tbe"
+source "${CANN_ROOT}/set_env.sh"
+source /usr/local/Ascend/nnal/atb/set_env.sh
+# 必须在 set_env.sh **之后** 覆盖(ops_legacy 被拷到 9.2.0 树下)
+export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
+export ASCEND_HOME_PATH="${CANN_ROOT}"
+export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
+
+# [GDN 训练算子 2026-08-05] Megatron 侧 GDN 前向要 aclnnRecomputeWUFwd
+# (MindSpeed/mindspeed/ops/chunk_gated_delta_rule.py:145 → torch.ops.npu.npu_recompute_w_u_fwd,
+#  op 由 site-packages/fla_npu 的 C++ 扩展注册)。该符号**只**存在于 CANN **9.0.0** 的 vendor 包:
+#    cann-9.0.0/opp/vendors/fla_npu_transformer/op_api/lib/libcust_opapi.so
+#  而 cann-9.2.0/opp/vendors/ 是空的(Aug 3 切 CANN 时没带过来),ASCEND_OPP_PATH 指 9.2.0 →
+#  训练一跑 GDN 就 "aclnnRecomputeWUFwd ... not in libopapi.so"。rollout-only 碰不到,故此前没暴露。
+# torch_npu 从 ${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so 加载(libtorch_npu.so 内字符串
+#  ASCEND_CUSTOM_OPP_PATH + /op_api/lib/ + libcust_opapi.so),所以这里指到 **vendor 目录本身**。
+# 实测:设了它符号即可解析并进入 kernel(9.0.0 kernel × 9.2.0 runtime 未见加载期不兼容)。
+ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH:-/usr/local/Ascend/cann-9.0.0/opp/vendors/fla_npu_transformer}
+if [ -f "${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so" ]; then
+   export ASCEND_CUSTOM_OPP_PATH
+   echo "[env] ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH} (GDN aclnnRecomputeWUFwd)"
+else
+   echo "[FATAL] GDN 自定义算子包缺失: ${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so" >&2
+   echo "        训练侧 GDN 前向会崩。确认 CANN 9.0.0 的 fla_npu_transformer vendor 包在位。" >&2
+   exit 1
+fi
+for d in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACKAGES}"; do
+   [ -e "${d}" ] || { echo "[FATAL] Required CANN path missing: ${d}" >&2; exit 1; }
+done
+
+# ─── 运行标识 / 多节点 ───
+RUN_ID=${RUN_ID:-qwen36_polar_$(date +%Y%m%d-%H%M%S)}
+MASTER_ADDR=${MASTER_ADDR:-80.48.5.59}
+ROLLOUT_NODE_IP=${ROLLOUT_NODE_IP:-80.48.5.56}   # 引擎+proxy 所在节点;须与 layout 的 rollout node 一致
+CURRENT_IP=${CURRENT_IP:-}
+SOCKET_IFNAME=${SOCKET_IFNAME:-}
+NNODES=${NNODES:-2}
+RAY_PORT=${RAY_PORT:-6461}
+RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8291}
+RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_qwen36_vime_polar}
+
+# ─── 拓扑:卡位由 RESOURCE_LAYOUT 唯一决定 ───
+# layout loader(arguments.py:1802-1812)会用 layout 覆盖 actor_num_nodes/actor_num_gpus_per_node/
+# rollout_num_gpus/rollout_num_gpus_per_engine,并把 num_gpus_per_node 设成 **rollout 节点** 的
+# 每节点卡数(16)—— 端口分配器靠它反推 node_index,所以这里不必也不该再传 --num-gpus-per-node。
+RESOURCE_LAYOUT=${RESOURCE_LAYOUT:-${VIME_ROOT}/scripts/resource_layout.dual56train57infer_pd.yaml}
+ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
+ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-8}
+ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-16}
+ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
+
+# ─── polar 数据 / 端点 ───
+POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
+OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
+OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.jsonl}
+OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
+VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # polar profile 的推理端点指向它
+# PD proxy bind 在 RolloutManager 所在节点 = rollout 节点(见文件头说明),不是 head。
+VLLM_ROUTER_IP=${VLLM_ROUTER_IP:-${ROLLOUT_NODE_IP}}
+# rollout 侧 PD 拓扑:复用 PD 参考脚本那份 yaml(prefill 4 + decode 12,per_engine=4,共 16 卡)
+VLLM_PD_CONFIG=${VLLM_PD_CONFIG:-${VIME_ROOT}/scripts/vllm_qwen36_35b_polar_single56_pd_mooncake_rollout_only.yaml}
+FEAT_PD_DISAGG=${FEAT_PD_DISAGG:-1}
+
+# ─── 环境 ───
+export PYTHONBUFFERED=16
+# 前置 site-packages = 新编 mooncake;vllm-023/vllm-ascend-023 = PD 验证过的那套(对齐 PD 参考脚本)
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm-023:/workspace/vllm-ascend-023:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
+export PATH="${CANN_BIN_DIR}:${PATH:-}"
+export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${CANN_TOOLKIT_ROOT}/x86_64-linux/lib64:${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${CANN_TOOLKIT_ROOT}/opp/lib64:${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH:-}"
+# Ascend 自定义 MoE 训练算子(--moe-grouped-gemm 用)。本容器两处都不存在 → ld 直接跳过、回退原生实现,
+# 保留是为了镜像里存在时行为不变。
+export LD_LIBRARY_PATH="${CANN_ROOT}/opp/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}"
+# [复核-D 保留 2026-07-14] Ascend 自定义 MoE 训练算子库(moe_grouped_matmul/grouped_matmul_swiglu/swiglu)。
+#   slime 在同名脚本 run-qwen36-35b-polar-minimal.sh:52 设的就是这条 identical 路径 → 参考正确,保留。
+#   --moe-grouped-gemm 用它;此路径在本容器不存在时被 ld 直接跳过 → 回退原生实现(不崩,仅性能),故当前 inert。
+export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH:-}"
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export HYDRA_FULL_ERROR=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export TASK_QUEUE_ENABLE=0                     # 必须 0:=1 会让 GDN/ring-attn 训练出 NaN
+export TORCHDYNAMO_DISABLE=1                   # 昇腾 inductor get_gpu_type() 断言 → 走 eager
+export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}   # NPU 邻近 NUMA 绑核,降延迟抖动
+export QWEN36_CP_MODE=ulysses
+export QWEN36_CAUSAL_CONV1D_IMPL=triton
+export QWEN36_CHUNK_LMHEAD=${QWEN36_CHUNK_LMHEAD:-0}   # =1 chunked LM-head logprob,长序列免 OOM
+export VLLM_ASCEND_ENABLE_NZ=0                         # 必须 0:vllm-ascend wake_up 对 NZ+RL 硬 raise、weight-sync 每步换权重与 NZ 格式冲突(精度崩);推理加速收益 RL 下无法安全兑现
+export VLLM_TOOL_CALL_PARSER=qwen3_coder
+export VLLM_REASONING_PARSER=qwen3
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export RAY_DEDUP_LOGS=1
+# HCCL(节点内 HCCS + 跨机 socket;长跑 EI0013 容错 + 35B 权重广播大 buffer)
+export HCCL_HOST_SOCKET_PORT_RANGE=${HCCL_HOST_SOCKET_PORT_RANGE:-60000-60050}
+export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
+export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-600}
+export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-2400}
+export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}
+export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
+export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
+# 跨机 HCCL 必需(对齐 slime;缺则双机权重同步 world>N 卡死在 rendezvous):
+export HCCL_SOCKET_FAMILY=${HCCL_SOCKET_FAMILY:-AF_INET}       # 强制 IPv4(网卡带 IPv6 地址会 socket family mismatch)
+export HCCL_WHITELIST_DISABLE=${HCCL_WHITELIST_DISABLE:-1}     # 禁 IP 白名单(否则跨机对端 IP 不在白名单→连接被拒→卡死)
+export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export HCCL_INTER_HCCS_DISABLE=${HCCL_INTER_HCCS_DISABLE:-true}
+export POLAR_KEEP_SESSION_DIR=${POLAR_KEEP_SESSION_DIR:-1}
+export POLAR_TRAJECTORY_PG_STRICT=${POLAR_TRAJECTORY_PG_STRICT:-1}
+export POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS=${POLAR_ANTHROPIC_DEFAULT_MAX_TOKENS:-12288}
+
+source "${VIME_ROOT}/scripts/models/qwen3.5-35B-A3B.sh"     # → MODEL_ARGS
+
+# [双机修复 2026-07-14] CURRENT_IP 优先从 SOCKET_IFNAME 指定的网卡取(对齐 slime polar-minimal:56),
+#   避免 hostname -I 首个 IP 命中 docker/bridge/别的网卡 → 跨机 HCCL ranktable 检测拿错 IP → EI0015。
+if [ -n "${SOCKET_IFNAME}" ]; then
+   CURRENT_IP=${CURRENT_IP:-$(ip -o -4 addr show "${SOCKET_IFNAME}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)}
+   CURRENT_IP=${CURRENT_IP:-$(ifconfig "${SOCKET_IFNAME}" 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')}
+fi
+CURRENT_IP=${CURRENT_IP:-$(hostname -I | awk '{print $1}')}
+export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${CURRENT_IP},${ROLLOUT_NODE_IP}${no_proxy:+,${no_proxy}}"
+export NO_PROXY="${no_proxy}"
+if [ -z "${SOCKET_IFNAME}" ]; then
+   SOCKET_IFNAME=$(ip -o addr show 2>/dev/null | awk -v t="${CURRENT_IP}" '{split($4,p,"/"); if (p[1]==t){print $2; exit}}')
+fi
+if [ -n "${SOCKET_IFNAME}" ]; then
+   export HCCL_SOCKET_IFNAME="${SOCKET_IFNAME}"
+   export GLOO_SOCKET_IFNAME="${SOCKET_IFNAME}"
+   export TP_SOCKET_IFNAME="${SOCKET_IFNAME}"
+fi
+export HCCL_IF_IP="${CURRENT_IP}"
+# mooncake 连接器的 side_channel_host 走 vllm get_ip()(kv_p2p/mooncake_connector.py:1890);
+# 多网卡下解析到非业务网段 → P 返回给 D 的 remote_host 不可达 → D 侧拉 KV 静默挂住。两台都钉。
+export VLLM_HOST_IP=${VLLM_HOST_IP:-${CURRENT_IP}}
+export VIME_HOST_IP=${VIME_HOST_IP:-${CURRENT_IP}}
+
+# ─── 按角色定 ray 注册卡数与可见卡(与 layout 的 devices 必须对得上)───
+# Ascend 要求 ASCEND_RT_VISIBLE_DEVICES 升序(乱序 → torch_npu 见 0 卡)。
+if [ "${MASTER_ADDR}" = "${CURRENT_IP}" ]; then
+   NODE_ROLE=head                                  # 训练节点:只暴露 0-7,8-15 留给宿主机 polar
+   NPUS_PER_NODE=${NPUS_PER_NODE:-8}
+   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+else
+   NODE_ROLE=worker                                # rollout 节点:16 卡全给引擎
+   NPUS_PER_NODE=${NPUS_PER_NODE:-16}
+   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+fi
+echo "[topo] role=${NODE_ROLE} ip=${CURRENT_IP} if=${SOCKET_IFNAME} npus=${NPUS_PER_NODE} devices=${ASCEND_RT_VISIBLE_DEVICES}"
+echo "[topo] actor=8卡@${MASTER_ADDR}  rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT_NODE_IP}(PD 1P3D tp4)  proxy=${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}"
+
+POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
+LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
+mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
+
+# ─── 参数分组 ───
+CKPT_ARGS=(
+   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
+   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
+   --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
+   --save-interval 10
+   --no-save-optim
+   --megatron-to-hf-mode raw
+   # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
+   #   的 dummy-TE 桩 + NPU 融合算子);默认 0 = 现 proven-healthy 态。opt2 是 blast-radius 项,须验 token-faith+GDN。
+   --optimization-level "$([ "${FEAT_OPT2:-0}" = "1" ] && echo 2 || echo 0)"
+)
+
+TOPO_ARGS=(
+   --actor-num-nodes ${ACTOR_NUM_NODES}
+   --actor-num-gpus-per-node ${ACTOR_NUM_GPUS_PER_NODE}
+   --rollout-num-gpus ${ROLLOUT_NUM_GPUS}
+   --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE}
+)
+
+ROLLOUT_ARGS=(
+   --rollout-function-path vime_bridge.rollout.generate_rollout_polar_async
+   --eval-function-path vime_bridge.rollout.generate_rollout_polar_async
+   --prompt-data "${OPERATOR_TASK_JSONL}"
+   --input-key prompt
+   --label-key label
+   --metadata-key metadata
+   --reward-key score
+   --custom-reward-post-process-path vime_bridge.reward_post_process.post_process_rewards
+   --rollout-shuffle
+   --num-rollout "${NUM_ROLLOUT:-20}"
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-4}"
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
+   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-32768}"
+   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
+   --rollout-temperature 0.7
+   --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
+   --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
+   --save-debug-train-data "${POLAR_OUTPUT_DIR}/vime_debug_train_${RUN_ID}_rollout_{rollout_id}_{rank}.pt"
+   --use-dynamic-global-batch-size
+   --rollout-seed "${ROLLOUT_SEED:-42}"
+)
+
+POLAR_ARGS=(
+   --polar-url "${POLAR_ROLLOUT_URL}"
+   --polar-run-id "${RUN_ID}"
+   --polar-reward-key score
+   --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
+   --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
+   --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
+   --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
+   --rollout-scheduler-mode session_pool
+   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
+   --rollout-release-on-postrun
+   --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
+)
+
+PERF_ARGS=(
+   --tensor-model-parallel-size "${TP:-2}"
+   --pipeline-model-parallel-size "${PP:-1}"
+   --context-parallel-size "${CP:-4}"
+   --expert-model-parallel-size "${EP:-8}"
+   --expert-tensor-parallel-size 1
+   --sequence-parallel
+   --chunked-lm-head
+   --recompute-granularity full
+   --recompute-method uniform
+   --recompute-num-layers 1
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-32768}"
+   --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-64}"
+   --seq-length "${SEQ_LENGTH:-131072}"
+)
+
+GRPO_ARGS=(
+   --advantage-estimator grpo
+   --use-kl-loss
+   --kl-loss-coef 0.001
+   --kl-loss-type low_var_kl
+   --entropy-coef 0.00
+   --eps-clip 0.2
+   --use-tis
+)
+
+OPTIMIZER_ARGS=(
+   --optimizer adam
+   --lr 2e-6
+   --lr-decay-style constant
+   --weight-decay 0.1
+   --adam-beta1 0.9
+   --adam-beta2 0.98
+   --optimizer-cpu-offload
+   --overlap-cpu-optimizer-d2h-h2d
+   --use-precision-aware-optimizer
+)
+
+VLLM_ARGS=(
+   --rollout-backend vllm
+   --qwen-gdn-backend npu
+   --model-name qwen3_5moeforconditionalgeneration
+   --vllm-hf-overrides '{"architectures":["Qwen3_5MoeForConditionalGeneration"]}'
+   --vllm-router-ip "${VLLM_ROUTER_IP}"
+   --vllm-router-port "${VLLM_ROUTER_PORT}"
+   --vllm-weight-sync-mode native
+   --no-vllm-weight-sync-packed
+   --vllm-gpu-memory-utilization "${VLLM_GPU_MEM_UTIL:-0.8}"
+   --vllm-max-num-seqs "${VLLM_MAX_NUM_SEQS:-96}"
+   --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-131072}"
+   --vllm-enable-sleep-mode
+   --vllm-compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+   # actor 与 rollout 分居不同节点、卡不重叠 → 无需 offload 腾显存
+   --no-offload-train
+   --no-offload-rollout
+)
+
+# ─── rollout 侧 PD 分离(拓扑对齐 run-qwen36-35b-polar-minimal-single-rollout-only-pd.sh)───
+# 卡怎么切由 ${VLLM_PD_CONFIG} 的 server_groups 决定(prefill 4 / decode 12,per_engine=4),
+# 其总卡数必须 == layout 里 rollout 的卡数(16),否则 rollout_validation.py 拦。
+if [ "${FEAT_PD_DISAGG:-1}" = "1" ]; then
+   VLLM_ARGS+=(
+      --vllm-config "${VLLM_PD_CONFIG}"
+      --disaggregation-backend "${PD_BACKEND:-mooncake}"
+      # --vllm-speculative-config "${VLLM_SPEC_CONFIG:-{\"method\":\"mtp\",\"num_speculative_tokens\":1}}"
+   )
+   FEAT_ROLLOUT_EP=${FEAT_ROLLOUT_EP:-1}       # PD 参考脚本开着 EP(经下面的 EP 闸门统一加 flag)
+   FEAT_PREFIX_CACHE=${FEAT_PREFIX_CACHE:-1}   # 同参考脚本;yaml 里 P/D 两组也各自置 true
+fi
+
+MISC_ARGS=(
+   --attention-dropout 0.0
+   --hidden-dropout 0.0
+   --accumulate-allreduce-grads-in-fp32
+   --attention-softmax-in-fp32
+   --attention-backend flash
+   --use-flash-attn
+   --moe-token-dispatcher-type alltoall
+   # [复核-B 回退 2026-07-14] slime 在**所有** NPU 脚本都用 --no-gradient-accumulation-fusion
+   #   (grad-fusion 依赖 CUDA-only 的 fused_weight_gradient_mlp_cuda,NPU 无)。
+   #   之前注释里"slime 开着跑通"是错的,已回退对齐 slime。
+   --no-gradient-accumulation-fusion
+   --seed "${SEED:-1234}"
+)
+
+# ─── 特性开关(默认全 OFF = baseline 逐位不变)───
+[ "${FEAT_ASYNC_SCHED:-0}" = "1" ] && VLLM_ARGS+=(--vllm-async-scheduling)
+EP_ON=0
+# FEAT_CROSS_DP_EP=1:跨 DP EP —— DP(external-LB)+ EP 同开,EP world=dp×tp。vLLM 自动 flatten
+#   ep_size=dp×tp(config.py:1179/1202),FusedMoE loader 按 dp×tp 分片(复用已验 c04b1dea4,无需新补丁)。
+#   硬需 FEAT_DP_EXTERNAL_LB=1(否则只是引擎内 EP);建议同开 FEAT_BALANCE_SCHED(防跨 DP EP batch 拖尾,§20)。
+if [ "${FEAT_ROLLOUT_EP:-0}" = "1" ] || [ "${FEAT_FLASHCOMM1:-0}" = "1" ] || [ "${FEAT_CROSS_DP_EP:-0}" = "1" ]; then
+   VLLM_ARGS+=(--vllm-enable-expert-parallel); EP_ON=1     # FlashComm1 硬需 rollout EP;CROSS_DP_EP 也需
+fi
+if [ "${FEAT_CROSS_DP_EP:-0}" = "1" ]; then
+   [ "${FEAT_DP_EXTERNAL_LB:-0}" = "1" ] || { echo "[cross-dp-ep][FATAL] 需同开 FEAT_DP_EXTERNAL_LB=1(EP world=dp×tp 依赖 DP 先到位)" >&2; exit 1; }
+   [ "${FEAT_BALANCE_SCHED:-0}" = "1" ] || echo "[cross-dp-ep][WARN] 建议同开 FEAT_BALANCE_SCHED=1(防跨 DP EP batch 不均拖尾,§20)" >&2
+fi
+[ "${FEAT_FLASHCOMM1:-0}" = "1" ] && export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+[ "${FEAT_PREFIX_CACHE:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-prefix-caching --vllm-enable-chunked-prefill)   # align 模式硬依赖 chunked-prefill
+# FEAT_DP_EXTERNAL_LB=1:vLLM 原生 external-LB 分布式 DP —— 每引擎 = 一个 DP rank,各自 API server + 前置 LB。
+#   **DP 组大小由 layout 的 rollout.vllm_dp_size 唯一决定**(arguments.py 消费 + 校验 == 引擎数);脚本只置模式
+#   开关。--data-parallel-external-lb 经 _forward_vllm_cli_args 自动带到 vllm serve;per-rank
+#   --data-parallel-rank/-address/-rpc-port 由 vime 运行时分配(rollout.py #3)。默认 OFF = baseline 逐位不变。
+if [ "${FEAT_DP_EXTERNAL_LB:-0}" = "1" ]; then
+   if [ "${FEAT_LB_PROXY:-0}" != "1" ]; then
+      echo "[dp-extlb][FATAL] external-LB DP 需前置 LB 分发各 rank API server,请同开 FEAT_LB_PROXY=1" >&2; exit 1
+   fi
+   VLLM_ARGS+=(--vllm-data-parallel-external-lb)
+fi
+# 多特性各自贡献 additional-config 顶层键 → 合并成单个 JSON(否则重复 flag 后者覆盖前者)
+ADDCFG_PARTS=()
+[ "${FEAT_MULTISTREAM_SHARED_EXPERT:-0}" = "1" ] && ADDCFG_PARTS+=('"multistream_overlap_shared_expert":true')
+[ "${FEAT_STATIC_KERNEL:-0}" = "1" ] && ADDCFG_PARTS+=('"ascend_compilation_config":{"enable_npugraph_ex":true,"enable_static_kernel":true}')
+# FEAT_BALANCE_SCHED=1:跨 DP rank 均衡调度(§20)——每 engine step 后 all_gather 各 rank 运行请求数,
+#   最忙副本打满时本副本停接 WAITING,防跨 DP EP batch 不均拖尾。DP-only:dp_size=1 时是无害 no-op;
+#   与 PD 分离(kv_producer/consumer)互斥(vllm-ascend 会 raise),纯 DP(kv_transfer_config=None)✅。
+#   纯调度层、理论不破 token-faith(§20.4)。建议随 FEAT_DP_EXTERNAL_LB 一起开。
+[ "${FEAT_BALANCE_SCHED:-0}" = "1" ] && ADDCFG_PARTS+=('"enable_balance_scheduling":true')
+[ "${#ADDCFG_PARTS[@]}" -gt 0 ] && VLLM_ARGS+=(--vllm-additional-config "{$(IFS=,; echo "${ADDCFG_PARTS[*]}")}")
+[ "${FEAT_HCCL_AIV:-0}" = "1" ] && export HCCL_OP_EXPANSION_MODE=AIV
+[ "${REPRO_DETERMINISTIC:-0}" = "1" ] && VLLM_ARGS+=(--vllm-enable-deterministic-inference)
+# [vime 2026-07-15 EXPERIMENTAL] FEAT_TRAIN_EXPANDABLE=1:把 expandable_segments forward 进训练 actor
+#   (ray actor 不继承父 env,必须经 --train-env-vars)。这是 OOM 所在的 88 训练侧,不碰 vLLM/CaMem/assert。
+#   默认 0 = 不变。与 vLLM 侧的 VIME_VLLM_KEEP_EXPANDABLE 独立。
+[ "${FEAT_TRAIN_EXPANDABLE:-0}" = "1" ] && PERF_ARGS+=(--train-env-vars "{\"PYTORCH_NPU_ALLOC_CONF\":\"${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}\"}")
+# [vime 2026-07-15 B] FEAT_OPT2=1:对齐 slime 开 opt-level 2 + moe-permute-fusion(NPU 融合算子省 unfused
+#   MoE permute 的中间张量 + workspace)。opt-level 值在上面数组处按 FEAT_OPT2 切;此处补 --moe-permute-fusion。
+#   前置已验:torch_npu 2.10.0 有 npu_moe_token_permute_with_routing_map。须验:model init 不崩 + token-faith + GDN。
+[ "${FEAT_OPT2:-0}" = "1" ] && PERF_ARGS+=(--moe-permute-fusion)
+echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
+
+# ─── Ray(单机 NNODES=1 走 head 分支)+ 启动 ───
+if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
+   ray stop --force
+   rm -rf "${RAY_TEMP_DIR}"
+   ray start --head --port "${RAY_PORT}" --dashboard-host=0.0.0.0 --node-ip-address="${CURRENT_IP}" --dashboard-port="${RAY_DASHBOARD_PORT}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
+
+   while true; do
+      active_node_count=$(ray status | awk '
+         /^Active:/ {in_active=1; next}
+         /^Pending:/ {in_active=0}
+         in_active && $1 == "1" && $2 ~ /^node_/ {count++}
+         END {print count + 0}')
+      echo "[stage] wait Ray nodes active=${active_node_count}/${NNODES}"
+      if [ "$active_node_count" -eq "$NNODES" ]; then
+         # ─── 卡位闸门:layout 要求的 (node, devices) 必须真的在集群里 ───
+         # layout 的 node 必须与 Ray 看到的节点 IP 一致、devices 必须与该节点暴露的卡号一致,
+         # 否则 _build_layout_bundles(placement_group.py:108)会在建 PG 时才报错。这里提前拦。
+         python3 - "${MASTER_ADDR}" "${ROLLOUT_NODE_IP}" "${ACTOR_NUM_GPUS_PER_NODE}" "${ROLLOUT_NUM_GPUS}" <<'PY'
+import sys, ray
+actor_ip, rollout_ip, want_actor, want_rollout = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+ray.init(address="auto", ignore_reinit_error=True, logging_level="ERROR")
+npu = {n["NodeManagerAddress"]: int(n["Resources"].get("NPU", 0)) for n in ray.nodes() if n.get("Alive")}
+print(f"[gate] per-node NPU: {npu}")
+errs = []
+if npu.get(actor_ip, 0) != want_actor:
+    errs.append(f"训练节点 {actor_ip} NPU={npu.get(actor_ip, 0)},期望 {want_actor}(该节点只应暴露 0-7)")
+if npu.get(rollout_ip, 0) != want_rollout:
+    errs.append(f"rollout 节点 {rollout_ip} NPU={npu.get(rollout_ip, 0)},期望 {want_rollout}")
+if errs:
+    print("[gate][FATAL] 卡位不对,拒绝启动:", *(" - " + e for e in errs), sep="\n")
+    sys.exit(1)
+print(f"[gate] OK: actor {want_actor}卡@{actor_ip} + rollout {want_rollout}卡@{rollout_ip}")
+PY
+         # layout 路径:清全局可见卡,交给 Ray 按 layout 钉卡(只影响 driver,raylet 不受影响)
+         unset ASCEND_RT_VISIBLE_DEVICES HCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME TP_SOCKET_IFNAME HCCL_IF_IP
+         EXTRA_ARGS=()
+         [ -n "${RESOURCE_LAYOUT:-}" ] && EXTRA_ARGS+=(--resource-layout "${RESOURCE_LAYOUT}")
+         # FEAT_LB_PROXY=1:Python 透传 LB proxy 替 Rust router(保 return_token_ids + 会话亲和);
+         #   需把 polar 推理端点指向 :${VLLM_ROUTER_PORT}。见 docs/design/router_return_token_ids_passthrough.md §10。
+         [ "${FEAT_LB_PROXY:-0}" = "1" ] && EXTRA_ARGS+=(--rollout-lb-proxy)
+         python3 train_async.py \
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
+            ${TOPO_ARGS[@]} ${MODEL_ARGS[@]} ${ROLLOUT_ARGS[@]} ${POLAR_ARGS[@]} \
+            ${OPTIMIZER_ARGS[@]} ${GRPO_ARGS[@]} ${PERF_ARGS[@]} ${VLLM_ARGS[@]} \
+            ${MISC_ARGS[@]} ${CKPT_ARGS[@]} \
+            2>&1 | tee "${LOG_FILE}"
+         break
+      fi
+      sleep 5
+   done
+else
+   # worker(rollout 节点):只加入集群。引擎与 PD proxy 由 head 的 driver 远程创建,
+   # 从本节点 raylet 继承环境 → 上面那些 export 必须在 ray start 之前完成。
+   ray stop --force
+   rm -rf "${RAY_TEMP_DIR}"
+   while true; do
+      ray start --address="${MASTER_ADDR}:${RAY_PORT}" --node-ip-address="${CURRENT_IP}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
+      ray status && break
+      sleep 5
+   done
+   set +x
+   echo "[worker] 已加入 ${MASTER_ADDR}:${RAY_PORT},注册 NPU=${NPUS_PER_NODE}。"
+   echo "[worker] 引擎/PD proxy 由 head 的 driver 远程创建;本脚本结束,raylet 常驻后台。"
+   echo "[worker] 引擎日志:${RAY_TEMP_DIR}/session_latest/logs/"
+fi

@@ -293,6 +293,56 @@ def _serialize_weight_transfer_config(value) -> str:
     return serialized
 
 
+def _resolve_mooncake_connector_name() -> str:
+    """Pick the newest Mooncake connector name supported by the installed vLLM."""
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+        if "MooncakeConnectorV1" in KVConnectorFactory._registry:
+            return "MooncakeConnectorV1"
+        if "MooncakeConnector" in KVConnectorFactory._registry:
+            return "MooncakeConnector"
+    except Exception as exc:
+        logger.debug("Failed to inspect KV connector registry for Mooncake alias: %s", exc)
+    return "MooncakeConnectorV1"
+
+
+def _build_mooncake_kv_transfer_config(server_args: dict[str, Any]) -> dict[str, Any]:
+    worker_type = server_args["worker_type"]
+    tp_size = server_args["tp_size"]
+    bootstrap_port = server_args["disaggregation_bootstrap_port"]
+    assert worker_type in ("prefill", "decode"), f"Unsupported worker_type for Mooncake: {worker_type}"
+    assert bootstrap_port is not None, "Mooncake PD workers require disaggregation_bootstrap_port"
+    role = "kv_producer" if worker_type == "prefill" else "kv_consumer"
+    kv_rank = 0 if worker_type == "prefill" else 1
+
+    topology = server_args.get("pd_topology") or {}
+    prefill_topology = topology.get("prefill") or {}
+    decode_topology = topology.get("decode") or {}
+    default_dp = int(server_args.get("dp_size") or 1)
+    extra_config = {
+        "prefill": {
+            "dp_size": int(prefill_topology.get("dp_size") or (default_dp if worker_type == "prefill" else 1)),
+            "tp_size": int(prefill_topology.get("tp_size") or (tp_size if worker_type == "prefill" else 1)),
+        },
+        "decode": {
+            "dp_size": int(decode_topology.get("dp_size") or (default_dp if worker_type == "decode" else 1)),
+            "tp_size": int(decode_topology.get("tp_size") or (tp_size if worker_type == "decode" else 1)),
+        },
+    }
+    if is_npu():
+        extra_config["use_ascend_direct"] = True
+    return {
+        "kv_connector": _resolve_mooncake_connector_name(),
+        "kv_buffer_device": "npu" if is_npu() else "cuda",
+        "kv_role": role,
+        "kv_parallel_size": 1,
+        "kv_port": bootstrap_port,
+        "kv_rank": kv_rank,
+        "kv_connector_extra_config": extra_config,
+    }
+
+
 def _forward_vllm_cli_args(args, cmd: list[str]) -> None:
     """Append user ``--vllm-*`` overrides not already set by the orchestrator."""
     fixed = {flag for flag in cmd if isinstance(flag, str) and flag.startswith("--")}
@@ -493,16 +543,22 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     else:
         cmd += ["--weight-transfer-config", '{"backend":"nccl"}']
 
+    worker_type = server_args.get("worker_type", "regular")
+    disagg_backend = getattr(args, "disaggregation_backend", "nixl")
+
     if getattr(args, "colocate", False) and "--worker-extension-cls" not in cmd:
         cmd += [
             "--worker-extension-cls",
             "vime.backends.megatron_utils.update_weight.update_weight_from_tensor.vLLMColocateWorkerExtension",
         ]
 
-    worker_type = server_args.get("worker_type", "regular")
     if worker_type in ("prefill", "decode") and topology.node_rank == 0:
-        env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = host_for_subprocess
-        env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(server_args["disaggregation_bootstrap_port"])
+        if disagg_backend == "mooncake":
+            env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(server_args["disaggregation_bootstrap_port"])
+            cmd += ["--kv-transfer-config", serialize_for_cli(_build_mooncake_kv_transfer_config(server_args))]
+        else:
+            env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = host_for_subprocess
+            env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(server_args["disaggregation_bootstrap_port"])
 
     _tp = os.environ.get("VLLM_TOOL_CALL_PARSER")
     if _tp and "--tool-call-parser" not in cmd:
@@ -649,8 +705,8 @@ class VLLMEngine(RayActor):
         self.disaggregation_bootstrap_port = disaggregation_bootstrap_port
 
         if self.worker_type != "regular":
-            logger.warning(
-                "vLLMEngine: worker_type=%s is not used by current vLLM deployment (treated as regular).",
+            logger.info(
+                "vLLMEngine: worker_type=%s affects PD/disaggregation launch wiring.",
                 self.worker_type,
             )
 
@@ -871,6 +927,12 @@ class VLLMEngine(RayActor):
         if self.node_rank != 0:
             return None
         return self._http_base()
+
+    def get_pd_endpoint(self):
+        """Return ``(url, bootstrap_port)`` for PD workers, or ``None`` on headless ranks."""
+        if self.node_rank != 0:
+            return None
+        return self._http_base(), self.disaggregation_bootstrap_port
 
     def shutdown(self):
         logger.info("Shutdown vLLM engine %s:%s...", self.server_host, self.server_port)
@@ -1194,6 +1256,12 @@ def _compute_server_args(
             raise ValueError("dist_init_addr is required when launching a multi-node vLLM engine")
         master_addr, master_port = parse_dist_init_addr(dist_init_addr)
 
+    pd_topology = None
+    if vllm_overrides:
+        raw_pd_topology = vllm_overrides.get("pd_topology")
+        if isinstance(raw_pd_topology, dict):
+            pd_topology = raw_pd_topology
+
     server_args = {
         "args": args,
         "rank": rank,
@@ -1211,6 +1279,7 @@ def _compute_server_args(
         "tp_size": topology.tensor_parallel_size,
         "pp_size": topology.pipeline_parallel_size,
         "dp_size": _get_vllm_dp_size(args),
+        "pd_topology": pd_topology,
         "seed": getattr(args, "seed", 1234) + rank,
         "disaggregation_bootstrap_port": disaggregation_bootstrap_port,
         # [DP #3/#4 P1 / external-LB] per-rank DP wiring (None on non-external-LB path).
