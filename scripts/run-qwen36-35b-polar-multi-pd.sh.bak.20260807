@@ -28,7 +28,7 @@ cd "${VIME_ROOT}"
 # PD/mooncake 只在这套环境验证过(CANN 9.2.0 + vllm-023 + vllm-ascend-023 + 新编 mooncake)。
 ASCEND_ROOT=${ASCEND_ROOT:-/usr/local/Ascend}
 CANN_ROOT=${CANN_ROOT:-${ASCEND_ROOT}/cann}
-CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.0.0"
+CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.2.0"
 CANN_BIN_DIR="${CANN_ROOT}/bin"
 CANN_LIB_DIR="${CANN_ROOT}/lib64"
 CANN_PYTHON_SITE_PACKAGES="${CANN_ROOT}/python/site-packages"
@@ -44,7 +44,7 @@ export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
 # (MindSpeed/mindspeed/ops/chunk_gated_delta_rule.py:145 → torch.ops.npu.npu_recompute_w_u_fwd,
 #  op 由 site-packages/fla_npu 的 C++ 扩展注册)。该符号**只**存在于 CANN **9.0.0** 的 vendor 包:
 #    cann-9.0.0/opp/vendors/fla_npu_transformer/op_api/lib/libcust_opapi.so
-#  而 cann-9.0.0/opp/vendors/ 是空的(Aug 3 切 CANN 时没带过来),ASCEND_OPP_PATH 指 9.2.0 →
+#  而 cann-9.2.0/opp/vendors/ 是空的(Aug 3 切 CANN 时没带过来),ASCEND_OPP_PATH 指 9.2.0 →
 #  训练一跑 GDN 就 "aclnnRecomputeWUFwd ... not in libopapi.so"。rollout-only 碰不到,故此前没暴露。
 # torch_npu 从 ${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so 加载(libtorch_npu.so 内字符串
 #  ASCEND_CUSTOM_OPP_PATH + /op_api/lib/ + libcust_opapi.so),所以这里指到 **vendor 目录本身**。
@@ -67,7 +67,7 @@ RUN_ID=${RUN_ID:-qwen36_polar_$(date +%Y%m%d-%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-80.48.5.59}
 ROLLOUT_NODE_IP=${ROLLOUT_NODE_IP:-80.48.5.56}   # 引擎+proxy 所在节点;须与 layout 的 rollout node 一致
 CURRENT_IP=${CURRENT_IP:-}
-SOCKET_IFNAME=${SOCKET_IFNAME:-data0.172}
+SOCKET_IFNAME=${SOCKET_IFNAME:-}
 NNODES=${NNODES:-2}
 RAY_PORT=${RAY_PORT:-6461}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8291}
@@ -98,8 +98,7 @@ FEAT_PD_DISAGG=${FEAT_PD_DISAGG:-1}
 # ─── 环境 ───
 export PYTHONBUFFERED=16
 # 前置 site-packages = 新编 mooncake;vllm-023/vllm-ascend-023 = PD 验证过的那套(对齐 PD 参考脚本)
-export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm-023:/workspace/vllm-ascend-023:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${CANN_TOOLKIT_ROOT}/x86_64-linux/lib64:${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${CANN_TOOLKIT_ROOT}/opp/lib64:${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH:-}"
 # Ascend 自定义 MoE 训练算子(--moe-grouped-gemm 用)。本容器两处都不存在 → ld 直接跳过、回退原生实现,

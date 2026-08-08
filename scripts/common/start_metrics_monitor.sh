@@ -11,6 +11,13 @@
 #   METRICS_SCAN_PORTS   自动发现的端口扫描范围，默认 15000-15200
 #                        (vime 在 rollout.py:165 从 base_port=15000 起逐个探测空闲端口分配,
 #                         端口既不固定也不连续，且训练启动前不可知 → 只能运行时发现)
+#   METRICS_SKIP_PORTS   扫描时跳过的端口(逗号分隔,支持区间 15002-15005)。
+#                        扫描区间和 Mooncake KV 握手端口重叠时用它显式排除
+#   METRICS_ENGINE_INTERNAL_PORTS
+#                        每个 engine 在 API port 之后占用的内部端口数 = 1(nccl)+tp(bootstrap)。
+#                        PD+Mooncake 场景建议设为 $((1 + TP))(如 tp4 → 5),
+#                        发现 engine 后自动隔离该窗口内的非 HTTP 端口,避免刷
+#                        readString/SocketHandShakePlugin 报错
 #   METRICS_INTERVAL     采样间隔秒，默认 5
 #
 # 设计约束：本脚本被 `set -ex` 的训练脚本 source。绝不能让任何非零返回码
@@ -37,6 +44,8 @@ __mm_monitor="${__mm_vime_root}/scripts/vllm_metrics_monitor_v2.py"
 __mm_dash_port="${METRICS_DASHBOARD_PORT:-5000}"
 __mm_host_ip="${METRICS_HOST_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"
 __mm_scan="${METRICS_SCAN_PORTS:-15000-15200}"
+__mm_skip="${METRICS_SKIP_PORTS:-}"
+__mm_internal="${METRICS_ENGINE_INTERNAL_PORTS:-0}"
 __mm_interval="${METRICS_INTERVAL:-5}"
 
 if [ ! -f "${__mm_monitor}" ]; then
@@ -78,8 +87,13 @@ if [ -n "${METRICS_ENGINE_URLS:-}" ]; then
    echo "[metrics] engine 端点(显式): ${METRICS_ENGINE_URLS}"
 else
    __mm_args+=(--discover-host "${__mm_host_ip}" --discover-ports "${__mm_scan}")
+   [ -n "${__mm_skip}" ] && __mm_args+=(--skip-ports "${__mm_skip}")
+   [ "${__mm_internal}" != "0" ] && __mm_args+=(--engine-internal-ports "${__mm_internal}")
    echo "[metrics] engine 端点: 自动发现 ${__mm_host_ip}:${__mm_scan}"
    echo "[metrics]   (engine 端口由 vime 运行时分配,启动前不可知 → 持续发现,引擎起来后自动纳入)"
+   [ -n "${__mm_skip}" ] && echo "[metrics]   跳过端口: ${__mm_skip}"
+   [ "${__mm_internal}" != "0" ] && \
+      echo "[metrics]   engine 内部端口窗口: +1..+${__mm_internal} (nccl+mooncake bootstrap,自动隔离)"
 fi
 
 nohup python3 "${__mm_monitor}" "${__mm_args[@]}" >"${__mm_log}" 2>&1 &
@@ -94,6 +108,7 @@ else
 fi
 
 unset __mm_script_dir __mm_vime_root __mm_monitor __mm_dash_port __mm_host_ip \
-      __mm_scan __mm_interval __mm_existing __mm_log_dir __mm_log __mm_args __mm_pid
+      __mm_scan __mm_skip __mm_internal __mm_interval __mm_existing __mm_log_dir \
+      __mm_log __mm_args __mm_pid
 __mm_finish
 return 0 2>/dev/null || true
