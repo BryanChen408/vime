@@ -28,7 +28,7 @@ cd "${VIME_ROOT}"
 # PD/mooncake 只在这套环境验证过(CANN 9.2.0 + vllm-023 + vllm-ascend-023 + 新编 mooncake)。
 ASCEND_ROOT=${ASCEND_ROOT:-/usr/local/Ascend}
 CANN_ROOT=${CANN_ROOT:-${ASCEND_ROOT}/cann}
-CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.0.0"
+CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.2.0"
 CANN_BIN_DIR="${CANN_ROOT}/bin"
 CANN_LIB_DIR="${CANN_ROOT}/lib64"
 CANN_PYTHON_SITE_PACKAGES="${CANN_ROOT}/python/site-packages"
@@ -43,19 +43,19 @@ export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
 # [GDN 训练算子 2026-08-05] Megatron 侧 GDN 前向要 aclnnRecomputeWUFwd
 # (MindSpeed/mindspeed/ops/chunk_gated_delta_rule.py:145 → torch.ops.npu.npu_recompute_w_u_fwd,
 #  op 由 site-packages/fla_npu 的 C++ 扩展注册)。该符号**只**存在于 CANN **9.0.0** 的 vendor 包:
-#    cann-9.0.0/opp/vendors/custom_transformer/op_api/lib/libcust_opapi.so
-#  而 cann-9.0.0/opp/vendors/ 是空的(Aug 3 切 CANN 时没带过来),ASCEND_OPP_PATH 指 9.2.0 →
+#    cann-9.0.0/opp/vendors/fla_npu_transformer/op_api/lib/libcust_opapi.so
+#  而 cann-9.2.0/opp/vendors/ 是空的(Aug 3 切 CANN 时没带过来),ASCEND_OPP_PATH 指 9.2.0 →
 #  训练一跑 GDN 就 "aclnnRecomputeWUFwd ... not in libopapi.so"。rollout-only 碰不到,故此前没暴露。
 # torch_npu 从 ${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so 加载(libtorch_npu.so 内字符串
 #  ASCEND_CUSTOM_OPP_PATH + /op_api/lib/ + libcust_opapi.so),所以这里指到 **vendor 目录本身**。
 # 实测:设了它符号即可解析并进入 kernel(9.0.0 kernel × 9.2.0 runtime 未见加载期不兼容)。
-ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH:-/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer}
+ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH:-/usr/local/Ascend/cann-9.0.0/opp/vendors/fla_npu_transformer}
 if [ -f "${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so" ]; then
    export ASCEND_CUSTOM_OPP_PATH
    echo "[env] ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH} (GDN aclnnRecomputeWUFwd)"
 else
    echo "[FATAL] GDN 自定义算子包缺失: ${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so" >&2
-   echo "        训练侧 GDN 前向会崩。确认 CANN 9.0.0 的 custom_transformer vendor 包在位。" >&2
+   echo "        训练侧 GDN 前向会崩。确认 CANN 9.0.0 的 fla_npu_transformer vendor 包在位。" >&2
    exit 1
 fi
 for d in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACKAGES}"; do
@@ -67,7 +67,7 @@ RUN_ID=${RUN_ID:-qwen36_polar_$(date +%Y%m%d-%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-80.48.5.59}
 ROLLOUT_NODE_IP=${ROLLOUT_NODE_IP:-80.48.5.56}   # 引擎+proxy 所在节点;须与 layout 的 rollout node 一致
 CURRENT_IP=${CURRENT_IP:-}
-SOCKET_IFNAME=${SOCKET_IFNAME:-data0.172}
+SOCKET_IFNAME=${SOCKET_IFNAME:-}
 NNODES=${NNODES:-2}
 RAY_PORT=${RAY_PORT:-6461}
 RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8291}
@@ -98,8 +98,7 @@ FEAT_PD_DISAGG=${FEAT_PD_DISAGG:-1}
 # ─── 环境 ───
 export PYTHONBUFFERED=16
 # 前置 site-packages = 新编 mooncake;vllm-023/vllm-ascend-023 = PD 验证过的那套(对齐 PD 参考脚本)
-export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm-023:/workspace/vllm-ascend-023:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${CANN_TOOLKIT_ROOT}/x86_64-linux/lib64:${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${CANN_TOOLKIT_ROOT}/opp/lib64:${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH:-}"
 # Ascend 自定义 MoE 训练算子(--moe-grouped-gemm 用)。本容器两处都不存在 → ld 直接跳过、回退原生实现,
@@ -171,11 +170,11 @@ export VIME_HOST_IP=${VIME_HOST_IP:-${CURRENT_IP}}
 if [ "${MASTER_ADDR}" = "${CURRENT_IP}" ]; then
    NODE_ROLE=head                                  # 训练节点:只暴露 0-7,8-15 留给宿主机 polar
    NPUS_PER_NODE=${NPUS_PER_NODE:-8}
-   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 else
    NODE_ROLE=worker                                # rollout 节点:16 卡全给引擎
    NPUS_PER_NODE=${NPUS_PER_NODE:-16}
-   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11}
+   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 fi
 echo "[topo] role=${NODE_ROLE} ip=${CURRENT_IP} if=${SOCKET_IFNAME} npus=${NPUS_PER_NODE} devices=${ASCEND_RT_VISIBLE_DEVICES}"
 echo "[topo] actor=8卡@${MASTER_ADDR}  rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT_NODE_IP}(PD 1P3D tp4)  proxy=${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}"
@@ -186,10 +185,10 @@ mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
 
 # ─── 参数分组 ───
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}
-   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
+   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
+   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
-   --save-interval 100
+   --save-interval 10
    --no-save-optim
    --megatron-to-hf-mode raw
    # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
@@ -219,7 +218,7 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
    --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-32768}"
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
-   --rollout-temperature 1
+   --rollout-temperature 0.7
    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
    --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
    --save-debug-train-data "${POLAR_OUTPUT_DIR}/vime_debug_train_${RUN_ID}_rollout_{rollout_id}_{rank}.pt"
@@ -241,15 +240,10 @@ POLAR_ARGS=(
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
 )
 
-# [FLOOR] 轨迹内 trace 保底权重(vime/ray/rollout.py 的 rollout_mask_sums 分母)。
-# 不设则不传该参,默认纯 token 加权,行为与之前完全一致。
-[ -n "${POLAR_TRAJECTORY_PG_FLOOR:-}" ] && \
-   POLAR_ARGS+=(--polar-trajectory-pg-floor "${POLAR_TRAJECTORY_PG_FLOOR}")
-
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"
    --pipeline-model-parallel-size "${PP:-1}"
-   --context-parallel-size "${CP:-8}"
+   --context-parallel-size "${CP:-4}"
    --expert-model-parallel-size "${EP:-8}"
    --expert-tensor-parallel-size 1
    --sequence-parallel
@@ -265,17 +259,17 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   #--use-kl-loss
-   #--kl-loss-coef 0.001
-   #--kl-loss-type low_var_kl
-   --entropy-coef 0.001
+   --use-kl-loss
+   --kl-loss-coef 0.001
+   --kl-loss-type low_var_kl
+   --entropy-coef 0.00
    --eps-clip 0.2
    --use-tis
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr 2e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
@@ -379,41 +373,10 @@ ADDCFG_PARTS=()
 [ "${FEAT_OPT2:-0}" = "1" ] && PERF_ARGS+=(--moe-permute-fusion)
 echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
 
-# ─── 清本节点 rollout 卡残留(只清 $ASCEND_RT_VISIBLE_DEVICES 钉的卡)───
-# 上个 run 异常结束后,vllm 栈(ray::VLLMEngine / vllm serve / EngineCore / Worker)
-# 可能变成孤儿进程:占着 HBM(实测 55GB/卡)和 15000 端口,ray stop 清不干净。
-# 判定 = 进程 env 的 ASCEND_RT_VISIBLE_DEVICES 与本机 rollout 卡集求交;
-# Ascend 运行时不持 /dev/davinciN 句柄,fuser/fd 扫描不可靠,勿用。
-# 模式里禁止裸写 ray:::head 节点的 ray::IDLE 预启动 worker 池(约 200 个,env 全卡)
-# 会被扫进来 —— 它们不占 HBM/端口,杀之无益还会误伤共享集群的 worker 池。
-# 仅在 ray stop 之后、ray start 之前调用:此时卡上的 vllm 按定义都是残留,
-# 函数不区分残留与活 run,禁止单独手动执行。
-cleanup_rollout_residue() {
-   local devs="${ASCEND_RT_VISIBLE_DEVICES//[[:space:]]/}"
-   [ -n "$devs" ] || { echo "[cleanup] ASCEND_RT_VISIBLE_DEVICES 为空,跳过"; return 0; }
-   local pid env_devs overlap pass hit
-   for pass in TERM KILL; do
-      hit=0
-      for pid in $(pgrep -fi "vllm" 2>/dev/null); do
-         env_devs=$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null | sed -n 's/^ASCEND_RT_VISIBLE_DEVICES=//p' | head -1)
-         [ -n "$env_devs" ] || continue
-         overlap=$(printf '%s\n%s\n' "$devs" "$env_devs" | tr ',' '\n' | grep -E '^[0-9]+$' | sort -n | uniq -d | head -1)
-         [ -n "$overlap" ] || continue
-         echo "[cleanup] kill -$pass pid=$pid cards=[$env_devs] $(ps -o comm= -p "$pid" 2>/dev/null)"
-         kill -"$pass" "$pid" 2>/dev/null || true
-         hit=1
-      done
-      [ "$hit" = 0 ] && break
-      [ "$pass" = TERM ] && sleep 8
-   done
-   return 0
-}
-
 # ─── Ray(单机 NNODES=1 走 head 分支)+ 启动 ───
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
    ray stop --force
    rm -rf "${RAY_TEMP_DIR}"
-   cleanup_rollout_residue
    ray start --head --port "${RAY_PORT}" --dashboard-host=0.0.0.0 --node-ip-address="${CURRENT_IP}" --dashboard-port="${RAY_DASHBOARD_PORT}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
 
    while true; do
@@ -450,17 +413,6 @@ PY
          # FEAT_LB_PROXY=1:Python 透传 LB proxy 替 Rust router(保 return_token_ids + 会话亲和);
          #   需把 polar 推理端点指向 :${VLLM_ROUTER_PORT}。见 docs/design/router_return_token_ids_passthrough.md §10。
          [ "${FEAT_LB_PROXY:-0}" = "1" ] && EXTRA_ARGS+=(--rollout-lb-proxy)
-         # ─── 启动 vLLM metrics 监控面板(旁路,失败不影响训练)───
-         # 引擎由 head 的 driver 远程创建在 rollout 节点 → 发现目标必须是
-         # ROLLOUT_NODE_IP(140),不是 CURRENT_IP(141 本机没有任何 engine)。
-         # 面板跑在 head 上,人在 141 直接看 http://<141>:5000。
-         # METRICS_ENGINE_INTERNAL_PORTS = 1(nccl)+tp:发现 engine 后自动隔离其
-         # Mooncake bootstrap 端口,避免 GET /metrics 被当二进制长度前缀读,
-         # 在 vllm 日志刷 readString/SocketHandShakePlugin 报错。
-         METRICS_DASHBOARD_PORT=${METRICS_DASHBOARD_PORT:-5000} \
-         METRICS_HOST_IP="${ROLLOUT_NODE_IP}" \
-         METRICS_ENGINE_INTERNAL_PORTS=$((1 + ROLLOUT_NUM_GPUS_PER_ENGINE)) \
-            source "${VIME_ROOT}/scripts/common/start_metrics_monitor.sh"
          python3 train_async.py \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             ${TOPO_ARGS[@]} ${MODEL_ARGS[@]} ${ROLLOUT_ARGS[@]} ${POLAR_ARGS[@]} \
@@ -476,7 +428,6 @@ else
    # 从本节点 raylet 继承环境 → 上面那些 export 必须在 ray start 之前完成。
    ray stop --force
    rm -rf "${RAY_TEMP_DIR}"
-   cleanup_rollout_residue
    while true; do
       ray start --address="${MASTER_ADDR}:${RAY_PORT}" --node-ip-address="${CURRENT_IP}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
       ray status && break

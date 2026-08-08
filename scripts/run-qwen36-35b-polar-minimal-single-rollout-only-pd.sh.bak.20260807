@@ -10,7 +10,7 @@ cd "${VIME_ROOT}"
 
 ASCEND_ROOT=${ASCEND_ROOT:-/usr/local/Ascend}
 CANN_ROOT=${CANN_ROOT:-${ASCEND_ROOT}/cann}
-CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.0.0"
+CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.2.0"
 CANN_BIN_DIR="${CANN_ROOT}/bin"
 CANN_LIB_DIR="${CANN_ROOT}/lib64"
 CANN_PYTHON_SITE_PACKAGES="${CANN_ROOT}/python/site-packages"
@@ -36,7 +36,6 @@ export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${LD_LIBRARY_PA
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64:${LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH}"
 export PYTHONPATH="${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
 
 for required_dir in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACKAGES}"; do
    if [ ! -e "${required_dir}" ]; then
@@ -48,7 +47,7 @@ done
 RUN_ID=${RUN_ID:-qwen36_polar_pd_$(date +%Y%m%d-%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-$(hostname -I | awk '{print $1}')}
 CURRENT_IP=${CURRENT_IP:-}
-SOCKET_IFNAME=${SOCKET_IFNAME:-data0.172}
+SOCKET_IFNAME=${SOCKET_IFNAME:-}
 RAY_HOST_IP=${RAY_HOST_IP:-}
 MOONCAKE_HOST_IP=${MOONCAKE_HOST_IP:-}
 
@@ -95,8 +94,7 @@ KV_CONNECTOR=${KV_CONNECTOR:-MooncakeConnectorV1}
 export PYTHONBUFFERED=16
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 # Prepend /usr/local/lib/python3.11/site-packages for newly compiled mooncake
-export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm-023:/workspace/vllm-ascend-023:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
@@ -161,8 +159,7 @@ export HCCL_IF_IP="${CURRENT_IP}"
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
 LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
-USE_WANDB=0  # Disabled - no API key
-export USE_WANDB
+USE_WANDB=${USE_WANDB:-1}
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_PROJECT=${WANDB_PROJECT:-qwen36-rollout-only-pd}
 WANDB_GROUP=${WANDB_GROUP:-single-rollout}
@@ -171,23 +168,23 @@ WANDB_HOST=${WANDB_HOST:-http://127.0.0.1:8088}
 mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs "${WANDB_DIR}"
 
 TRACKING_ARGS=()
-# [vime fix] wandb disabled - no API key
-# if [ "${USE_WANDB}" = "1" ]; then
-#    source /workspace/vime/scripts/common/wandb_ready.sh
-#    TRACKING_ARGS+=(--use-wandb)
-#    TRACKING_ARGS+=(--wandb-mode "${WANDB_MODE}")
-#    TRACKING_ARGS+=(--wandb-dir "${WANDB_DIR}")
-#    TRACKING_ARGS+=(--wandb-host "${WANDB_HOST}")
-#    TRACKING_ARGS+=(--wandb-project "${WANDB_PROJECT}")
-#    TRACKING_ARGS+=(--wandb-group "${WANDB_GROUP}")
-#    [ -n "${WANDB_KEY:-}" ] && TRACKING_ARGS+=(--wandb-key "${WANDB_KEY}")
-#    [ "${WANDB_RANDOM_SUFFIX:-1}" = "0" ] && TRACKING_ARGS+=(--disable-wandb-random-suffix)
-#    [ "${WANDB_ALWAYS_USE_TRAIN_STEP:-0}" = "1" ] && TRACKING_ARGS+=(--wandb-always-use-train-step)
-#    [ -n "${WANDB_RUN_ID:-}" ] && TRACKING_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
-#    [ "${USE_TENSORBOARD:-0}" = "1" ] && TRACKING_ARGS+=(--use-tensorboard)
-#    [ -n "${TB_PROJECT_NAME:-}" ] && TRACKING_ARGS+=(--tb-project-name "${TB_PROJECT_NAME}")
-#    [ -n "${TB_EXPERIMENT_NAME:-}" ] && TRACKING_ARGS+=(--tb-experiment-name "${TB_EXPERIMENT_NAME}")
-# fi
+if [ "${USE_WANDB}" = "1" ]; then
+   source /workspace/vime/scripts/common/wandb_ready.sh
+   assert_wandb_ready "${WANDB_HOST}"
+   TRACKING_ARGS+=(--use-wandb)
+   TRACKING_ARGS+=(--wandb-mode "${WANDB_MODE}")
+   TRACKING_ARGS+=(--wandb-dir "${WANDB_DIR}")
+   TRACKING_ARGS+=(--wandb-host "${WANDB_HOST}")
+   TRACKING_ARGS+=(--wandb-project "${WANDB_PROJECT}")
+   TRACKING_ARGS+=(--wandb-group "${WANDB_GROUP}")
+   [ -n "${WANDB_KEY:-}" ] && TRACKING_ARGS+=(--wandb-key "${WANDB_KEY}")
+   [ "${WANDB_RANDOM_SUFFIX:-1}" = "0" ] && TRACKING_ARGS+=(--disable-wandb-random-suffix)
+   [ "${WANDB_ALWAYS_USE_TRAIN_STEP:-0}" = "1" ] && TRACKING_ARGS+=(--wandb-always-use-train-step)
+   [ -n "${WANDB_RUN_ID:-}" ] && TRACKING_ARGS+=(--wandb-run-id "${WANDB_RUN_ID}")
+   [ "${USE_TENSORBOARD:-0}" = "1" ] && TRACKING_ARGS+=(--use-tensorboard)
+   [ -n "${TB_PROJECT_NAME:-}" ] && TRACKING_ARGS+=(--tb-project-name "${TB_PROJECT_NAME}")
+   [ -n "${TB_EXPERIMENT_NAME:-}" ] && TRACKING_ARGS+=(--tb-experiment-name "${TB_EXPERIMENT_NAME}")
+fi
 
 CKPT_ARGS=(
    --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
@@ -203,12 +200,6 @@ TOPO_ARGS=(
    --actor-num-nodes ${ACTOR_NUM_NODES}
    --actor-num-gpus-per-node ${ACTOR_NUM_GPUS_PER_NODE}
    --rollout-num-gpus ${ROLLOUT_NUM_GPUS}
-   # 端口分配器用 num_gpus_per_node 算 num_engines_per_node = num_gpus_per_node // gpus_per_engine,
-   # 再用它算 node_index。不传则停在默认 8 → 8//4=2 → 单台 16 卡机被劈成两个虚构节点 →
-   # decode 组 engine 3 落到 node_index=1,游标回退 base_port,与 engine 1 撞同一段
-   # bootstrap 区间(实测 15076-15079)→ Mooncake handshake 元数据串台 → transfer ret:-1。
-   # debug_rollout_only 走不到 --resource-layout 的同源修正(arguments.py:1809 禁止共用),必须显式传。
-   --num-gpus-per-node ${NPUS_PER_NODE}
    --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE}
 )
 
@@ -358,15 +349,8 @@ unset ASCEND_RT_VISIBLE_DEVICES HCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME TP_SOCKET_
 # engine 端口由 vime 运行时分配(rollout.py:165 从 base_port=15000 起探测空闲端口),
 # 启动前不可知且不连续 → 面板自动扫描发现。不要用 PREFILL_PORT/DECODE_PORT:
 # 那两个变量没有传给 vllm,上面没有服务在监听。
-#
-# 扫描区间和 Mooncake KV 握手端口重叠: vime 每个 engine 分配
-# port / port+1(nccl) / port+2..port+1+tp(bootstrap)。往 bootstrap 端口发
-# GET /metrics 会让 Mooncake 把 HTTP 头当二进制长度前缀读,在 vllm 日志里刷
-# "readString: too large length from socket: 8387229930220700999"(小端即 'GET /met')。
-# 故告知面板 engine 内部端口窗口宽度 = 1(nccl) + tp,发现 engine 后自动隔离。
 METRICS_DASHBOARD_PORT=${METRICS_DASHBOARD_PORT:-5000} \
 METRICS_HOST_IP="${CURRENT_IP}" \
-METRICS_ENGINE_INTERNAL_PORTS=$((1 + ROLLOUT_NUM_GPUS_PER_ENGINE)) \
    source "${VIME_ROOT}/scripts/common/start_metrics_monitor.sh"
 
 python3 train_async.py \

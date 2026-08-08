@@ -17,9 +17,19 @@
 * **per-engine 的 running/waiting 是关键诊断信号。** 实跑对比中，区分
   "KV 卡住准入"和"负载不足"靠的就是 ``waiting>0 且 running<=1`` 的占比
   （tp2 34% vs tp4 0%）。面板直接算出这个比例。
+
+* **扫描不能骚扰非 HTTP 端口。** 同一区间里还挤着 Mooncake 的 KV 握手端口
+  （vime 给每个 engine 分配 ``port`` / ``port+1`` (nccl) / ``port+2 .. port+1+tp``
+  (bootstrap)）。往握手端口发 ``GET /metrics``，Mooncake 会把 HTTP 头当成二进制
+  长度前缀读，刷出 ``readString: too large length from socket: 8387229930220700999``
+  （小端解码即 ASCII ``GET /met``）+ ``SocketHandShakePlugin: malformed json``。
+  因此扫描前先做 TCP 预探，且对"连得上但不是 vLLM metrics"的端口做负缓存
+  （连续 ``_PROBE_MAX_STRIKES`` 次判负后隔离 ``_PROBE_QUARANTINE_SEC`` 秒），
+  已发现 engine 的派生内部端口窗口直接永久隔离。
 """
 
 import argparse
+import errno
 import threading
 import time
 from collections import deque
@@ -51,7 +61,29 @@ config = {
     "discover_ports": (15000, 15200),
     "interval": 5,
     "discover": True,
+    # 显式排除的端口集合（--skip-ports）
+    "skip_ports": frozenset(),
+    # 每个 engine 在 API port 之后占用的内部端口数：nccl(1) + mooncake bootstrap(tp)。
+    # 发现 engine 后，该窗口内"连得上但不是 metrics"的端口永久隔离。
+    # 0 = 关闭该推导（只靠负缓存收敛）。
+    "engine_internal_ports": 0,
 }
+
+# 连续判负多少次后隔离。>1 是为了容忍 engine 刚 bind 端口但 uvicorn 还没能
+# 在 probe 超时内应答的窗口 —— 真 engine 只会短暂落在这里，不会被永久误杀。
+_PROBE_MAX_STRIKES = 3
+# 隔离时长。给 engine 重启后端口复用留出重新发现的机会，同时把噪音摊薄到
+# 每端口每 10 分钟最多 _PROBE_MAX_STRIKES 次。
+_PROBE_QUARANTINE_SEC = 600.0
+# 探测超时。给得比 0.25s 宽是为了不把「活着但慢」的 engine 误判为非 metrics 端点。
+# 绝大多数端口是 connection-refused 立即返回，不吃满超时；只有 listen 着却不应答
+# 的端口(Mooncake 握手口)才会吃满，而它们会被负缓存收敛掉。
+_PROBE_HTTP_TIMEOUT = 1.0
+
+# port -> 连续判负次数
+_probe_strikes: dict[int, int] = {}
+# port -> 隔离到期时间戳；float("inf") = 永久（已确认是 engine 的内部端口）
+_probe_quarantine: dict[int, float] = {}
 
 
 def parse_prometheus_metrics(text: str) -> dict:
@@ -77,10 +109,16 @@ def parse_prometheus_metrics(text: str) -> dict:
     return metrics
 
 
+# engine 端点一律直连：它们在本机/局域网上，绝不能走 http_proxy。
+# 若继承了带 http_proxy 的环境，所有探测都会变成经代理的统一超时 ——
+# 既抓不到 metrics，又会让端口判负逻辑失去意义（真 engine 也被判负）。
+_NO_PROXY = {"http": None, "https": None}
+
+
 def fetch_metrics(url: str, timeout: float = 2.0) -> dict | None:
     """返回 None 表示端点不可达（区别于「可达但全零」）。"""
     try:
-        resp = requests.get(url, timeout=timeout)
+        resp = requests.get(url, timeout=timeout, proxies=_NO_PROXY)
         if resp.status_code == 200:
             return parse_prometheus_metrics(resp.text)
     except Exception:
@@ -88,23 +126,129 @@ def fetch_metrics(url: str, timeout: float = 2.0) -> dict | None:
     return None
 
 
+def _nobody_listening(exc: BaseException) -> bool:
+    """异常是否表示「端口上没人 listen」（区别于「有人但不说 HTTP」）。
+
+    这个区分决定了要不要记 strike：没人 listen 是 engine 还没起来的正常路径
+    （engine 是训练启动后才陆续 bind 的），必须每轮重试，否则晚起的 engine 永远
+    发现不了；有人 listen 却不给合法 HTTP 应答，才是需要负缓存的骚扰源。
+    """
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True  # SYN 没人应（端口被过滤/丢包），不是判负
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        # 连上了却不应答。实测 Mooncake 握手端口和「卡死的 vLLM engine」在这里
+        # 完全同形（都不关连接、都读超时），异常类型无法区分二者 —— 靠
+        # engine_internal_ports 推导的窗口来判定，窗口外的只做限次负缓存。
+        return False
+    no_listener = (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH)
+    # 沿 __cause__/__context__ 下钻，同时看 args —— urllib3 既会串异常链
+    # (NewConnectionError.__cause__)，也会把原始 OSError 塞进 args。
+    seen = 0
+    pending: list[BaseException] = [exc]
+    while pending and seen < 20:  # 防御异常链成环
+        cur = pending.pop()
+        seen += 1
+        if isinstance(cur, OSError) and cur.errno in no_listener:
+            return True
+        for nxt in (cur.__cause__, cur.__context__):
+            if nxt is not None:
+                pending.append(nxt)
+        for arg in getattr(cur, "args", ()):
+            if isinstance(arg, BaseException):
+                pending.append(arg)
+    return False
+
+
+def _quarantine(port: int, until: float, reason: str) -> None:
+    if port not in _probe_quarantine:
+        span = "永久" if until == float("inf") else f"{_PROBE_QUARANTINE_SEC:.0f}s"
+        print(f"[metrics] 端口 {port} 判定非 metrics 端点({reason})，隔离 {span}")
+    _probe_quarantine[port] = until
+
+
 def probe_engines() -> list[str]:
     """扫描端口区间，返回暴露 vLLM metrics 的 URL 列表。
 
     判据是 payload 里出现 ``vllm:`` 前缀 —— 端口区间内可能混有 Ray/router
     等其他 HTTP 服务，靠 200 状态码无法区分。
+
+    区间里还有 Mooncake 的 KV 握手端口，它们不说 HTTP：发过去的 ``GET /metrics``
+    会被当成二进制长度前缀，在 vLLM 日志里刷 ``readString: too large length``。
+    所以这里先 TCP 预探，再对判负端口做负缓存，避免每轮重复骚扰。
     """
     host = config["discover_host"]
     lo, hi = config["discover_ports"]
+    skip = config["skip_ports"]
+    internal_span = config["engine_internal_ports"]
+    now = time.time()
+
+    with _lock:
+        known_urls = [e["url"] for e in engines.values()]
+    known_ports = set()
+    for url in known_urls:
+        try:
+            known_ports.add(int(url.rsplit(":", 1)[1].split("/")[0]))
+        except (IndexError, ValueError):
+            continue
+
+    def in_engine_internal_window(port: int) -> bool:
+        """port 是否落在某个已发现 engine 的派生内部端口窗口内。
+
+        vime 的分配顺序是 API port → nccl(+1) → bootstrap(+2 .. +1+tp)，
+        所以窗口是 ``[base+1, base+internal_span]``。
+        """
+        if internal_span <= 0:
+            return False
+        return any(base < port <= base + internal_span for base in known_ports)
+
     found = []
     for port in range(lo, hi + 1):
+        if port in skip or port in known_ports:
+            continue
+
+        expiry = _probe_quarantine.get(port)
+        if expiry is not None:
+            if now < expiry:
+                continue
+            # 隔离到期，清零重新给机会（engine 重启可能复用了这个端口）
+            del _probe_quarantine[port]
+            _probe_strikes.pop(port, None)
+
         url = f"http://{host}:{port}/metrics"
         try:
-            resp = requests.get(url, timeout=0.25)
-        except Exception:
-            continue
-        if resp.status_code == 200 and "vllm:" in resp.text:
+            resp = requests.get(url, timeout=_PROBE_HTTP_TIMEOUT, proxies=_NO_PROXY)
+            is_metrics = resp.status_code == 200 and "vllm:" in resp.text
+        except Exception as exc:  # noqa: BLE001 - 旁路能力，任何异常都只做分类
+            if _nobody_listening(exc):
+                # 端口空着：engine 可能还没起来 → 清零，下轮继续探
+                _probe_strikes.pop(port, None)
+                continue
+            # 连得上却收不到合法 HTTP 应答 —— Mooncake 握手端口就长这样
+            is_metrics = False
+
+        if is_metrics:
+            _probe_strikes.pop(port, None)
             found.append(url)
+            # 立刻纳入 known_ports：端口是升序扫的，engine 的 API port 一定排在
+            # 它自己的 nccl/bootstrap 端口之前，所以本轮后续就能识别出内部端口，
+            # 不用等 collector 回填后的下一轮。
+            known_ports.add(port)
+            continue
+
+        strikes = _probe_strikes.get(port, 0) + 1
+        _probe_strikes[port] = strikes
+        if in_engine_internal_window(port):
+            # 已确认属于某个 engine 的内部端口段，不会变成 metrics 端点
+            _quarantine(port, float("inf"), "engine 内部端口")
+        elif strikes >= _PROBE_MAX_STRIKES:
+            # 注意：listen 着但不应答的端口，可能是 Mooncake 握手口，也可能是
+            # 卡死的 engine —— 二者同形。日志写清原因，便于后者被人看见。
+            _quarantine(
+                port,
+                now + _PROBE_QUARANTINE_SEC,
+                f"{strikes} 次判负(端口在 listen 但未返回 vllm metrics)",
+            )
+
     return found
 
 
@@ -399,6 +543,26 @@ def api_metrics():
     return jsonify(payload)
 
 
+def _parse_port_set(spec: str) -> frozenset[int]:
+    """解析 "15002-15005,15076" 形式的端口集合。非法片段忽略（旁路能力不该因此挂掉）。"""
+    ports: set[int] = set()
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        lo, _, hi = chunk.partition("-")
+        try:
+            lo_i = int(lo)
+            hi_i = int(hi) if hi else lo_i
+        except ValueError:
+            print(f"[metrics][WARN] --skip-ports 片段无法解析，忽略: {chunk!r}")
+            continue
+        if hi_i < lo_i:
+            lo_i, hi_i = hi_i, lo_i
+        ports.update(range(lo_i, hi_i + 1))
+    return frozenset(ports)
+
+
 def main():
     p = argparse.ArgumentParser(description="vLLM Rollout Metrics Monitor (N-engine)")
     p.add_argument("--host", default="0.0.0.0")
@@ -414,10 +578,25 @@ def main():
         default="15000-15200",
         help="自动发现的端口区间，默认 15000-15200（vime base_port=15000）",
     )
+    p.add_argument(
+        "--skip-ports",
+        default="",
+        help="扫描时跳过的端口，逗号分隔，支持区间：如 15002-15005,15076-15079。"
+        "用于显式排除 Mooncake bootstrap 等非 HTTP 端口",
+    )
+    p.add_argument(
+        "--engine-internal-ports",
+        type=int,
+        default=0,
+        help="每个 engine 在 API port 之后占用的内部端口数 = 1(nccl) + tp(mooncake bootstrap)。"
+        "如 tp4 → 5。发现 engine 后自动隔离该窗口内的非 metrics 端口。0=关闭推导",
+    )
     p.add_argument("--interval", type=int, default=5)
     args = p.parse_args()
 
     config["interval"] = args.interval
+    config["engine_internal_ports"] = max(0, args.engine_internal_ports)
+    config["skip_ports"] = _parse_port_set(args.skip_ports)
 
     if args.engines.strip():
         config["discover"] = False
@@ -443,6 +622,11 @@ def main():
         if not config["discover"]
         else f"auto-discover {config['discover_host']}:{args.discover_ports}"
     )
+    if config["discover"]:
+        skipped = len(config["skip_ports"])
+        mode += f", skip={skipped} ports" if skipped else ""
+        if config["engine_internal_ports"]:
+            mode += f", engine-internal={config['engine_internal_ports']}"
     print("=" * 64)
     print("vLLM Rollout Metrics Monitor — N-engine, vLLM 0.23+")
     print("=" * 64)
