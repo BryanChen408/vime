@@ -377,6 +377,28 @@ ADDCFG_PARTS=()
 #   MoE permute 的中间张量 + workspace)。opt-level 值在上面数组处按 FEAT_OPT2 切;此处补 --moe-permute-fusion。
 #   前置已验:torch_npu 2.10.0 有 npu_moe_token_permute_with_routing_map。须验:model init 不崩 + token-faith + GDN。
 [ "${FEAT_OPT2:-0}" = "1" ] && PERF_ARGS+=(--moe-permute-fusion)
+# ─── RL profiling(默认全 OFF = baseline 逐位不变;2026-08-10,参考 verl 昇腾采集指南)───
+# PROFILE_TRAIN=1:训练侧 NPU 算子/阶段采集(torch_npu.profiler,Level1,离线解析)。
+#   PROFILE_TARGET=train_overall(整步,默认)| train_actor(actor 前反向更新)| train_log_probs(log_prob 前向)
+#   ※ NPU 同进程只允许一个活跃 profiler → 一次只采一个 target,多阶段请分多次跑。
+#   PROFILE_STEP_START/END(默认 2/4):采第 START+1..END 个 rollout;数据落
+#   ${TENSORBOARD_DIR:-outputs/profile}/<target>_rank_<N>/ 下的 *_ascend_pt 目录。
+if [ "${PROFILE_TRAIN:-0}" = "1" ]; then
+   MISC_ARGS+=(--use-pytorch-profiler --profile-target "${PROFILE_TARGET:-train_overall}"
+               --profile-step-start "${PROFILE_STEP_START:-2}" --profile-step-end "${PROFILE_STEP_END:-4}")
+   echo "[profile-train] ON target=${PROFILE_TARGET:-train_overall} steps=(${PROFILE_STEP_START:-2},${PROFILE_STEP_END:-4}]" >&2
+fi
+# PROFILE_OP=1:rollout(vLLM)侧算子级采集,经 --vllm-profiler-config 转发给 vllm serve。
+#   ※ 引擎在 140:140 的 raylet env 也要 PROFILE_OP=1(给 VLLM_RPC_TIMEOUT),所以 worker 脚本里同样设。
+#   max_iterations(默认 20)个 engine step 后自动停并落盘到 PROFILE_DIR。
+if [ "${PROFILE_OP:-0}" = "1" ]; then
+   export VLLM_RPC_TIMEOUT="${VLLM_RPC_TIMEOUT:-1800000}"
+   PROFILE_DIR="${PROFILE_DIR:-/home/docker/logs/opprof/$(date +%Y%m%d-%H%M%S)}"
+   mkdir -p "${PROFILE_DIR}"
+   _PROF_JSON="{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${PROFILE_DIR}\",\"ignore_frontend\":true,\"max_iterations\":${PROFILE_MAX_ITERS:-20},\"torch_profiler_with_stack\":false,\"torch_profiler_record_shapes\":true}"
+   VLLM_ARGS+=(--vllm-profiler-config "${_PROF_JSON}")
+   echo "[profile-op] ON dir=${PROFILE_DIR} max_iters=${PROFILE_MAX_ITERS:-20} rpc_timeout=${VLLM_RPC_TIMEOUT}" >&2
+fi
 echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
 
 # ─── 清本节点 rollout 卡残留(只清 $ASCEND_RT_VISIBLE_DEVICES 钉的卡)───

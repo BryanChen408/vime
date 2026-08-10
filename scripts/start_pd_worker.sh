@@ -41,5 +41,12 @@ export PATH="/usr/local/Ascend/driver/tools:${PATH}"
 #    调大到 60s(今早 141 的 "Connect timeout" 即此)。
 export ASCEND_CONNECT_TIMEOUT=${ASCEND_CONNECT_TIMEOUT:-60000}
 
+# ── RL profiling(rollout 侧;默认关,与 141 start_pd.sh 的开关成对使用)──
+# 要采 vLLM 引擎算子数据时,把下面三行取消注释(141 侧 start_pd.sh 也同时开 PROFILE_OP=1):
+#   引擎继承本机 raylet 环境,所以必须在这边设;训练侧的 PROFILE_TRAIN 与 140 无关,不用加。
+# export PROFILE_OP=1
+# export PROFILE_DIR=/home/docker/logs/opprof/$(date +%Y%m%d-%H%M%S)   # 落盘目录(140 本地,会自建)
+# export PROFILE_MAX_ITERS=20                                          # 每 worker 采 N 个 engine step 后自动停
+
 cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
 exec bash scripts/run-qwen36-35b-polar-multi-pd.sh

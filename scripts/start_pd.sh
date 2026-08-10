@@ -31,6 +31,10 @@ FEAT_DP_EXTERNAL_LB=0 FEAT_BALANCE_SCHED=0 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=0 \
 FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=0 FEAT_HCCL_AIV=1 \
 OPERATOR_DATA_ROOT=/home/docker/datasets/op_tasks/op_assets_kernelbench_level1 \
 OPERATOR_TASK_JSONL=/home/docker/datasets/op_tasks/op_assets_kernelbench_level1/operator_tasks.ascendc.jsonl \
+PROFILE_TRAIN=1 \
+PROFILE_TARGET=train_overall \
+PROFILE_STEP_START=2 PROFILE_STEP_END=3 \
+TENSORBOARD_DIR=/home/docker/logs/prof/$(date +%Y%m%d-%H%M%S) \
 bash scripts/run-qwen36-35b-polar-multi-pd.sh
 # ── 【当前:单算子冒烟(3_Add)】验功能正确性,不是训练 ──
 #   OPERATOR_TASK_JSONL 只决定"跑哪些算子";OPERATOR_TASKS_DIR(默认 ${OPERATOR_DATA_ROOT}/op_tasks)
@@ -46,3 +50,9 @@ bash scripts/run-qwen36-35b-polar-multi-pd.sh
 #         --out /home/docker/datasets/op_tasks/smoke_3add/operator_tasks.jsonl
 # ── 备选:跨 DP EP(DP+EP 同开)。冒烟通过 external-LB+Balance 后,把上面 FEAT_CROSS_DP_EP=0 改成 1 即可(其余不动;EP world=dp×tp=16,experts/card=256/16=16)。整行等价形式如下: ──
 # FEAT_DP_EXTERNAL_LB=1 FEAT_BALANCE_SCHED=1 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=1 FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=1 FEAT_HCCL_AIV=1 bash scripts/run-qwen36-35b-polar-minimal.sh
+# ── RL profiling 开关(默认全关;需要时把注释放到续行链里)──
+#   PROFILE_TRAIN=1                       训练侧 NPU 采集(torch_npu.profiler Level1,离线解析)
+#   PROFILE_TARGET=train_actor            train_overall(默认整步)| train_actor(前反向)| train_log_probs
+#   PROFILE_STEP_START=2 PROFILE_STEP_END=4   采第 3-4 个 rollout;落 ${TENSORBOARD_DIR:-outputs/profile}/
+#   PROFILE_OP=1                          rollout(vLLM)侧算子采集(140 的 worker 脚本也要设)
+#   注意:NPU 一次只能采一个 target;多目标分多次跑。
