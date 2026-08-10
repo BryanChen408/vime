@@ -80,3 +80,53 @@ bash tools/op_profile_collect.sh analyse "$PROFILE_DIR"
 要看"算子该不该这么慢"(算子 ≥50μs 时 vec/mac 流水线占用应 ≥80%,verl 判据),需 AI Core 指标,
 当前 wrapper 写死关闭(torch_npu_profiler.py:`aic_metrics=AiCMetrics.AiCoreNone`)。需要时改为
 `AiCMetrics.PipeUtilization` 重采(数据量与开销上升,`max_iterations` 要调小)。先按默认跑通再决定。
+
+## RL 训练侧 Profiling(2026-08-10 新增)
+
+上文讲的是 **rollout(vLLM)侧**;本节是 **训练(Megatron)侧**,按 verl 昇腾指南的思路落在 vime 上。
+开关全在 `scripts/run-qwen36-35b-polar-multi-pd.sh`(env 驱动,默认全关 = baseline 逐位不变)。
+
+### 用法
+
+```bash
+# start_pd.sh 续行链里加(或 export 后再跑):
+PROFILE_TRAIN=1 \
+PROFILE_TARGET=train_actor \        # train_overall(默认,整步)| train_actor(前反向更新)| train_log_probs(log_prob 前向)
+PROFILE_STEP_START=2 PROFILE_STEP_END=4 \   # 采第 3~4 个 rollout(左开右闭)
+TENSORBOARD_DIR=/home/docker/logs/prof/$(date +%Y%m%d-%H%M%S) \   # 可选;缺省 outputs/profile
+bash scripts/start_pd.sh
+```
+
+rollout 侧同跑就再加 `PROFILE_OP=1`(140 的 `start_pd_worker.sh` 里也要加,引擎继承 raylet env)。
+
+### 落点与产物
+
+- 代码:`vime/utils/profile_utils.py`(`TrainProfiler`)+ `vime/backends/megatron_utils/actor.py` 的阶段注入。
+- 每个训练 rank 一份:`${TENSORBOARD_DIR:-outputs/profile}/<target>_rank_<N>/.../<host>_<pid>_<ts>_ascend_pt/`。
+- 离线解析(采集时 `analyse_flag=False`,不在线解析):
+  ```python
+  import torch_npu
+  torch_npu.profiler.profiler.analyse(profiler_path="<ascend_pt 的上一级目录>")
+  ```
+  或用 MindStudio Insight 直接打开。
+
+### 语义与限制(重要)
+
+1. **NPU 同一进程只允许一个活跃 profiler**:`PROFILE_TARGET` 一次只给一个;多阶段分多次跑。
+   代码里做了保护(多 target 只生效第一个并打 warning)。
+2. **阶段与 rollout 的对应**:`train_actor` 每个 rollout 出现一次(actor 更新);`train_log_probs`
+   每 rollout 出现多次(ref/teacher/old_actor 各一次,按顺序 step)。schedule 按出现次数计。
+3. **wait/warmup/active 映射**:`wait=START-1, warmup=1, active=END-START, repeat=1`——
+   例:`START=2,END=4` = 跳过 2 次、第 3~4 次落盘。
+4. **`--record-memory-history` 在 NPU 上不可用**(torch.cuda 私有 API),开了会 warning 并跳过,不影响算子采集。
+5. 长序列/大 batch 下 trace 体积可能很大(数 GB/rank/步);先小步数冒烟(`START=2 END=3`)确认产物正常再加量。
+
+### 与 verl 指南的对应
+
+| verl 指南 | vime 对应 |
+|---|---|
+| `global_profiler.steps` | `PROFILE_STEP_START/END`(连续区间;离散点分多次跑) |
+| `actor.profiler.enable` + `tool_config.npu.level=level1` | `PROFILE_TRAIN=1`(Level1 写死,离线解析) |
+| `rollout.profiler` | `PROFILE_OP=1`(见上文 rollout 侧) |
+| `discrete=True` 分阶段 | `PROFILE_TARGET` 单目标 + 多次跑 |
+| `profile_token_start/end`(rollout 按 token 区间) | 未实现(vllm-ascend 0.23 的 --profiler-config 不支持 token 粒度;需要时用 `max_iterations` 控制 engine step 数) |
