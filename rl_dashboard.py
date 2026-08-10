@@ -1346,8 +1346,8 @@ th{font-size:11px;color:var(--muted);font-weight:600;text-align:left;padding:2px
 <section class=sec id=sec-sys style="--sa:#ff9f0a">
   <div class=sechead><span class=secbadge>系统资源</span></div>
   <div class=grid>
-    <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · 本机 141</h2><div id=npu></div></div>
-    <div class=card><h2>🖥️ 140 rollout 节点 · NPU / CPU / 内存</h2><div id=npu_peer></div></div>
+    <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · Actor</h2><div id=npu></div></div>
+    <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · Rollout</h2><div id=npu_peer></div></div>
     <div class=card><h2>🧠 Host CPU memory · 训练阶段</h2><div id=host></div>
         <canvas id=c_hostmem style="height:140px;margin-top:8px" title="波谷逐轮抬升=泄漏;回到同一基线=尖峰"></canvas>
         <div id=hostmem_stat class=muted style="font-size:11px;margin-top:2px"></div>
@@ -1559,8 +1559,12 @@ async function tick(){
    <div class=row style="font-size:11px"><span class=muted>策略更新</span><span>ent ${fmt(ent,3)} · kl ${fmt(kl,3)} · ppo_kl ${fmt(pk,3)} · clip ${pc(clip)} · grad ${fmt(gn,2)}</span></div>
    <div class=row style="font-size:11px"><span class=muted>生成质量</span><span>截断 ${pc(trunc)} · 重复 ${pc(rep)} · staleness ${fmt(stale,2)} · 整段 ${kK(tot)}</span></div>
    <div class=row style="font-size:11px;margin-bottom:6px"><span class=muted>各阶段(上轮)</span><span>生成 ${fmtT(el.train_wait)} · 训练 ${fmtT(el.train)} · 权重 ${fmtT(el.update_weights)}</span></div>
-   <div class=row><span>${h.used_gb} / ${h.total_gb} GB</span><span class=muted>${h.pct}% · 峰值 ${h.peak_gb} · 余量 ${h.margin_gb}G</span></div>
-   <div class=bar style="position:relative"><span style="width:${h.pct}%;background:${barColor(h.pct)}"></span><i style="position:absolute;top:0;bottom:0;left:${thrPct}%;width:2px;background:#ff3b30;opacity:.7" title="Ray OOM 阈值 ${h.thr_gb}G"></i></div>`;
+   <div class=row><span><span class=tag style="background:#0a84ff22;color:#0a84ff;margin-right:4px">141</span>${h.used_gb} / ${h.total_gb} GB</span><span class=muted>${h.pct}% · 峰值 ${h.peak_gb} · 余量 ${h.margin_gb}G</span></div>
+   <div class=bar style="position:relative"><span style="width:${h.pct}%;background:${barColor(h.pct)}"></span><i style="position:absolute;top:0;bottom:0;left:${thrPct}%;width:2px;background:#ff3b30;opacity:.7" title="Ray OOM 阈值 ${h.thr_gb}G"></i></div>
+   ${(()=>{const q=m.peer||{};if(!q.ok)return `<div class=row style="margin-top:4px"><span class=tag style="background:#bf5af222;color:#bf5af2;margin-right:4px">140</span><span class=muted>exporter 离线(${q.err||''})</span></div>`;
+     const mm=(q.data||{}).mem||{};const p2=mm.total_gb?100*mm.used_gb/mm.total_gb:0;
+     return `<div class=row style="margin-top:4px"><span><span class=tag style="background:#bf5af222;color:#bf5af2;margin-right:4px">140</span>${mm.used_gb} / ${mm.total_gb} GB</span><span class=muted>${p2.toFixed(1)}%${q.stale?` · ${q.age}s前`:''}</span></div>
+     <div class=bar><span style="width:${p2}%;background:#bf5af2"></span></div>`;})()}`;
  drawSpark('c_rspark',rd);
  // Host RAM 历史:泄漏看波谷是否抬升(尖峰会回到同一基线)
  if(h.hist_x&&h.hist_x.length>1){
