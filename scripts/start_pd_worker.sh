@@ -7,10 +7,10 @@
 # 该变量会静默变成本地未导出变量、传不进内层 bash(实测 ASCEND_RT_VISIBLE_DEVICES 就这么丢过)。
 set -euo pipefail
 
-# ── 卡位:worker 暴露 8-15 给 vime(推理8卡);4-7 归 polar agent,0-3 空闲。必须与 layout 的
-#    rollout devices "8-15" 完全一致,否则 ray 注册的卡与 layout 对不上 → select_role_bundles 报错。
-export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
-export NPUS_PER_NODE=8
+# ── 卡位:worker 暴露 4-7 给 vime(推理4卡,P=4-5/D=6-7 同 HCCS 域);0-3 归 polar agent。
+#    必须与 layout 的 rollout devices "4-7" 完全一致,否则 ray 注册的卡与 layout 对不上 → select_role_bundles 报错。
+export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
+export NPUS_PER_NODE=4
 
 # ── 网络 / 角色 ──
 export CURRENT_IP=80.5.25.140

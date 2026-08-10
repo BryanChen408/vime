@@ -1,25 +1,24 @@
-# [8卡 PD / 1P1D] 140 节点 rollout 8 卡(devices 8-15)→ prefill 4(tp4×1)+ decode 4(tp4×1)。
-# 逐字派生自 vllm_qwen36_35b_polar_single56_pd_mooncake_rollout_only.yaml,唯一实质改动:
-#   decode.num_gpus 12 → 4(16卡单机是 1P3D;双机 rollout 仅 8 卡,PD 下只能 1P1D)。
-# decode 侧 overrides 全保留(FULL_DECODE_ONLY / fused_mc2 / recompute_scheduler / npugraph_ex 都是 decode 提速项)。
-# per_engine=4 与 start_pd.sh 的 ROLLOUT_NUM_GPUS_PER_ENGINE 一致;两组各 1 个 tp4 引擎,不跨 HCCS 域。
+# [4卡 PD / 1P1D] 140 节点 rollout 4 卡(devices 4-7)→ prefill 2(tp2×1,卡4-5)+ decode 2(tp2×1,卡6-7)。
+# 派生自 vllm_qwen36_35b_polar_dual140_pd_8card.yaml,实质改动:num_gpus/num_gpus_per_engine/tp_size 4→2。
+# P/D 同处 HCCS 域 4-7(同域建链,规避跨域 RoCE/超时坑,是 4 卡下最稳的 PD 形态)。
+# per_engine=2 必须与 start_pd.sh 的 ROLLOUT_NUM_GPUS_PER_ENGINE=2 一致。
 vllm:
   - name: default
     update_weights: true
     server_groups:
       - worker_type: prefill
-        num_gpus: 4
-        num_gpus_per_engine: 4
+        num_gpus: 2
+        num_gpus_per_engine: 2
         overrides:
           disable_hybrid_kv_cache_manager: false
           enable_prefix_caching: true
           pd_topology:
             prefill:
               dp_size: 1
-              tp_size: 4
+              tp_size: 2
             decode:
               dp_size: 1
-              tp_size: 4
+              tp_size: 2
           additional_config:
             enable_flashcomm1: true
             enable_fused_mc2: 0
@@ -27,8 +26,8 @@ vllm:
             ascend_compilation_config:
               enable_npugraph_ex: false
       - worker_type: decode
-        num_gpus: 4
-        num_gpus_per_engine: 4
+        num_gpus: 2
+        num_gpus_per_engine: 2
         overrides:
           disable_hybrid_kv_cache_manager: false
           enable_prefix_caching: true
@@ -41,10 +40,10 @@ vllm:
           pd_topology:
             prefill:
               dp_size: 1
-              tp_size: 4
+              tp_size: 2
             decode:
               dp_size: 1
-              tp_size: 4
+              tp_size: 2
           additional_config:
             enable_flashcomm1: false
             enable_fused_mc2: 1

@@ -435,26 +435,67 @@ def npu_info():
     except Exception:
         return []
     cards = {}
-    # row1: | 0  910B2C | OK | 104.8  54  0 / 0 |
-    r1 = re.compile(r"\|\s*(\d+)\s+\S+\s*\|\s*\w+\s*\|\s*([\d.]+)\s+(\d+)\s")
-    # row2: | 0 | 0000:5A:00.0 | 100  0 / 0  3774 / 65536 |
-    r2 = re.compile(r"\|\s*\d+\s*\|\s*[\w:.]+\s*\|\s*(\d+)\s+\d+\s*/\s*\d+\s+(\d+)\s*/\s*(\d+)")
-    cur = None
+    module_temp = {}   # npu 模组号 -> temp(行1 提供,给同模组两个 die 共用)
+    # 行1(每模组一条;A3 第二 die 的 power 是 "-"):
+    #   老910B: | 0  910B2C | OK | 104.8  54  0 / 0 |
+    #   A3:     | 0  Ascend910 | OK | 191.7  36  0 / 0 |   /  | 0  Ascend910 | OK | -  36 ... |
+    r1 = re.compile(r"\|\s*(\d+)\s+\S+\s*\|\s*\w+\s*\|\s*(?:[\d.]+|-)\s+(\d+)\s")
+    # 行2(带 bus-id 的数据行):
+    #   老910B 单 die: | 0 | 0000:5A:00.0 | 100  0 / 0  3774 / 65536 |
+    #   A3 双 die:     | 0  0 | 0000:9D:00.0 | 0  0 / 0  40286 / 65536 |
+    #   ↑ 首格是 "模组号 die号" 两个数;有 die 号时以它(Phy-ID 0-15)作为卡号 → 面板显示 16 卡。
+    #   [2026-08-10 修复] 旧正则首格只允许一个数,在 A3 上一行都匹配不到 → 面板只显示 8 模组且 aicore/hbm 恒 0。
+    r2 = re.compile(r"\|\s*(\d+)(?:\s+(\d+))?\s*\|\s*[\w:.]+\s*\|"
+                    r"\s*([\d.]+)\s+[\d.]+\s*/\s*[\d.]+\s+(\d+)\s*/\s*(\d+)")
     for line in out.splitlines():
         m = r1.search(line)
         if m:
-            cur = int(m.group(1))
-            cards[cur] = {"id": cur, "power": float(m.group(2)),
-                          "temp": int(m.group(3)), "aicore": 0,
-                          "hbm_used": 0, "hbm_total": 0}
+            module_temp[int(m.group(1))] = int(m.group(2))
             continue
         m = r2.search(line)
-        if m and cur is not None:
-            cards[cur].update(aicore=int(m.group(1)),
-                              hbm_used=int(m.group(2)),
-                              hbm_total=int(m.group(3)))
-            cur = None
+        if m:
+            card_id = int(m.group(2)) if m.group(2) is not None else int(m.group(1))
+            cards[card_id] = {"id": card_id, "power": 0.0,
+                              "temp": module_temp.get(card_id // 2, 0),   # 模组号 = die Phy-ID // 2
+                              "aicore": int(float(m.group(3))),
+                              "hbm_used": int(m.group(4)),
+                              "hbm_total": int(m.group(5))}
     return [cards[i] for i in sorted(cards)]
+
+
+# --------------------------- peer node (140) ------------------------------
+# [2026-08-10] 跨机节点状态:140 跑 tools/node_exporter.py,这里定时拉取。
+# 无免密 ssh,故走 HTTP。拉取失败用 ≤120s 的旧缓存兜底,绝不让面板刷新被拖死。
+PEER_METRICS_URL = os.environ.get("PEER_METRICS_URL",
+                                  "http://80.5.25.140:6010/node_metrics")
+PEER = {"last_try": 0.0, "good": None, "good_ts": 0.0}
+
+
+def peer_metrics():
+    now = time.time()
+    if now - PEER["last_try"] < 5:           # 5s 内不重复拉,直接用缓存
+        if PEER["good"] is not None:
+            out = dict(PEER["good"])
+            out["age"] = round(now - PEER["good_ts"])
+            return out
+        return {"ok": False, "err": "pending"}
+    PEER["last_try"] = now
+    try:
+        import urllib.request
+        # 集群内网地址必须绕开 http_proxy 代理,否则被代理网关拦(504)。
+        # 训练脚本靠 no_proxy 环境变量;面板进程环境不一定有 → 代码里硬性绕过。
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(PEER_METRICS_URL, timeout=2.5) as r:
+            data = json.loads(r.read().decode())
+        PEER["good"] = {"ok": True, "data": data}
+        PEER["good_ts"] = now
+        return {"ok": True, "age": 0, "data": data}
+    except Exception as e:
+        if PEER["good"] is not None and now - PEER["good_ts"] < 120:
+            out = dict(PEER["good"])
+            out.update(stale=True, age=round(now - PEER["good_ts"]))
+            return out
+        return {"ok": False, "err": type(e).__name__}
 
 
 def host_mem():
@@ -1074,6 +1115,7 @@ def build_metrics():
         "rollouts": rollout_block(),
         "train": train_block(),
         "npu": npu_info(),
+        "peer": peer_metrics(),
         "host": host_mem(),
         "sglang": STATE.get("sglang", {}),
         "operators": operator_status(),
@@ -1304,7 +1346,8 @@ th{font-size:11px;color:var(--muted);font-weight:600;text-align:left;padding:2px
 <section class=sec id=sec-sys style="--sa:#ff9f0a">
   <div class=sechead><span class=secbadge>系统资源</span></div>
   <div class=grid>
-    <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%)</h2><div id=npu></div></div>
+    <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · 本机 141</h2><div id=npu></div></div>
+    <div class=card><h2>🖥️ 140 rollout 节点 · NPU / CPU / 内存</h2><div id=npu_peer></div></div>
     <div class=card><h2>🧠 Host CPU memory · 训练阶段</h2><div id=host></div>
         <canvas id=c_hostmem style="height:140px;margin-top:8px" title="波谷逐轮抬升=泄漏;回到同一基线=尖峰"></canvas>
         <div id=hostmem_stat class=muted style="font-size:11px;margin-top:2px"></div>
@@ -1484,6 +1527,17 @@ async function tick(){
  $('npu').innerHTML=m.npu.map(n=>{const hp=n.hbm_total?100*n.hbm_used/n.hbm_total:0,ap=n.aicore||0;
    return `<div class=row><b>NPU ${n.id}</b><span class=muted>AICore ${ap}% · HBM ${hp.toFixed(0)}% (${(n.hbm_used/1024).toFixed(1)}/${(n.hbm_total/1024).toFixed(0)}GB) · ${n.temp}°C</span></div>
    <div class=bar title="HBM 显存占比 ${hp.toFixed(0)}%"><span style="width:${hp}%;background:${barColor(hp)}"></span></div>`;}).join('')||'<span class=muted>npu-smi 无数据</span>';
+ // peer node (140,经 tools/node_exporter.py)
+ const pr=m.peer||{};
+ $('npu_peer').innerHTML=(()=>{
+   if(!pr.ok)return `<span class=muted>140 exporter 离线(${pr.err||'未配置'}) · 在 140 起:python3 tools/node_exporter.py</span>`;
+   const d=pr.data||{},mem=d.mem||{},cpu=d.cpu_pct==null?'—':d.cpu_pct+'%';
+   const head=`<div class=row><b>host ${d.host||'140'}</b><span class=muted>CPU ${cpu} · 内存 ${mem.used_gb??'—'}/${mem.total_gb??'—'}GB${pr.stale?` · <span style="color:#ff9f0a">数据 ${pr.age}s 前</span>`:''}</span></div>`;
+   const rows=(d.npu||[]).map(n=>{const hp=n.hbm_total?100*n.hbm_used/n.hbm_total:0,ap=n.aicore||0;
+     return `<div class=row><b>NPU ${n.id}</b><span class=muted>AICore ${ap}% · HBM ${hp.toFixed(0)}% (${(n.hbm_used/1024).toFixed(1)}/${(n.hbm_total/1024).toFixed(0)}GB) · ${n.temp}°C</span></div>
+     <div class=bar><span style="width:${hp}%;background:${barColor(hp)}"></span></div>`;}).join('');
+   return head+rows||'<span class=muted>140 无 npu 数据</span>';
+ })();
  // host
  const ph=m.phase||{};
  const pbadge=(on,txt,col)=>on?`<span class=tag style="background:${col}22;color:${col};margin-right:4px">${txt}</span>`:'';

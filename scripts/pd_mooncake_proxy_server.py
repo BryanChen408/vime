@@ -521,7 +521,7 @@ async def _send_prefill(
     return _extract_prefill_kv_transfer_params(body)
 
 
-DECODE_MAX_TOKENS_CAP = int(os.environ.get("PD_MOONCAKE_DECODE_MAX_TOKENS_CAP", "4096"))
+DECODE_MAX_TOKENS_CAP = int(os.environ.get("PD_MOONCAKE_DECODE_MAX_TOKENS_CAP", "32768"))
 
 
 def _build_decode_payload(req_data: dict[str, Any], kv_transfer_params: dict[str, Any]) -> dict[str, Any]:

@@ -391,10 +391,18 @@ echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${
 cleanup_rollout_residue() {
    local devs="${ASCEND_RT_VISIBLE_DEVICES//[[:space:]]/}"
    [ -n "$devs" ] || { echo "[cleanup] ASCEND_RT_VISIBLE_DEVICES 为空,跳过"; return 0; }
+   # [2026-08-10] PD proxy(pd_mooncake_proxy_server.py)进程名不含 "vllm",下面的 pgrep 扫不到,
+   #   会跨 run 残留并占用 ${VLLM_ROUTER_PORT}(8011)→ 新 proxy bind 失败、旧 proxy 用过期路由应答
+   #   → polar 全报 'no completions'。这里按进程名单独清(不依赖卡号匹配,它就是本节点的)。
+   local proxy_pid
+   for proxy_pid in $(pgrep -f "pd_mooncake_proxy" 2>/dev/null); do
+      echo "[cleanup] kill stale pd proxy pid=$proxy_pid"
+      kill "$proxy_pid" 2>/dev/null || true
+   done
    local pid env_devs overlap pass hit
    for pass in TERM KILL; do
       hit=0
-      for pid in $(pgrep -fi "vllm" 2>/dev/null); do
+      for pid in $(pgrep -fi "vllm|pd_mooncake_proxy" 2>/dev/null); do
          env_devs=$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null | sed -n 's/^ASCEND_RT_VISIBLE_DEVICES=//p' | head -1)
          [ -n "$env_devs" ] || continue
          overlap=$(printf '%s\n%s\n' "$devs" "$env_devs" | tr ',' '\n' | grep -E '^[0-9]+$' | sort -n | uniq -d | head -1)
