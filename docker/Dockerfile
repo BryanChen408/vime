@@ -1,178 +1,216 @@
-ARG BASE_IMAGE=vllm/vllm-openai:v0.22.0-cu129-ubuntu2404
+# Dockerfile for vLLM v0.23.0 + vLLM-Ascend v0.23.0 + Mooncake v0.3.9 PD Architecture
+# Base image: Assumes CANN 9.0.0, Python 3.11, and torch-npu are pre-installed
+
+ARG BASE_IMAGE=ascendhub.huawei.com/public-ascendhub/ascend-mindspore:24.0.RC3-centos7.6
 FROM ${BASE_IMAGE}
 
-# ======================================== Arguments =============================================
+LABEL maintainer="vime-pd-mooncake"
+LABEL description="vLLM v0.23.0 PD-Mooncake environment with Ascend NPU support"
 
-ARG PATCH_VERSION=latest
-ARG MEGATRON_COMMIT=1dcf0dafa884ad52ffb243625717a3471643e087
+# ================================
+# Environment Setup
+# ================================
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PIP_NO_CACHE_DIR=1
 
-ARG ENABLE_CUDA_13=0
-ARG TMS_CUDA_MAJOR=
+# Go mirror for China (Tsinghua)
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GO111MODULE=on
 
-# ======================================== Setup =============================================
+# Python package mirrors (optional, uncomment if needed)
+# ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# ENV PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 
-WORKDIR /root/
+# ================================
+# System Dependencies
+# ================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    wget \
+    curl \
+    ca-certificates \
+    # Mooncake dependencies
+    libboost-all-dev \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    protobuf-compiler-grpc \
+    libcurl4-openssl-dev \
+    libhiredis-dev \
+    liburing-dev \
+    libjemalloc-dev \
+    libasio-dev \
+    pkg-config \
+    patchelf \
+    libc6-dev \
+    libc-bin \
+    libyaml-cpp-dev \
+    libjsoncpp-dev \
+    libgoogle-glog-dev \
+    libibverbs-dev \
+    # vLLM dependencies
+    libssl-dev \
+    # Network tools
+    net-tools \
+    iproute2 \
+    iputils-ping \
+    netcat \
+    # Utilities
+    vim \
+    htop \
+    tmux \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# ======================================== Apt dependencies =============================================
+# ================================
+# Install Go 1.23.8 (Mooncake requirement)
+# ================================
+ARG GO_VERSION=1.23.8
+RUN echo "Installing Go ${GO_VERSION} from Tsinghua mirror..." && \
+    cd /tmp && \
+    wget --no-check-certificate https://mirrors.tuna.tsinghua.edu.cn/golang/go${GO_VERSION}.linux-arm64.tar.gz && \
+    tar -C /usr/local -xzf go${GO_VERSION}.linux-arm64.tar.gz && \
+    rm go${GO_VERSION}.linux-arm64.tar.gz
 
-# vllm/vllm-openai base is an inference image — add cu12 dev headers + cmake/git
-# so TE / apex / flash-attn source builds find cusparse.h etc.
-RUN apt-get update && apt-get install -y \
-    nvtop rsync dnsutils git cmake \
-    cuda-nvrtc-dev-12-9 cuda-nvml-dev-12-9 cuda-profiler-api-12-9 cuda-nvtx-12-9 \
-    libcusparse-dev-12-9 libcusolver-dev-12-9 libcufft-dev-12-9 libcurand-dev-12-9 \
-    libcudnn9-dev-cuda-12 && \
-    rm -rf /var/lib/apt/lists/*
+ENV PATH=/usr/local/go/bin:${PATH}
+ENV GOPATH=/root/go
 
-# vllm/vllm-openai base only ships python3; subsequent source builds invoke `python`.
-RUN ln -sf /usr/bin/python3 /usr/local/bin/python
+# Verify Go installation
+RUN go version
 
-# ====================================== Python dependencies ============================================
+# ================================
+# Install MPI (for Mooncake)
+# ================================
+ARG MPICH_VERSION=4.2.3
+RUN cd /tmp && \
+    wget https://www.mpich.org/static/downloads/${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz && \
+    tar -xzf mpich-${MPICH_VERSION}.tar.gz && \
+    cd mpich-${MPICH_VERSION} && \
+    ./configure --prefix=/usr/local --disable-fortran && \
+    make -j$(nproc) && \
+    make install && \
+    cd /tmp && rm -rf mpich-${MPICH_VERSION}*
 
-# The compilation is slow, thus should be put at top
-# TransformerEngines does not support too high FA2
-RUN MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1 --no-build-isolation
+# ================================
+# Python Dependencies
+# ================================
+COPY requirements.txt /tmp/
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
 
-# The compilation is slow, thus should be put at top
-RUN git clone https://github.com/Dao-AILab/flash-attention.git && \
-    cd flash-attention/ && git checkout fbf24f67cf7f6442c5cfb2c1057f4bfc57e72d89 && git submodule update --init && cd hopper/ && \
-    MAX_JOBS=96 python setup.py install && \
-    export python_path=`python -c "import site; print(site.getsitepackages()[0])"` && \
-    mkdir -p $python_path/flash_attn_3 && \
-    cp flash_attn_interface.py $python_path/flash_attn_3/flash_attn_interface.py && \
-    rm -rf flash-attention/
+# ================================
+# Install vLLM v0.23.0 (editable)
+# ================================
+WORKDIR /workspace
+ARG VLLM_REPO=https://github.com/ljyrj/vllm.git
+ARG VLLM_BRANCH=releases/v0.23.0
+RUN git clone --depth 1 --branch ${VLLM_BRANCH} ${VLLM_REPO} vllm && \
+    cd vllm && \
+    pip install -e . --no-build-isolation
 
-RUN pip install git+https://github.com/ISEEKYAN/mbridge.git@89eb10887887bc74853f89a4de258c0702932a1c --no-deps
+# ================================
+# Install vLLM-Ascend v0.23.0 (editable)
+# ================================
+ARG VLLM_ASCEND_REPO=https://github.com/ljyrj/vllm-ascend-023.git
+ARG VLLM_ASCEND_BRANCH=vime-adapter-v023
+RUN git clone --depth 1 --branch ${VLLM_ASCEND_BRANCH} ${VLLM_ASCEND_REPO} vllm-ascend
 
-RUN pip install flash-linear-attention==0.4.1
-ARG INSTALL_FLASHQLA=0
-RUN if [ "${INSTALL_FLASHQLA}" = "1" ]; then \
-      pip install git+https://github.com/QwenLM/FlashQLA.git --no-build-isolation; \
-    else \
-      echo "Skipping FlashQLA (INSTALL_FLASHQLA=0; sm90/Hopper-only — use --qwen-gdn-backend fla)"; \
-    fi
-RUN pip install tilelang -f https://tile-ai.github.io/whl/nightly/cu128/
 
-# cublas + (cu13) cuda dev headers. The arm64 (sbsa) vllm/vllm-openai base ships
-# the cublas runtime .so but not the dev header (cublas_v2.h) / unversioned .so
-# symlink that the x86 base has; TE needs the header and its CMake only creates
-# the CUDA::cublas target when both exist. The dev pkg must match the toolkit
-# CUDA major. For cu13 the top apt block's -12-9 dev set is the wrong major, so
-# also install the -13-0 nvrtc/nvtx/etc. headers TE's nvcc build needs. Placed
-# after the slow flash-attn layers so their cache is preserved; before TE.
-RUN apt-get update && \
-    if [ "${ENABLE_CUDA_13}" = "1" ]; then \
-      apt-get install -y libcublas-dev-13-0 \
-        cuda-nvrtc-dev-13-0 cuda-nvtx-13-0 cuda-nvml-dev-13-0 cuda-profiler-api-13-0 \
-        libcusparse-dev-13-0 libcusolver-dev-13-0 libcufft-dev-13-0 libcurand-dev-13-0; \
-    else apt-get install -y libcublas-dev-12-9; fi && \
-    rm -rf /var/lib/apt/lists/*
+# Build and install (with CANN environment)
+RUN bash -c 'source /usr/local/Ascend/cann-9.0.0/set_env.sh && \
+    cd /workspace/vllm-ascend && \
+    export SOC_VERSION=ascend910_9391 && \
+    pip install -e . --no-build-isolation --no-deps'
 
-# TE does not have wheel on cuda 13 yet, thus need to install from source.
-# TE is built with --no-build-isolation, so its build deps must be pre-installed;
-# install the set TE's release_v2.10 CI uses (wheel packaging ninja pybind11).
-# nvidia-mathdx is left unpinned (as in TE CI): 26.6.0 is x86-only, arm64 (sbsa)
-# max is 25.6.0, and TE release_v2.10 does not pin or reference it (it links plain
-# CUDA::cublas), so the resolver picking the per-arch latest is safe.
-RUN if [ "${ENABLE_CUDA_13}" = "1" ]; then \
-      pip install nvidia-mathdx pybind11 ninja wheel packaging && \
-      pip -v install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.10; \
-    else \
-      pip -v install --no-build-isolation "transformer_engine[pytorch]==2.10.0"; \
-    fi
+# Fix RPATH for cmake 4.4.0 bug (if needed)
+RUN patchelf --set-rpath '$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib' \
+    /workspace/vllm-ascend/vllm_ascend/vllm_ascend_C.*.so 2>/dev/null || true
 
-RUN NVCC_APPEND_FLAGS="--threads 4" \
-  pip -v install --disable-pip-version-check --no-cache-dir \
-  --no-build-isolation \
-  --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git@10417aceddd7d5d05d7cbf7b0fc2daad1105f8b4
+# Set VLLM_VERSION for patch compatibility
+ENV VLLM_VERSION=0.23.0
 
-RUN git clone https://github.com/NVIDIA/Megatron-LM.git --recursive && \
-    cd Megatron-LM && git checkout ${MEGATRON_COMMIT}
+# ================================
+# Install yalantinglibs (Mooncake dependency)
+# ================================
+ARG YALANTINGLIBS_VERSION=0.5.7
+RUN cd /tmp && \
+    git clone --depth 1 --branch ${YALANTINGLIBS_VERSION} https://github.com/alibaba/yalantinglibs.git && \
+    cd yalantinglibs && \
+    mkdir build && cd build && \
+    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF && \
+    cmake --build . -j$(nproc) && \
+    cmake --install . && \
+    cd /tmp && rm -rf yalantinglibs
 
-# torch_memory_saver pinned to a193d9dd (upstream slime #1916). The newer commit
-# ships a multi-CUDA wheel and requires TMS_CUDA_MAJOR at build time; default it
-# to the running torch's CUDA major (slime #1924).
-RUN TMS_CUDA_MAJOR="${TMS_CUDA_MAJOR:-$(python -c 'import torch; print(torch.version.cuda.split(".")[0])')}" && \
-    export TMS_CUDA_MAJOR && \
-    pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@a193d9dd1b877d33c64a41cfb3db9f867df2d926 --no-cache-dir --force-reinstall
-RUN pip install git+https://github.com/radixark/Megatron-Bridge.git@bridge --no-deps --no-build-isolation
-RUN pip install nvidia-modelopt[torch]>=0.37.0 --no-build-isolation
+# ================================
+# Install Mooncake v0.3.9
+# ================================
+ARG MOONCAKE_VERSION=v0.3.9
+RUN cd /workspace && \
+    git clone --depth 1 --branch ${MOONCAKE_VERSION} https://github.com/kvcache-ai/Mooncake.git && \
+    cd Mooncake && \
+    git submodule update --init --recursive
 
-# This patch from masahi will be included in later Triton releases
-RUN if [ "$ENABLE_CUDA_13" = "1" ]; then \
-    (cd /root && git clone -b feat/v350_plus_8045 https://github.com/fzyzcjy/triton.git && cd triton && pip install -r python/requirements.txt && pip install --verbose -e .); \
-  fi
+# Build Mooncake with ASCEND_DIRECT
+RUN bash -c 'source /usr/local/Ascend/cann-9.0.0/set_env.sh && \
+    cd /workspace/Mooncake && \
+    mkdir -p build && cd build && \
+    cmake .. -DUSE_ASCEND_DIRECT=ON && \
+    make -j$(nproc) && \
+    make install'
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --ignore-installed PyJWT && \
-    pip install -r /tmp/requirements.txt
+# ================================
+# Install vime (if applicable)
+# ================================
+# Uncomment if vime is needed in the image
+# COPY vime /workspace/vime
+# RUN cd /workspace/vime && pip install -e .
 
-# https://github.com/pytorch/pytorch/issues/168167
-RUN pip install nvidia-cudnn-cu12==9.16.0.29
+# ================================
+# Setup CANN Environment
+# ================================
+ENV ASCEND_ROOT=/usr/local/Ascend
+ENV CANN_ROOT=${ASCEND_ROOT}/cann
+ENV CANN_TOOLKIT_ROOT=${ASCEND_ROOT}/ascend-toolkit/latest
+ENV PATH=${CANN_ROOT}/bin:${CANN_TOOLKIT_ROOT}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CANN_ROOT}/lib64:${CANN_TOOLKIT_ROOT}/lib64:${LD_LIBRARY_PATH}
+ENV PYTHONPATH=/usr/local/lib/python3.11/site-packages:${CANN_ROOT}/python/site-packages:${PYTHONPATH}
 
-# reinstall numpy 1.x for megatron
-RUN pip install "numpy<2"
+# ================================
+# Runtime Configuration
+# ================================
+# Disable wandb by default
+ENV USE_WANDB=0
 
-RUN pip install IPython
+# Set working directory
+WORKDIR /workspace
 
-# Pin vllm-router explicitly so the vllm rollout routing layer is a visible build step
-# (also in requirements.txt; pulling it here makes the layer cache-able and fail-fast).
-RUN pip install "vllm-router>=0.1.14"
+# Create necessary directories
+RUN mkdir -p /workspace/logs \
+             /workspace/output \
+             /home/docker/logs \
+             /workspace/wandb_logs
 
-RUN rm -rf /root/.cache/pip
+# ================================
+# Verification
+# ================================
+RUN echo "=== Environment Verification ===" && \
+    python3 -c "import vllm; print('vllm version:', vllm.__version__)" && \
+    python3 -c "import vllm_ascend; print('vllm_ascend: OK')" && \
+    python3 -c "import mooncake; print('mooncake: OK')" && \
+    go version && \
+    which cmake && cmake --version | head -1 && \
+    echo "=== Verification Complete ==="
 
-# ====================================== Patches ============================================
+# ================================
+# Entrypoint
+# ================================
+# Source CANN environment on container start
+RUN echo 'source /usr/local/Ascend/cann-9.0.0/set_env.sh 2>/dev/null' >> /root/.bashrc
 
-# Patch megatron BEFORE pip install -e . so any patch hunks that touch setup.py
-# or C++/CUDA extensions are picked up by the build.
-COPY docker/patch/${PATCH_VERSION}/megatron.patch /root/Megatron-LM/
-RUN cd Megatron-LM && \
-    git update-index --refresh && \
-    git apply megatron.patch --3way && \
-    if grep -R -n '^<<<<<<< ' .; then \
-      echo "Patch failed to apply cleanly. Please resolve conflicts." && \
-      exit 1; \
-    fi && \
-    rm megatron.patch && \
-    pip install -e .
-
-# Patch vLLM: skip execute_dummy_batch while the engine is asleep / being put to sleep, so a
-# colocate DP+EP rollout's staged sleep/wake weight-sync doesn't run a forward against freed KV
-# (illegal memory access at update_weights / the post-rollout sleep offload). vLLM PR #44483
-# lineage, broadened to guard on EngineCore.is_sleeping() (covers the cuMem offload window).
-# vLLM is a pip install (not a git checkout) so apply with plain `git apply` (no --3way).
-COPY docker/patch/${PATCH_VERSION}/vllm.patch /tmp/vllm.patch
-RUN VLLM_SITE="$(python3 -c 'import os, vllm; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" && \
-    cd "$VLLM_SITE" && \
-    git apply -v /tmp/vllm.patch && \
-    rm /tmp/vllm.patch
-
-# ====================================== Install main package ============================================
-
-ARG VIME_COMMIT=main
-RUN git clone https://github.com/vllm-project/vime.git /root/vime && \
-    cd /root/vime && \
-    git checkout ${VIME_COMMIT} && \
-    pip install -e . --no-deps
-
-RUN cd /root/vime/vime/backends/megatron_utils/kernels/int4_qat && \
-    pip install . --no-build-isolation
-
-# ====================================== Build-time smoke ============================================
-
-# Fail-fast import smoke + flashinfer version pin check. Catches ABI / version
-# regressions at build time instead of first GPU run.
-RUN python3 -c "\
-import vllm, vime, flashinfer; \
-from vime.backends.vllm_utils.vllm_engine import VLLMEngine; \
-print('vllm', vllm.__version__); \
-print('flashinfer', flashinfer.__version__); \
-print('VLLMEngine import ok')"
-
-# Megatron stream serialization. vllm rollout + megatron actor co-located on
-# the same GPU need this; default value causes stream-level contention.
-ENV CUDA_DEVICE_MAX_CONNECTIONS=1
-
-# Reset ENTRYPOINT inherited from vllm/vllm-openai base (`vllm serve`).
-ENTRYPOINT []
 CMD ["/bin/bash"]
