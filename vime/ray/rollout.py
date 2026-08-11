@@ -1535,6 +1535,10 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
+    # rollout_bench/* stays top-level (not under rollout/) so the benchmark block below finds it.
+    log_dict |= dict_add_prefix(
+        _compute_rollout_bench_metrics(args, samples, rollout_time), "rollout_bench/"
+    )
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
     logger.info(f"perf {rollout_id}: {log_dict}")
     rollout_bench_metrics = {k: v for k, v in log_dict.items() if k.startswith("rollout_bench/")}
@@ -1582,6 +1586,58 @@ def compute_metrics_from_samples(args, samples):
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _compute_rollout_bench_metrics(args, all_samples: list[Sample], rollout_time: float):
+    """Latency/throughput metrics from the engine's per-request timing stats.
+
+    Returns ``{}`` when the engine reported no timing data at all, so the caller's
+    ``if rollout_bench_metrics:`` guard keeps the benchmark block silent instead of
+    printing a table of zeros.
+
+    Throughput divides by *rollout_time* (wall clock), not by the sum of per-request
+    latencies: requests run concurrently, so summing them inflates the denominator
+    and understates throughput by roughly the concurrency factor.
+    """
+    if not all_samples:
+        return {}
+
+    ttfts = [s.benchmark_info.ttft_ms for s in all_samples if s.benchmark_info.ttft_ms > 0]
+    tpots = [t for s in all_samples for t in s.benchmark_info.tpot_ms]
+    itls = [t for s in all_samples for t in s.benchmark_info.itl_ms]
+    total_input_tokens = sum(s.benchmark_info.total_input_tokens for s in all_samples)
+    total_output_tokens = sum(s.benchmark_info.total_output_tokens for s in all_samples)
+
+    # Nothing usable reported (e.g. engine/backend doesn't surface timings) → stay quiet.
+    if not (ttfts or tpots or itls or total_input_tokens or total_output_tokens):
+        return {}
+
+    metrics: dict[str, float] = {}
+    if total_input_tokens:
+        metrics["total_input_tokens"] = float(total_input_tokens)
+    if total_output_tokens:
+        metrics["total_generated_tokens"] = float(total_output_tokens)
+
+    if rollout_time and rollout_time > 0:
+        metrics["request_throughput"] = len(all_samples) / rollout_time
+        if total_output_tokens:
+            metrics["output_throughput"] = total_output_tokens / rollout_time
+        if total_input_tokens or total_output_tokens:
+            metrics["total_token_throughput"] = (total_input_tokens + total_output_tokens) / rollout_time
+
+    # peak_output_token_throughput / peak_concurrent_requests are deliberately absent:
+    # both need a time-series of in-flight requests, which per-sample stats don't carry.
+    # The print block skips whichever keys are missing.
+    for name, values in (("ttft", ttfts), ("tpot", tpots), ("itl", itls)):
+        if not values:
+            continue
+        metrics[f"{name}_mean_ms"] = float(np.mean(values))
+        metrics[f"{name}_median_ms"] = float(np.median(values))
+        metrics[f"{name}_p99_ms"] = float(np.percentile(values, 99))
+        metrics[f"{name}_min_ms"] = float(np.min(values))
+        metrics[f"{name}_max_ms"] = float(np.max(values))
+
+    return metrics
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):

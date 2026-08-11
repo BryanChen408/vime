@@ -127,11 +127,65 @@ class Sample:
 
     prefix_cache_info: PrefixCacheInfo = field(default_factory=PrefixCacheInfo)
 
+    @dataclass
+    class BenchmarkInfo:
+        """Benchmark metrics from vLLM inference"""
+        ttft_ms: float = 0.0  # Time to first token (milliseconds)
+        tpot_ms: list[float] = field(default_factory=list)  # Time per output token (milliseconds)
+        itl_ms: list[float] = field(default_factory=list)  # Inter-token latency (milliseconds)
+        total_input_tokens: int = 0
+        total_output_tokens: int = 0
+        request_latency_ms: float = 0.0  # Total request latency
+
+        def add(self, meta_info: dict):
+            """累加一次 generate 调用的计时。
+
+            partial rollout 下同一个 sample 会多次调用 ``update_from_meta_info``，
+            所以这里必须累加而不是赋值（与 ``PrefixCacheInfo.add`` 一致）：
+            latency/token 求和，TTFT 取第一次的非零值（真正的首 token 延迟只发生一次）。
+
+            ``ttft_ms`` / ``tpot_ms`` / ``itl_ms`` 目前不会被填充：本版 vLLM 的响应体
+            不含计时字段，且 rollout 走非流式 post()。字段保留是为了让打印块在
+            以后能拿到真值时直接生效，不必再改结构。
+            """
+            ttft = meta_info.get("ttft_ms", 0.0) or 0.0
+            if ttft > 0 and self.ttft_ms == 0.0:
+                self.ttft_ms = ttft
+            self.tpot_ms.extend(meta_info.get("tpot_ms") or [])
+            self.itl_ms.extend(meta_info.get("itl_ms") or [])
+            self.total_input_tokens += meta_info.get("prompt_tokens", 0)
+            self.total_output_tokens += meta_info.get("completion_tokens", 0)
+            self.request_latency_ms += meta_info.get("request_latency_ms", 0.0) or 0.0
+
+        def to_dict(self):
+            return {
+                "ttft_ms": self.ttft_ms,
+                "tpot_ms": self.tpot_ms,
+                "itl_ms": self.itl_ms,
+                "total_input_tokens": self.total_input_tokens,
+                "total_output_tokens": self.total_output_tokens,
+                "request_latency_ms": self.request_latency_ms,
+            }
+
+        @staticmethod
+        def from_dict(data: dict):
+            info = Sample.BenchmarkInfo()
+            info.ttft_ms = data.get("ttft_ms", 0.0)
+            info.tpot_ms = data.get("tpot_ms", [])
+            info.itl_ms = data.get("itl_ms", [])
+            info.total_input_tokens = data.get("total_input_tokens", 0)
+            info.total_output_tokens = data.get("total_output_tokens", 0)
+            info.request_latency_ms = data.get("request_latency_ms", 0.0)
+            return info
+
+    benchmark_info: BenchmarkInfo = field(default_factory=BenchmarkInfo)
+
     def to_dict(self):
         value = self.__dict__.copy()
         value["status"] = self.status.value
         value["spec_info"] = self.spec_info.to_dict()
         value["prefix_cache_info"] = self.prefix_cache_info.to_dict()
+        value["benchmark_info"] = self.benchmark_info.to_dict()
         return value
 
     @staticmethod
@@ -140,6 +194,7 @@ class Sample:
         data["status"] = Sample.Status(data["status"])
         data["spec_info"] = Sample.SpecInfo.from_dict(data.get("spec_info", {}))
         data["prefix_cache_info"] = Sample.PrefixCacheInfo.from_dict(data.get("prefix_cache_info", {}))
+        data["benchmark_info"] = Sample.BenchmarkInfo.from_dict(data.get("benchmark_info", {}))
 
         field_names = set(Sample.__dataclass_fields__.keys())
         init_data = {k: v for k, v in data.items() if k in field_names}
@@ -169,6 +224,9 @@ class Sample:
 
         # Collect prefix cache statistics
         self.prefix_cache_info.add(meta_info=meta_info)
+
+        # Collect benchmark statistics
+        self.benchmark_info.add(meta_info=meta_info)
 
         if "weight_version" in meta_info:
             self.weight_versions.append(meta_info["weight_version"])

@@ -186,10 +186,10 @@ mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
 
 # ─── 参数分组 ───
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
-   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
+   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}
+   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
-   --save-interval 10
+   --save-interval 100
    --no-save-optim
    --megatron-to-hf-mode raw
    # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute

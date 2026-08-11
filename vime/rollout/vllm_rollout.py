@@ -5,6 +5,7 @@ import inspect
 import io
 import json
 import logging
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -330,7 +331,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         generate_body["sampling_params"] = inference_sampling_params
         gen_url = f"{base}/inference/v1/generate"
         with trace_span(sample, "vllm_mm_generate", attrs={"max_tokens": sampling_params["max_new_tokens"]}):
+            _gen_started_at = time.monotonic()
             output = await post(gen_url, generate_body, headers=headers)
+            _gen_latency_ms = (time.monotonic() - _gen_started_at) * 1000.0
     else:
         url = f"{base}/inference/v1/generate"
         payload = {
@@ -340,7 +343,9 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         }
 
         with trace_span(sample, "vllm_generate", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}) as span:
+            _gen_started_at = time.monotonic()
             output = await post(url, payload, headers=headers)
+            _gen_latency_ms = (time.monotonic() - _gen_started_at) * 1000.0
             if hasattr(span, "update"):
                 span.update(build_vllm_meta_trace_attrs(output))
 
@@ -399,6 +404,13 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     if usage:
         meta["prompt_tokens"] = usage.get("prompt_tokens", 0)
         meta["completion_tokens"] = usage.get("completion_tokens", 0)
+
+    # 客户端实测的端到端请求耗时。引擎侧不回传计时:本版 vLLM 的 GenerateResponse /
+    # ChatCompletionResponse 都没有 metrics/timing 字段(见 entrypoints/serve/disagg/protocol.py
+    # 与 openai/chat_completion/protocol.py),且这里走的是非流式 post() —— 所以 TTFT /
+    # ITL 无法从响应里得到,只有 e2e latency 可测。
+    meta["request_latency_ms"] = _gen_latency_ms
+
     sample.update_from_meta_info(args, meta)
 
     return sample
