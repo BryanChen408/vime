@@ -14,61 +14,73 @@ logger = logging.getLogger(__name__)
 
 
 class TrainProfiler:
+    """训练侧 profiling(2026-08-12 重做,照 verl mstx_profile.py 的实证模式)。
+
+    核心:不用 schedule。这版 torch_npu 的 schedule 语义反直觉(WARMUP 段也真实录制、
+    RECORD_AND_SAVE 在步边界才落盘,连踩两坑)——改为"命中目标步才建 profiler:
+    start → 跑 → step → stop",录制窗精确等于目标本身。
+    阶段 profiler 用完即停,NPU 单活跃约束天然满足 → 多个 target 可在同一 run 都采。
+    """
+
     def __init__(self, args):
         self.args = args
-        self._torch_profiler_overall = None
+        self._enabled = bool(args.use_pytorch_profiler)
+        self._targets = set(args.profile_target) if self._enabled else set()
+        # 用户语义:PROFILE_STEP_START=N → 采第 N 个 train 步(1-based)。
+        # rollout_id 是 0-based(第一轮 id=0)→ 命中区间 [START-1, END-1)。
+        self._step_lo = args.profile_step_start - 1
+        self._step_hi = args.profile_step_end - 1
+        # rank 门(verl 同款:开启但未指定 PROFILE_RANKS → 只采 rank 0)
+        self._this_rank = True
+        if self._enabled and torch.distributed.is_available() and torch.distributed.is_initialized():
+            _env = os.environ.get("PROFILE_RANKS")
+            _allow = {int(x) for x in _env.split(",") if x.strip()} if _env else {0}
+            self._this_rank = torch.distributed.get_rank() in _allow
         self._memory_profiler_overall = None
-        self._stage_profilers = {}
-
-        targets = list(args.profile_target) if args.use_pytorch_profiler else []
-        # [2026-08-10 NPU] torch_npu 同一进程只允许一个活跃 profiler;
-        # 多 target 在 NPU 上会撞 "profiler already running" → 只取第一个并告警。
-        if is_npu() and len(targets) > 1:
-            logger.warning(
-                "[profiler] NPU 只允许单个活跃 profiler,targets=%s 只生效第一个(%s)。"
-                "要采多个阶段请分多次跑。", targets, targets[0],
-            )
-            targets = targets[:1]
-
-        if args.use_pytorch_profiler and ("train_overall" in targets):
-            self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
-        for name in ("train_actor", "train_log_probs"):
-            if args.use_pytorch_profiler and name in targets:
-                self._stage_profilers[name] = _create_torch_profiler(args, name=name)
-
-        if args.record_memory_history and ("train_overall" in targets):
+        if (
+            self._enabled and self._this_rank
+            and args.record_memory_history and ("train_overall" in self._targets)
+        ):
             self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
             self._memory_profiler_overall.start()
 
     def on_init_end(self):
-        if self._torch_profiler_overall is not None:
-            self._torch_profiler_overall.start()
-        for p in self._stage_profilers.values():
-            p.start()
+        # 懒启动:不预建不预启 —— 预启会把启动/等待期也录进去(踩过)。
+        pass
+
+    def _want(self, name, rollout_id):
+        if not (self._enabled and self._this_rank):
+            return False
+        if rollout_id is None or not (self._step_lo <= rollout_id < self._step_hi):
+            return False
+        if name in self._targets:
+            return True
+        # 兼容旧 target:train_log_probs = ref/teacher/actor 三个 log_prob 阶段的集合
+        return "train_log_probs" in self._targets and name.endswith("_log_probs")
+
+    @contextmanager
+    def stage(self, name: str, rollout_id: int = None):
+        """包一个阶段/整步。命中:进入时新建 profiler 并 start,退出时 step+stop 落盘。"""
+        if not self._want(name, rollout_id):
+            yield
+            return
+        prof = _create_torch_profiler(self.args, name=name, rollout_id=rollout_id)
+        prof.start()
+        try:
+            yield
+        finally:
+            try:
+                prof.step()
+            finally:
+                prof.stop()
 
     def step(self, rollout_id: int):
-        if self._torch_profiler_overall is not None:
-            self._torch_profiler_overall.step()
-
         if (
             self._memory_profiler_overall is not None
             and ((s := self.args.memory_snapshot_num_steps) is not None)
             and (rollout_id == s - 1)
         ):
             self._memory_profiler_overall.stop()
-
-    @contextmanager
-    def stage(self, name: str):
-        """包一个训练阶段(train_actor=actor 前反向更新 / train_log_probs=log_prob 前向)。
-        schedule 由 --profile-step-start/end 驱动:每次阶段出现 step 一次。"""
-        p = self._stage_profilers.get(name)
-        if p is None:
-            yield
-            return
-        try:
-            yield
-        finally:
-            p.step()
 
     def iterate_train_actor(self, iterator):
         return _profile_simple_loop(iterator, self.args, name="train_actor")
@@ -89,55 +101,55 @@ def _profile_simple_loop(iterator, args, name):
         torch_profiler.step()
 
 
-def _create_torch_profiler(args, name):
+def _create_torch_profiler(args, name, rollout_id=None):
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    trace_dir = (
+        getattr(args, "tensorboard_dir", None)
+        or os.environ.get("TENSORBOARD_DIR")
+        or "outputs/profile"
+    )
+    worker = f"{name}_step{rollout_id}_rank_{rank}" if rollout_id is not None else f"{name}_rank_{rank}"
     if is_npu():
-        # [2026-08-10] NPU 版:走 torch_npu.profiler,才能拿到 NPU 设备侧算子数据。
-        # 参考 verl 昇腾采集指南:Level1 + 离线解析(analyse_flag=False,事后用
-        # torch_npu.profiler.profiler.analyse 或 MindStudio Insight 打开)。
+        # [2026-08-12] NPU 版:无 schedule,由 stage() 的 start/step/stop 驱动。
+        # experimental_config 照 verl mstx_profile.py:Db 导出 + 数据精简 + msprof_tx;
+        # PROFILE_LEVEL=level0/1/2(默认 level1);PROFILE_EXCLUDE_COMM=1 可排通信域降噪。
         import torch_npu
 
-        trace_dir = (
-            getattr(args, "tensorboard_dir", None)
-            or os.environ.get("TENSORBOARD_DIR")
-            or "outputs/profile"
+        _levels = {
+            "level0": torch_npu.profiler.ProfilerLevel.Level0,
+            "level1": torch_npu.profiler.ProfilerLevel.Level1,
+            "level2": torch_npu.profiler.ProfilerLevel.Level2,
+        }
+        _level = _levels.get(os.environ.get("PROFILE_LEVEL", "level1").lower(),
+                             torch_npu.profiler.ProfilerLevel.Level1)
+        _exp = dict(
+            profiler_level=_level,
+            export_type=torch_npu.profiler.ExportType.Db,
+            data_simplification=True,
+            msprof_tx=True,
         )
-        experimental_config = torch_npu.profiler._ExperimentalConfig(
-            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-        )
+        if os.environ.get("PROFILE_EXCLUDE_COMM", "0") == "1":
+            _exp["mstx_domain_exclude"] = ["communication"]
+        # 采集内容开关(照 verl contents 列表风格):PROFILE_CONTENTS="shapes,module,memory,stack"
+        # 不设 = 全关(最省体积);按需打开。stack 体积最大,慎用。
+        _contents = {x.strip() for x in os.environ.get("PROFILE_CONTENTS", "").split(",") if x.strip()}
         return torch_npu.profiler.profile(
             activities=[
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
-            schedule=torch_npu.profiler.schedule(
-                wait=max(args.profile_step_start - 1, 0),
-                warmup=1 if args.profile_step_start > 0 else 0,
-                active=args.profile_step_end - args.profile_step_start,
-                repeat=1,
-            ),
             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
-                trace_dir,
-                worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
-                analyse_flag=False,   # 离线解析,避免在线解析拖垮训练
+                trace_dir, worker_name=worker, analyse_flag=False,  # 离线解析
             ),
-            record_shapes=True,
-            with_modules=True,        # 框架层调用栈,膨胀低于 with_stack
-            with_stack=False,
-            profile_memory=False,
-            experimental_config=experimental_config,
+            record_shapes="shapes" in _contents,
+            with_modules="module" in _contents,
+            with_stack="stack" in _contents,
+            profile_memory="memory" in _contents,
+            experimental_config=torch_npu.profiler._ExperimentalConfig(**_exp),
         )
     return torch.profiler.profile(
-        schedule=torch.profiler.schedule(
-            # TODO the train_actor and train_log_probs ones may need to have different args to control step
-            wait=max(args.profile_step_start - 1, 0),
-            warmup=1 if args.profile_step_start > 0 else 0,
-            active=args.profile_step_end - args.profile_step_start,
-            repeat=1,
-        ),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            args.tensorboard_dir,
-            worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
-            use_gzip=True,
+            trace_dir, worker_name=worker, use_gzip=True,
         ),
         record_shapes=True,
         with_stack=True,

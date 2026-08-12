@@ -1232,7 +1232,14 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--profile-target",
                 type=str,
-                choices=["train_overall", "train_actor", "train_log_probs"],
+                choices=[
+                    "train_overall",      # 整个 train 步
+                    "train_actor",        # actor 前向+反向更新
+                    "train_log_probs",    # 旧别名:全部 log_prob 阶段(ref/teacher/actor 三个的集合)
+                    "ref_log_probs",      # 细分:ref 模型的 log_prob 前向
+                    "teacher_log_probs",  # 细分:teacher(OPD)的 log_prob 前向
+                    "actor_log_probs",    # 细分:old_actor 的 log_prob 前向
+                ],
                 default=["train_overall"],
                 nargs="+",
             )
