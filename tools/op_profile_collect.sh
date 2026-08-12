@@ -23,9 +23,9 @@ _default_ports() { echo "${@:-15000}"; }
 case "${ACTION}" in
   check)
     for p in $(_default_ports "$@"); do
-      code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://${HOST}:${p}/start_profile" || echo 000)
+      code=$(curl -s --noproxy "*" -o /dev/null -w '%{http_code}' -X POST "http://${HOST}:${p}/start_profile" || echo 000)
       # 立刻停掉(check 只探路由,不真采)
-      [ "${code}" = "200" ] && curl -s -o /dev/null -X POST "http://${HOST}:${p}/stop_profile" || true
+      [ "${code}" = "200" ] && curl -s --noproxy "*" -o /dev/null -X POST "http://${HOST}:${p}/stop_profile" || true
       case "${code}" in
         200) echo "[check] :${p} 路由已注册(200) — 引擎带了 --profiler-config" ;;
         404) echo "[check] :${p} 未注册(404) — 引擎启动时没带 PROFILE_OP=1,需重启" ;;
@@ -36,7 +36,7 @@ case "${ACTION}" in
     ;;
   start)
     for p in $(_default_ports "$@"); do
-      code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://${HOST}:${p}/start_profile" || echo 000)
+      code=$(curl -s --noproxy "*" -o /dev/null -w '%{http_code}' -X POST "http://${HOST}:${p}/start_profile" || echo 000)
       echo "[start] :${p} -> ${code}"
       [ "${code}" = "404" ] && echo "        (404=引擎没带 profiler 配置,用 PROFILE_OP=1 重启)" >&2
     done
@@ -44,7 +44,7 @@ case "${ACTION}" in
     ;;
   stop)
     for p in $(_default_ports "$@"); do
-      code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://${HOST}:${p}/stop_profile" || echo 000)
+      code=$(curl -s --noproxy "*" -o /dev/null -w '%{http_code}' -X POST "http://${HOST}:${p}/stop_profile" || echo 000)
       echo "[stop] :${p} -> ${code}(落盘可能耗时数分钟,勿中断)"
     done
     ;;
