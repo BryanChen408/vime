@@ -28,6 +28,7 @@ import time
 import ast
 import subprocess
 import argparse
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -428,12 +429,7 @@ def eval_block():
 
 
 # --------------------------- npu-smi ------------------------------
-def npu_info():
-    try:
-        out = subprocess.run(["npu-smi", "info"], capture_output=True,
-                             text=True, timeout=5).stdout
-    except Exception:
-        return []
+def _npu_info_parse(out):
     cards = {}
     module_temp = {}   # npu 模组号 -> temp(行1 提供,给同模组两个 die 共用)
     # 行1(每模组一条;A3 第二 die 的 power 是 "-"):
@@ -461,6 +457,33 @@ def npu_info():
                               "hbm_used": int(m.group(4)),
                               "hbm_total": int(m.group(5))}
     return [cards[i] for i in sorted(cards)]
+
+
+# [2026-08-11] npu-smi 在训练高负载下会变慢(实测 8s+,甚至分钟级),
+# 原先同步调用 + 5s 超时会静默返回 [] → 面板 NPU 空白。
+# 改成后台线程刷新 + 旧缓存兜底:请求永不阻塞,瞬时变慢显示缓存(标 stale)。
+_NPU_CACHE = {"data": [], "ts": 0.0, "refreshing": False, "ever_ok": False}
+
+
+def _npu_refresh():
+    try:
+        out = subprocess.run(["npu-smi", "info"], capture_output=True,
+                             text=True, timeout=30).stdout
+        data = _npu_info_parse(out)
+        if data:
+            _NPU_CACHE.update(data=data, ts=time.time(), ever_ok=True)
+    except Exception:
+        pass
+    finally:
+        _NPU_CACHE["refreshing"] = False
+
+
+def npu_info():
+    now = time.time()
+    if not _NPU_CACHE["refreshing"] and (now - _NPU_CACHE["ts"] > 10):
+        _NPU_CACHE["refreshing"] = True
+        threading.Thread(target=_npu_refresh, daemon=True).start()
+    return _NPU_CACHE["data"]
 
 
 # --------------------------- peer node (140) ------------------------------
