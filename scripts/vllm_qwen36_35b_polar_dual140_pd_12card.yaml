@@ -1,0 +1,59 @@
+# [12卡 PD / 2P4D] 140 节点 rollout 12 卡(devices 4-15)→ prefill 2(tp2×2,卡4-7)+ decode 4(tp2×4,卡8-15)。
+# 派生自 vllm_qwen36_35b_polar_dual140_pd_4card.yaml(1P1D 验证形态),实质改动:引擎数 1P1D→2P4D。
+# 选 2P4D 而非 1P3D 的理由(实测依据):
+#   ① prefill 吞吐缺口:p50 prompt 93K token,单 TP2 prefill 实测 ~4.8K tok/s,
+#     20 session 长上下文轮转需求 ~15K tok/s —— 1P 必排队,2P 才接近打平;
+#   ② decode 多副本抗「长生成占锅」:一条 12288 巨型生成只占 1/4 的 decode 容量
+#     (1P1D 时代是 100%,09:14 事故的根因),4 副本把单点堵死变成概率事件;
+#   ③ 12 卡整除:TP3 对 35B-A3B(256 expert/注意力头)不整除不可用;TP4 的 1P3D 要 16 卡。
+# per_engine=2 必须与 start_pd.sh 的 ROLLOUT_NUM_GPUS_PER_ENGINE=2、
+# layout 的 rollout.num_gpus_per_engine=2 一致;start_pd_worker.sh 的卡注册改 4-15/12 卡。
+vllm:
+  - name: default
+    update_weights: true
+    server_groups:
+      - worker_type: prefill
+        num_gpus: 4              # 2 个 TP2 prefill 引擎:卡 4-5 / 6-7
+        num_gpus_per_engine: 2
+        overrides:
+          disable_hybrid_kv_cache_manager: false
+          enable_prefix_caching: true
+          pd_topology:
+            prefill:
+              dp_size: 1
+              tp_size: 2
+            decode:
+              dp_size: 1
+              tp_size: 2
+          additional_config:
+            enable_flashcomm1: true
+            enable_fused_mc2: 0
+            enable_cpu_binding: true
+            ascend_compilation_config:
+              enable_npugraph_ex: false
+      - worker_type: decode
+        num_gpus: 8              # 4 个 TP2 decode 引擎:卡 8-9 / 10-11 / 12-13 / 14-15
+        num_gpus_per_engine: 2
+        overrides:
+          disable_hybrid_kv_cache_manager: false
+          enable_prefix_caching: true
+          # 必须 == 全局 262144:写小(如 131072)会让超长的 polar 会话被 decode 直接
+          # 400 拒掉(131159 run 里 176 次),session 全 ERROR 白跑。KV 按需分配,
+          # 提上限不占静态显存;KV 满了请求排队(waiting)而不是报错。
+          max_model_len: 262144
+          compilation_config:
+            cudagraph_mode: FULL_DECODE_ONLY
+          pd_topology:
+            prefill:
+              dp_size: 1
+              tp_size: 2
+            decode:
+              dp_size: 1
+              tp_size: 2
+          additional_config:
+            enable_flashcomm1: false
+            enable_fused_mc2: 1
+            enable_cpu_binding: true
+            recompute_scheduler_enable: true
+            ascend_compilation_config:
+              enable_npugraph_ex: true

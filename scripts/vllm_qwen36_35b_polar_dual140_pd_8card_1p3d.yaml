@@ -1,0 +1,56 @@
+# [8卡 PD / 1P3D] 140 节点 rollout 8 卡(devices 8-15):prefill 2(tp2×1,卡8-9)+ decode 6(tp2×3,卡10-11/12-13/14-15)。
+# 配比依据(2026-08-10 实测 131159/052057 两次 run 的引擎侧数据):
+#   prefill 有活率仅 6-20%(prefix cache 命中 66% 后需求更低),decode 100% 满载 →
+#   decode 是绝对瓶颈,prefill 1P1D 下闲置 80% → 1P3D 把 6 张卡全给 decode,容量 ≈1.8×。
+# HCCS 域:P(8-9)↔D1(10-11) 同域;P↔D2/D3 跨域 → 依赖 HCCL_INTER_HCCS_DISABLE=false
+#   + ASCEND_CONNECT_TIMEOUT=60000 + 140 无空 hccn.conf(均已固化在启动脚本,勿删)。
+# per_engine=2 与 start_pd.sh 的 ROLLOUT_NUM_GPUS_PER_ENGINE=2 一致;引擎数 4 = layout 的 vllm_dp_size。
+vllm:
+  - name: default
+    update_weights: true
+    server_groups:
+      - worker_type: prefill
+        num_gpus: 2
+        num_gpus_per_engine: 2
+        overrides:
+          disable_hybrid_kv_cache_manager: false
+          enable_prefix_caching: true
+          pd_topology:
+            prefill:
+              dp_size: 1
+              tp_size: 2
+            decode:
+              dp_size: 1
+              tp_size: 2
+          additional_config:
+            enable_flashcomm1: true
+            enable_fused_mc2: 0
+            enable_cpu_binding: true
+            ascend_compilation_config:
+              enable_npugraph_ex: false
+      - worker_type: decode
+        num_gpus: 6
+        num_gpus_per_engine: 2
+        overrides:
+          disable_hybrid_kv_cache_manager: false
+          enable_prefix_caching: true
+          # 必须 == 全局 262144:写小(如 131072)会让超长的 polar 会话被 decode 直接
+          # 400 拒掉(131159 run 里 176 次),session 全 ERROR 白跑。KV 按需分配,
+          # 提上限不占静态显存;KV 满了请求排队(waiting)而不是报错。
+          max_model_len: 262144
+          compilation_config:
+            cudagraph_mode: FULL_DECODE_ONLY
+          pd_topology:
+            prefill:
+              dp_size: 1
+              tp_size: 2
+            decode:
+              dp_size: 1
+              tp_size: 2
+          additional_config:
+            enable_flashcomm1: false
+            enable_fused_mc2: 1
+            enable_cpu_binding: true
+            recompute_scheduler_enable: true
+            ascend_compilation_config:
+              enable_npugraph_ex: true
