@@ -302,6 +302,10 @@ VLLM_ARGS=(
    # actor 与 rollout 分居不同节点、卡不重叠 → 无需 offload 腾显存
    --no-offload-train
    --no-offload-rollout
+   # renderer 多 worker(前端渲染/tokenize 并行,长 prompt 提速)。注意必须与 mm-processor-cache-gb 0 同开:
+   # vllm 校验"renderer_num_workers>1 与多模态缓存互斥"(缓存非线程安全),纯文本任务关它零损失。
+   --vllm-renderer-num-workers 4
+   --vllm-mm-processor-cache-gb 0
 )
 
 # ─── rollout 侧 PD 分离(拓扑对齐 run-qwen36-35b-polar-minimal-single-rollout-only-pd.sh)───
