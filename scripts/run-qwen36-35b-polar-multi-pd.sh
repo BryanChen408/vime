@@ -371,12 +371,17 @@ ADDCFG_PARTS=()
 #   MoE permute 的中间张量 + workspace)。opt-level 值在上面数组处按 FEAT_OPT2 切;此处补 --moe-permute-fusion。
 #   前置已验:torch_npu 2.10.0 有 npu_moe_token_permute_with_routing_map。须验:model init 不崩 + token-faith + GDN。
 [ "${FEAT_OPT2:-0}" = "1" ] && PERF_ARGS+=(--moe-permute-fusion)
-# ─── RL profiling(默认全 OFF = baseline 逐位不变;2026-08-10,参考 verl 昇腾采集指南)───
-# PROFILE_TRAIN=1:训练侧 NPU 算子/阶段采集(torch_npu.profiler,Level1,离线解析)。
-#   PROFILE_TARGET=train_overall(整步,默认)| train_actor(actor 前反向更新)| train_log_probs(log_prob 前向)
-#   ※ NPU 同进程只允许一个活跃 profiler → 一次只采一个 target,多阶段请分多次跑。
-#   PROFILE_STEP_START/END(默认 2/4):采第 START+1..END 个 rollout;数据落
-#   ${TENSORBOARD_DIR:-outputs/profile}/<target>_rank_<N>/ 下的 *_ascend_pt 目录。
+# ─── RL profiling(默认全 OFF = baseline 逐位不变;2026-08-12 重做,照 verl mstx_profile 实证模式)───
+# PROFILE_TRAIN=1:训练侧 NPU 采集。命中目标步才建 profiler(start→跑→step→stop),
+#   录制窗精确等于目标步/阶段本身,无 schedule 歧义。
+#   PROFILE_TARGET=train_overall(整步,默认)| train_actor(前反向更新)
+#                 | ref_log_probs / teacher_log_probs / actor_log_probs(细分)
+#                 | train_log_probs(旧别名=三个 log_prob 阶段的集合)
+#                 ※ 多 target 可同 run(各阶段独立临时 profiler)。
+#   PROFILE_STEP_START=N → 采第 N 个 train 步(1-based);END=M → 采到第 M-1 步止。
+#   PROFILE_RANKS="0"(默认只 rank 0);PROFILE_LEVEL=level0/1/2(默认 level1);
+#   PROFILE_EXCLUDE_COMM=1 排通信域降噪。
+#   落盘:${TENSORBOARD_DIR:-outputs/profile}/<target>_step<id>_rank<N>/.../*_ascend_pt,离线 analyse。
 if [ "${PROFILE_TRAIN:-0}" = "1" ]; then
    MISC_ARGS+=(--use-pytorch-profiler --profile-target "${PROFILE_TARGET:-train_overall}"
                --profile-step-start "${PROFILE_STEP_START:-2}" --profile-step-end "${PROFILE_STEP_END:-4}")

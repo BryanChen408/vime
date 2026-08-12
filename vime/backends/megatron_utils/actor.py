@@ -497,13 +497,14 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
-        with inverse_timer("train_wait"), timer("train"):
+        with self.prof.stage("train_overall", rollout_id):
+         with inverse_timer("train_wait"), timer("train"):
             if self.args.compute_advantages_and_returns:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("ref")
-                    with self.prof.stage("train_log_probs"):
+                    with self.prof.stage("ref_log_probs", rollout_id):
                         rollout_data.update(
                             self.compute_log_prob(
                                 data_iterator,
@@ -517,7 +518,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("teacher")
-                    with self.prof.stage("train_log_probs"):
+                    with self.prof.stage("teacher_log_probs", rollout_id):
                         rollout_data.update(
                             self.compute_log_prob(
                                 data_iterator,
@@ -547,7 +548,7 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                    with self.prof.stage("train_log_probs"):
+                    with self.prof.stage("actor_log_probs", rollout_id):
                         rollout_data.update(
                             self.compute_log_prob(
                                 data_iterator,
@@ -585,7 +586,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
-                with self.prof.stage("train_actor"):
+                with self.prof.stage("train_actor", rollout_id):
                     train(
                         rollout_id,
                         self.model,
