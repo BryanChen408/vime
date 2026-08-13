@@ -94,6 +94,34 @@ def test_post_process_rewards_returns_one_per_sample():
     assert len(rewards) == len(s)
 
 
+def test_post_process_rewards_std_floor_damps_near_tie_groups():
+    # P1-a(slime 2540e19 同款):近全同组 [1,1,1,0.99] 的 std≈0.005,无 floor 时
+    # 0.99 那条 advantage ≈ -1.73(因 0.01 分差吃满强度);STD_FLOOR=0.05 后 ÷0.05
+    # -> -0.15,比例型。大差异组不受 floor 影响。
+    args = SimpleNamespace(
+        rewards_normalization=True,
+        advantage_estimator="grpo",
+        grpo_std_normalization=True,
+        reward_key="score",
+        polar_reward_key=None,
+    )
+    s = []
+    for i, rw in enumerate([1.0, 1.0, 1.0, 0.99]):
+        s += session_result_to_samples(_session(f"s{i}", [_trace([1, 2], rw)]),
+                                       group_index=0, trajectory_index=i, reward_key="score")
+    _raw, rewards = post_process_rewards(args, s)
+    assert abs(rewards[3] - (-0.15)) < 1e-6, rewards
+    assert abs(rewards[0] - 0.05) < 1e-6, rewards
+    # 对照:组内 std=0.5 >> floor 时按原样白化([1.0, 0.0] -> torch 无偏方差下 ±1/√2)
+    s2 = []
+    s2 += session_result_to_samples(_session("hi", [_trace([1, 2], 1.0)]),
+                                    group_index=0, trajectory_index=0, reward_key="score")
+    s2 += session_result_to_samples(_session("lo", [_trace([1, 2], 0.0)]),
+                                    group_index=0, trajectory_index=1, reward_key="score")
+    _raw2, rewards2 = post_process_rewards(args, s2)
+    assert abs(rewards2[0] - 0.7071) < 1e-3 and abs(rewards2[1] + 0.7071) < 1e-3, rewards2
+
+
 def test_build_rollout_benchmark_metrics_matches_basic_benchmark_semantics():
     result = _session(
         "sbench",

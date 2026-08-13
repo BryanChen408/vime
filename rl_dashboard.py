@@ -1500,6 +1500,14 @@ async function tick(){
    ['解对/session',`${(m.solved_stats||{}).solved||0}/${(m.solved_stats||{}).total||0}`],
    ['grad_norm',fmt(last(T.grad_norm),2)],['loss',fmt(last(T.loss),4)],
    ['整段seq(K)',kK(last(R.total_len_mean))],['生成resp(K)',kK(last(R.sess_resp_len_mean))],['rollout_time(h)',fmt(last(R.rollout_time)&&last(R.rollout_time)/3600,2)],
+   // ── vllm 推理性能(140 exporter → 引擎 /metrics 聚合)──
+   ...(()=>{const eng=(((m.peer||{}).data||{}).engines)||[];
+     const agg=(key,keep)=>{let sv=0,sn=0;for(const e of eng){const s=e[key];if(s&&s.n>0&&(!keep||keep(s))){sv+=s.mean*s.n;sn+=s.n;}}return sn?sv/sn:null;};
+     const ttft=agg('ttft'), tpot=agg('tpot',s=>s.mean>0), qt=agg('queue_t');
+     const run=eng.reduce((a,e)=>a+(e.running||0),0), wait=eng.reduce((a,e)=>a+(e.waiting||0),0);
+     const fmtS=v=>v==null?'—':(v<1?(v*1000).toFixed(0)+'ms':v.toFixed(1)+'s');
+     if(!eng.length)return [['推理延迟','离线']];
+     return [['TTFT',fmtS(ttft)],['TPOT',fmtS(tpot)],['排队耗时',fmtS(qt)],['eng运行/排队',`${run}/${wait}`]];})(),
    ['turns(mean)',m.operators.mean_turns],
  ].map(([l,v])=>`<div class=kpi><div class=v>${v}</div><div class=l>${l}</div></div>`).join('');
  draw('c_reward',[S(R.reward_std,'#8b949e','std'),S(R.reward_mean,'#0a84ff','mean'),S(R.reward_completed,'#34c759','completed'),MA(R.reward_mean,5,'#ff9500','MA'+MAW)]);
@@ -1559,7 +1567,20 @@ async function tick(){
    const rows=(d.npu||[]).map(n=>{const hp=n.hbm_total?100*n.hbm_used/n.hbm_total:0,ap=n.aicore||0;
      return `<div class=row><b>NPU ${n.id}</b><span class=muted>AICore ${ap}% · HBM ${hp.toFixed(0)}% (${(n.hbm_used/1024).toFixed(1)}/${(n.hbm_total/1024).toFixed(0)}GB) · ${n.temp}°C</span></div>
      <div class=bar><span style="width:${hp}%;background:${barColor(hp)}"></span></div>`;}).join('');
-   return head+rows||'<span class=muted>140 无 npu 数据</span>';
+   // vllm 推理性能(来自 140 exporter 采的 /metrics)
+   const eng=(d.engines||[]);
+   const engRows = eng.length ? eng.map(e=>{
+     const t=e.ttft||{}, o=e.tpot||{}, q=e.queue_t||{}, ee=e.e2e||{};
+     const tpotTxt = o.mean>0 ? ` · TPOT ${o.mean}s` : '';
+     const qTxt = q.mean!=null ? ` · 排队 ${q.mean}s` : '';
+     const e2eTxt = ee.mean!=null ? ` · e2e ${ee.mean}s` : '';
+     const kv = e.kv_usage!=null ? ` · KV ${(e.kv_usage*100).toFixed(0)}%` : '';
+     const phit = e.prefix_hit!=null ? ` · 命中 ${(e.prefix_hit*100).toFixed(0)}%` : '';
+     const w = (e.waiting||0) > 0 ? ` · <span style="color:#ff9f0a">等待 ${e.waiting}</span>` : '';
+     return `<div class=row><b>eng :${e.port}</b><span class=muted>TTFT ${t.mean??'—'}s(p90 ${t.p90??'—'})${tpotTxt}${qTxt}${e2eTxt}${kv}${phit} · 运行 ${e.running??0}${w}</span></div>`;
+   }).join('') : '';
+   const engSec = engRows ? `<div class=row style="margin-top:6px"><span class=muted>── vllm 推理性能(引擎 /metrics)──</span></div>` + engRows : '';
+   return head+rows+engSec||'<span class=muted>140 无 npu 数据</span>';
  })();
  // host
  const ph=m.phase||{};

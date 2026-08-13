@@ -4,7 +4,7 @@ ACTOR_NUM_GPUS_PER_NODE=16 \
 ROLLOUT_NODE_IP=80.5.25.140 \
 ROLLOUT_NUM_GPUS=4 \
 ROLLOUT_NUM_GPUS_PER_ENGINE=2 \
-FEAT_PD_DISAGG=1 \
+FEAT_PD_DISAGG=0 \
 VLLM_PD_CONFIG=/workspace/vime/scripts/vllm_qwen36_35b_polar_dual140_pd_4card.yaml \
 RESOURCE_LAYOUT=/workspace/vime/scripts/resource_layout.dual56train57infer_pd.yaml \
 MAX_TOKENS_PER_GPU=32768 \
@@ -31,11 +31,11 @@ FEAT_DP_EXTERNAL_LB=0 FEAT_BALANCE_SCHED=0 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=0 \
 FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=0 FEAT_HCCL_AIV=1 \
 OPERATOR_DATA_ROOT=/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189 \
 OPERATOR_TASK_JSONL=/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189/operator_tasks.ascendc.jsonl \
-PROFILE_TRAIN=1 \
+PROFILE_TRAIN=0 \
 PROFILE_TARGET=train_overall \
 PROFILE_STEP_START=1 PROFILE_STEP_END=2 \
 TENSORBOARD_DIR=/home/docker/logs/prof/$(date +%Y%m%d-%H%M%S) \
-PROFILE_OP=1 \
+PROFILE_OP=0 \
 PROFILE_RANKS="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15" \
 bash scripts/run-qwen36-35b-polar-multi-pd.sh
 # ── 【当前:单算子冒烟(3_Add)】验功能正确性,不是训练 ──

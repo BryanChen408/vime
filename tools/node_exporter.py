@@ -60,6 +60,117 @@ def mem_info():
 _prev_cpu = None
 
 
+# ─── vllm 引擎指标(TTFT/TPOT/队列),2026-08-12 新增 ───
+import urllib.request
+
+_ENG_CACHE = {"ts": 0.0, "ports": []}
+# 集群内网必须绕过 http_proxy(代理网关会劫持→连接失败)
+_NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _local_ip():
+    """本机主网卡 IP(引擎绑的是节点 IP 而非 127.0.0.1,别用 loopback 探)。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("80.5.25.141", 80))   # 不真发包,只为拿到本地出口 IP
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def _discover_engine_ports():
+    """扫 15000-15220,找 /metrics 里有 vllm: 前缀的端口。60s 缓存。"""
+    now = time.time()
+    if now - _ENG_CACHE["ts"] < 60:
+        return _ENG_CACHE["ports"]
+    host = _local_ip()
+    cands = []
+    for p in range(15000, 15221):
+        try:
+            s = socket.create_connection((host, p), timeout=0.15)
+            s.close()
+            cands.append(p)
+        except Exception:
+            pass
+    ports = []
+    for p in cands:
+        try:
+            body = _NOPROXY.open(f"http://{host}:{p}/metrics", timeout=2).read().decode(errors="ignore")
+            if "vllm:" in body:
+                ports.append(p)
+        except Exception:
+            pass
+    _ENG_CACHE.update(ts=now, ports=ports)
+    return ports
+
+
+def _hist_stats(body, name):
+    """从 prometheus histogram 提取 mean/p50/p90。"""
+    msum = re.search(re.escape(name) + r'_sum[^ ]* ([\d.eE+-]+)', body)
+    mcnt = re.search(re.escape(name) + r'_count[^ ]* ([\d.eE+-]+)', body)
+    if not msum or not mcnt or float(mcnt.group(1)) <= 0:
+        return None
+    total, mean = float(mcnt.group(1)), float(msum.group(1)) / float(mcnt.group(1))
+    buckets = []
+    for m in re.finditer(re.escape(name) + r'_bucket\{[^}]*le="([\d.eE+-]+)"[^}]*\} ([\d.eE+-]+)', body):
+        buckets.append((float(m.group(1)), float(m.group(2))))
+    buckets.sort()
+
+    def q(x):
+        for le, cum in buckets:
+            if cum >= total * x:
+                return le
+        return buckets[-1][0] if buckets else 0.0
+
+    return {"mean": round(mean, 3), "p50": q(0.5), "p90": q(0.9), "n": int(total)}
+
+
+def _gauge(body, name):
+    m = re.search(re.escape(name) + r'(?:\{[^}]*\})? ([\d.eE+-]+)', body)
+    return int(float(m.group(1))) if m else 0
+
+
+def _gauge_float(body, name):
+    m = re.search(re.escape(name) + r'(?:\{[^}]*\})? ([\d.eE+-]+)', body)
+    return round(float(m.group(1)), 4) if m else None
+
+
+def _ratio(body, num, den):
+    """hits/queries 类比率;无数据返回 None。"""
+    n = re.search(re.escape(num) + r'(?:\{[^}]*\})? ([\d.eE+-]+)', body)
+    d = re.search(re.escape(den) + r'(?:\{[^}]*\})? ([\d.eE+-]+)', body)
+    if not n or not d or float(d.group(1)) <= 0:
+        return None
+    return round(float(n.group(1)) / float(d.group(1)), 4)
+
+
+def engine_metrics():
+    """抓取本机 vllm 引擎的性能指标(TTFT/TPOT/排队/e2e/KV/缓存命中)。失败静默跳过。"""
+    host = _local_ip()
+    out = []
+    for p in _discover_engine_ports():
+        try:
+            body = _NOPROXY.open(f"http://{host}:{p}/metrics", timeout=3).read().decode(errors="ignore")
+        except Exception:
+            continue
+        out.append({
+            "port": p,
+            "ttft": _hist_stats(body, "vllm:time_to_first_token_seconds"),
+            "tpot": _hist_stats(body, "vllm:request_time_per_output_token_seconds"),
+            "queue_t": _hist_stats(body, "vllm:request_queue_time_seconds"),
+            "e2e": _hist_stats(body, "vllm:e2e_request_latency_seconds"),
+            "prefill_t": _hist_stats(body, "vllm:request_prefill_time_seconds"),
+            "decode_t": _hist_stats(body, "vllm:request_decode_time_seconds"),
+            "kv_usage": _gauge_float(body, "vllm:kv_cache_usage_perc"),
+            "prefix_hit": _ratio(body, "vllm:prefix_cache_hits_total", "vllm:prefix_cache_queries_total"),
+            "running": _gauge(body, "vllm:num_requests_running"),
+            "waiting": _gauge(body, "vllm:num_requests_waiting"),
+        })
+    return out
+
+
 def cpu_pct():
     """两次抓取间 /proc/stat 差值;首次返回 None。"""
     global _prev_cpu
@@ -83,6 +194,7 @@ class H(BaseHTTPRequestHandler):
             body = json.dumps({
                 "host": socket.gethostname(), "ts": time.time(),
                 "npu": npu_info(), "cpu_pct": cpu_pct(), "mem": mem_info(),
+                "engines": engine_metrics(),
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

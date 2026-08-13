@@ -334,6 +334,9 @@ def log_rollout_data(
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
+                # per-token attempt-advantage 是 list[list|None],不能进
+                # sum(val) 的 reporter 路径(slime run 20260720_035241 踩过 TypeError)。
+                "attempt_advantage",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

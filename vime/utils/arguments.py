@@ -679,6 +679,15 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--polar-scheduler-mode", type=str, default=None)
             parser.add_argument("--rollout-max-active-sessions", type=int, default=None)
             parser.add_argument("--polar-max-active-sessions", type=int, default=None)
+            # 轨迹内逐 trace PG 权重 floor(slime 2540e19 移植;消费方
+            # vime_bridge.pg_floor + ray/rollout.py 的分母折算)。此前启动脚本一直传
+            # 这个 flag 但未定义 —— 解析 ignore_unknown_args=True 会静默吞掉,这里补上。
+            parser.add_argument("--polar-trajectory-pg-floor", type=float, default=None,
+                                help="trajectory 内每条 trace 的 PG 权重下限份额:[0,1);"
+                                     "w_i = floor+(1-K·floor)·T_i/ΣT。未设置=None(默认),"
+                                     "保持原生「轨迹级 token 加权」;0.0=纯 token 比例;"
+                                     "0.05=每条 trace 保底 5%% 权重。env "
+                                     "POLAR_TRAJECTORY_PG_FLOOR 同义(flag 优先)。")
             parser.add_argument("--rollout-release-on-postrun", action=argparse.BooleanOptionalAction, default=None)
             parser.add_argument("--rollout-min-complete-accept-fraction", type=float, default=None)
             parser.add_argument("--polar-min-complete-accept-fraction", type=float, default=None)

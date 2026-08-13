@@ -238,7 +238,7 @@ POLAR_ARGS=(
    --rollout-scheduler-mode session_pool
    --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
    --rollout-release-on-postrun
-   --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
+   --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6}"
 )
 
 # [FLOOR] 轨迹内 trace 保底权重(vime/ray/rollout.py 的 rollout_mask_sums 分母)。
@@ -294,7 +294,7 @@ VLLM_ARGS=(
    --vllm-router-port "${VLLM_ROUTER_PORT}"
    --vllm-weight-sync-mode native
    --no-vllm-weight-sync-packed
-   --vllm-gpu-memory-utilization "${VLLM_GPU_MEM_UTIL:-0.8}"
+   --vllm-gpu-memory-utilization "${VLLM_GPU_MEM_UTIL:-0.85}"
    --vllm-max-num-seqs "${VLLM_MAX_NUM_SEQS:-96}"
    --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-131072}"
    --vllm-enable-sleep-mode

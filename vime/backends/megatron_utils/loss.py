@@ -710,6 +710,41 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
+    # P3 event-level (per-attempt) credit: add the bridge-precomputed per-token
+    # additive advantage term. The bridge term is FULL response-length; under
+    # CP>1, advantages[i] is this rank's zigzag shard (same layout as
+    # log_probs/rollout_log_probs — actor.py slices those with
+    # slice_log_prob_with_cp), so the term must be sliced identically or the
+    # shape guard below never fires and the feature silently no-ops (slime run
+    # 20260720_035241: it no-opped AND still crashed the reporter downstream).
+    # Applied before OPD-KL / whitening / storage so it flows through the rest
+    # of the pipeline unchanged. Shape-checked -> fail-closed (skip) rather
+    # than risk a misaligned add.
+    attempt_adv = rollout_data.get("attempt_advantage")
+    if attempt_adv is not None:
+        _use_cp = mpu.get_context_parallel_world_size() > 1
+        for i in range(len(advantages)):
+            aa = attempt_adv[i]
+            if aa is None:
+                continue
+            if _use_cp:
+                aa = slice_log_prob_with_cp(
+                    aa,
+                    total_lengths[i],
+                    response_lengths[i],
+                    args.qkv_format,
+                    max_seq_lens[i] if args.qkv_format == "bshd" else None,
+                )
+            add = torch.tensor(aa, dtype=advantages[i].dtype, device=advantages[i].device)
+            if add.shape == advantages[i].shape:
+                advantages[i] = advantages[i] + add
+            elif not getattr(compute_advantages_and_returns, "_attempt_shape_warned", False):
+                logger.warning(
+                    "attempt_advantage shape mismatch after CP align: %s vs %s — skipped (fail-closed)",
+                    tuple(add.shape), tuple(advantages[i].shape),
+                )
+                compute_advantages_and_returns._attempt_shape_warned = True
+
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
     if args.use_opd:
         apply_opd_kl_to_advantages(

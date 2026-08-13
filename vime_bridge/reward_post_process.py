@@ -28,7 +28,15 @@ from typing import Any
 
 import torch
 
+from vime_bridge import attempt_credit
+
 logger = logging.getLogger(__name__)
+
+# P1-a: GRPO std-normalization floor(slime 侧实战踩坑后加的,移植时带过):近全同组
+# (std≈0.1 档差)会把微小 reward 差白化放大成巨优势 —— slime 实测「正确但慢的 0.82 在
+# 全 1.0 组拿到 adv≈-0.94」,即因正确受罚。除数下限 0.05(约一个 reward 阶梯档)后,
+# 小分差回到比例型信号;floor 之上的组间差异仍是满强度。
+STD_FLOOR = 0.05
 
 
 def post_process_rewards(
@@ -81,15 +89,60 @@ def post_process_rewards(
         valid_vals = vals[valid_mask]
         vals = vals - valid_vals.mean()
         if std_norm:
-            vals = vals / (valid_vals.std() + 1e-6) if len(valid_vals) > 1 else torch.zeros_like(vals)
+            vals = vals / torch.clamp(valid_vals.std(), min=STD_FLOOR) if len(valid_vals) > 1 else torch.zeros_like(vals)
         # Failed trajectories' loss_mask is already 0, but zeroing here keeps
         # their advantage out of any downstream stats/logging too.
         vals = vals * valid_mask.to(vals.dtype)
         for k, v in zip(keys, vals.tolist(), strict=True):
             normalized[k] = float(v)
 
+    # P3 event-level credit: precompute the per-token attempt-advantage term and
+    # stash it on train_metadata (consumed in vime compute_advantages_and_returns).
+    # Bridge-only write; env-gated (POLAR_ATTEMPT_CREDIT); never changes the
+    # returned trajectory rewards.
+    if attempt_credit.enabled():
+        _write_attempt_advantage(samples, key_by_sample, group_keys, traj_reward, traj_failed)
+
     rewards = [normalized[k] for k in key_by_sample]
     return raw_rewards, rewards
+
+
+def _write_attempt_advantage(
+    samples: list[Any],
+    key_by_sample: list[tuple[int, int]],
+    group_keys: dict[int, list[tuple[int, int]]],
+    traj_reward: dict[tuple[int, int], float],
+    traj_failed: dict[tuple[int, int], bool],
+) -> None:
+    """Compute the per-token attempt-advantage term and stash on train_metadata.
+    Never raises into the reward path."""
+    try:
+        # Per-group reward std (same quantity A_traj is normalized by), for scale
+        # consistency of the additive term.
+        group_std: dict[int, float] = {}
+        for keys in group_keys.values():
+            if not keys:
+                continue
+            g = keys[0][0]
+            valid = [traj_reward[k] for k in keys if not traj_failed.get(k)]
+            if len(valid) > 1:
+                group_std[g] = float(torch.tensor(valid, dtype=torch.float32).std())
+            else:
+                group_std[g] = 1.0
+        response_len = [
+            len(s.loss_mask) if getattr(s, "loss_mask", None) is not None else 0 for s in samples
+        ]
+        terms = attempt_credit.build_batch(
+            samples, key_by_sample, group_keys, group_std, response_len
+        )
+        for i, sample in enumerate(samples):
+            if terms[i] is None:
+                continue
+            if getattr(sample, "train_metadata", None) is None:
+                sample.train_metadata = {}
+            sample.train_metadata["attempt_advantage"] = terms[i]
+    except Exception:  # best-effort; never break training
+        logger.exception("attempt-advantage precompute failed")
 
 
 def _is_failed_trajectory(sample: Any) -> bool:

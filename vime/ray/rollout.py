@@ -15,6 +15,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from vime.backends.vllm_utils.vllm_config import ModelConfig, ServerGroupConfig, VllmConfig
 from vime.backends.vllm_utils.vllm_engine import VLLMEngine, _resolve_vllm_parallel_sizes
+from vime_bridge.pg_floor import floor_adjusted_denominators, polar_pg_floor
 
 # Memory-type tag strings shared with the vLLM engine's sleep/wake_up API.
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
@@ -754,6 +755,24 @@ class RolloutManager:
             rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
         train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
 
+        # POLAR_TRAJECTORY_PG_FLOOR(slime 2540e19 移植,vime_bridge/pg_floor.py):
+        # floor 设置时把逐 trace 分母从「轨迹总 token 数」换成 D_i = T_i/w_i
+        # (w_i = floor+(1-K·floor)·T_i/ΣT,轨迹内和为 1)—— 每条 trace 对轨迹损失的
+        # 贡献变为 w_i·mean_i,短 trace 保底 floor 份额不被长 trace 淹没;未设置时
+        # 保持上方原生「轨迹级 token 加权」语义不变。全 batch 切分前计算,split-invariant。
+        _pg_floor = polar_pg_floor(self.args)
+        if _pg_floor is not None:
+            train_data["rollout_mask_sums"] = floor_adjusted_denominators(
+                rollout_id_list, mask_sums_per_sample, _pg_floor
+            )
+            logger.info(
+                "POLAR_TRAJECTORY_PG_FLOOR=%s active: per-trace denominators floor-adjusted "
+                "over %d samples / %d rollouts",
+                _pg_floor,
+                len(rollout_id_list),
+                len(rollout_total_mask),
+            )
+
         # Overwrite raw_reward when available. Mixed-source batches may only
         # populate this field for a subset of samples (e.g. SWE but not code).
         if any(sample.metadata and "raw_reward" in sample.metadata for sample in samples):
@@ -775,6 +794,16 @@ class RolloutManager:
 
         if samples[0].train_metadata is not None:
             train_data["metadata"] = [sample.train_metadata for sample in samples]
+
+        # P3 event-level credit: per-token attempt-advantage precomputed by the
+        # bridge reward-post-process (present only when POLAR_ATTEMPT_CREDIT is on).
+        if any(
+            getattr(s, "train_metadata", None) and "attempt_advantage" in s.train_metadata
+            for s in samples
+        ):
+            train_data["attempt_advantage"] = [
+                (getattr(s, "train_metadata", None) or {}).get("attempt_advantage") for s in samples
+            ]
 
         if any(sample.multimodal_train_inputs is not None for sample in samples):
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
@@ -831,6 +860,7 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "attempt_advantage",
             ]:
                 if key not in data:
                     continue
