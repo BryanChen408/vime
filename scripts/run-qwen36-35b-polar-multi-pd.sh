@@ -299,6 +299,7 @@ VLLM_ARGS=(
    --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-131072}"
    --vllm-enable-sleep-mode
    --vllm-compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
+   --vllm-max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS:-16384}"
    # actor 与 rollout 分居不同节点、卡不重叠 → 无需 offload 腾显存
    --no-offload-train
    --no-offload-rollout
