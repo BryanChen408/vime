@@ -19,6 +19,7 @@ import hashlib
 import os
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -36,6 +37,11 @@ try:
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
     pass
+
+
+# 会话亲和 map(LRU)容量上限:decode 落点记这里,超限淘汰最久未用的老 session。
+# 远大于并发 session 数即可(一场 run 累计几千 session,被淘汰的都是早已结束的)。
+DECODE_AFFINITY_MAP_MAX = int(os.environ.get("PD_MOONCAKE_DECODE_AFFINITY_MAP_MAX", "8192"))
 
 
 @dataclass
@@ -62,17 +68,28 @@ class ProxyState:
         self.req_id_lock = asyncio.Lock()
         self.prefill_index = 0
         self.decode_active_tokens = [0.0 for _ in decode_clients]
+        # 会话亲和:session_id → decode 引擎下标。新 session 挑最闲落地并记此,
+        # 后续轮次粘住(prefix/KV 跨轮复用);LRU 封顶,详见 select_decode_client。
+        self.session_decode_map: OrderedDict[str, int] = OrderedDict()
 
     async def next_request_id(self) -> str:
         async with self.req_id_lock:
             return str(uuid.uuid4())
 
-    def next_prefill_client(self) -> dict[str, Any]:
+    def next_prefill_client(self, session_id: str | None = None) -> dict[str, Any]:
         if not self.prefill_clients:
             raise RuntimeError("No prefill servers available")
-        client_info = self.prefill_clients[self.prefill_index % len(self.prefill_clients)]
-        self.prefill_index += 1
-        return client_info
+        # 会话亲和(与 select_decode_client 对称):同一 session 的每轮稳定哈希到固定
+        # prefill 引擎,让它跨轮复用前缀 KV、只 prefill 增量,而不是每轮重算整段上下文。
+        # PD 分离下若 prefill 轮询,同一 session 的前缀会在多个 prefill 引擎间打散 →
+        # 落到没缓存的引擎就重灌。无 session_id(未下发 x-session-id)→ 退回原
+        # round-robin,行为逐字节不变(PD 分离正常功能零影响)。
+        if session_id:
+            idx = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % len(self.prefill_clients)
+        else:
+            idx = self.prefill_index % len(self.prefill_clients)
+            self.prefill_index += 1
+        return self.prefill_clients[idx]
 
     def calculate_request_score(
         self,
@@ -100,7 +117,16 @@ class ProxyState:
         if not self.decode_clients:
             raise RuntimeError("No decode servers available")
         if session_id:
-            idx = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % len(self.decode_clients)
+            # 负载感知的会话亲和:老 session 粘住既有落点(prefix/KV 跨轮复用);新 session
+            # 挑当前最闲的 decode 引擎再记下 —— 比纯 md5 哈希多了「落点均衡」,又不丢粘性。
+            idx = self.session_decode_map.get(session_id)
+            if idx is not None and idx < len(self.decode_clients):
+                self.session_decode_map.move_to_end(session_id)  # 刷新 LRU 新鲜度
+            else:
+                idx = min(range(len(self.decode_clients)), key=lambda i: self.decode_active_tokens[i])
+                self.session_decode_map[session_id] = idx
+                if len(self.session_decode_map) > DECODE_AFFINITY_MAP_MAX:
+                    self.session_decode_map.popitem(last=False)  # 淘汰最久未用
         else:
             idx = min(range(len(self.decode_clients)), key=lambda i: self.decode_active_tokens[i])
         self.decode_active_tokens[idx] += priority_score
@@ -637,7 +663,7 @@ async def _handle_request(api: str, request: Request):
     session_id = request.headers.get("x-session-id")
     request_id = await proxy_state.next_request_id()
 
-    prefill_client_info = proxy_state.next_prefill_client()
+    prefill_client_info = proxy_state.next_prefill_client(session_id)
     kv_transfer_params = await _send_prefill(prefill_client_info, api, req_data, request, request_id)
 
     priority_score = proxy_state.calculate_request_score(api, req_data, len(req_body))
