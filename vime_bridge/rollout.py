@@ -2239,6 +2239,19 @@ def _build_metrics(
     return metrics
 
 
+_CURVE_DIR = Path("logs/rollout_curve")
+
+
+def _curve_log(path: Path, event: dict[str, Any]) -> None:
+    """Append one rollout-progress event as JSON. Must never break a run."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
@@ -2261,6 +2274,11 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     start = time.monotonic()
     last_progress = start
 
+    curve_tag = str(getattr(args, "wandb_run_name", None) or "run")
+    curve_path = _CURVE_DIR / f"{curve_tag}_r{rollout_id}.jsonl"
+    cum_tokens = 0
+    _curve_log(curve_path, {"ev": "round_start", "rollout_id": rollout_id, "target": target})
+
     while len(data) < target:
         made_progress = False
         completed_groups = async_worker.drain_completed(
@@ -2270,6 +2288,19 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
         for completed in completed_groups:
             data.append(completed.samples)
             made_progress = True
+            cum_tokens += sum(int(getattr(s, "response_length", 0) or 0) for s in completed.samples)
+            curve_t = time.monotonic() - start
+            curve_pct = 100.0 * len(data) / target
+            _curve_log(curve_path, {
+                "ev": "drain", "t": round(curve_t, 3), "done": len(data), "target": target,
+                "pct": round(curve_pct, 1), "cum_tokens": cum_tokens,
+                "queue": async_worker.queue_size(), "group_id": completed.group_id,
+                "queued_s": round(time.monotonic() - completed.completed_at, 3),
+            })
+            logger.info(
+                "[curve] t=%.1fs %d/%d (%.0f%%) tokens=%d queue=%d",
+                curve_t, len(data), target, curve_pct, cum_tokens, async_worker.queue_size(),
+            )
 
         now = time.monotonic()
         if made_progress:
