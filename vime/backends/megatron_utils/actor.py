@@ -657,8 +657,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())
             dist.barrier(group=get_gloo_group())
 
+        # [WSYNC-DBG] 这两条夹住 get_updatable_engines_and_lock:16 个 actor 同时打这一个
+        #   单线程 RolloutManager,只有 BEFORE 没有 AFTER = 卡在 actor 邮箱排队,不是 HCCL 建组。
+        logger.info("[WSYNC-DBG] get_updatable_engines BEFORE rank=%d", dist.get_rank())
         rollout_engines, rollout_engine_lock, num_new_engines, engine_gpu_counts, engine_gpu_offsets = ray.get(
             self.rollout_manager.get_updatable_engines_and_lock.remote()
+        )
+        logger.info(
+            "[WSYNC-DBG] get_updatable_engines AFTER rank=%d n_engines=%d num_new=%d gpu_counts=%r",
+            dist.get_rank(),
+            len(rollout_engines),
+            num_new_engines,
+            list(engine_gpu_counts),
         )
 
         reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate

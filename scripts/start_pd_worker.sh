@@ -1,52 +1,61 @@
-#!/usr/bin/env bash
-# 140 (rollout+agent / ray worker) 启动。
-# 用法:先在 141 跑 `bash scripts/start_pd.sh` 等到 active=1/2,再在 140 跑本脚本。
-# 只 join ray 集群;引擎与 PD proxy 由 head(141)的 driver 远程创建。
-#
-# 用显式 export(不用 `VAR=val \` 续行链)—— 续行链一旦某行漏了结尾反斜杠,
-# 该变量会静默变成本地未导出变量、传不进内层 bash(实测 ASCEND_RT_VISIBLE_DEVICES 就这么丢过)。
-set -euo pipefail
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+CURRENT_IP=80.48.5.56  MASTER_ADDR=80.48.5.56  NNODES=2  NPUS_PER_NODE=16  SOCKET_IFNAME=enp48s3u1u1 \
+ACTOR_NUM_GPUS_PER_NODE=16 \
+ROLLOUT_NODE_IP=80.48.5.64 \
+ROLLOUT_NUM_GPUS=12 \
+ROLLOUT_NUM_GPUS_PER_ENGINE=2 \
+FEAT_PD_DISAGG=1 \
+VLLM_PD_CONFIG=/workspace/vime/scripts/vllm_qwen36_35b_polar_dual140_pd_12card.yaml \
+RESOURCE_LAYOUT=/workspace/vime/scripts/resource_layout.dual56train57infer_pd.yaml \
+MAX_TOKENS_PER_GPU=32768 \
+SEQ_LENGTH=262144 \
+ROLLOUT_MAX_CONTEXT_LEN=262144 \
+VLLM_MAX_MODEL_LEN=262144 \
+VIME_MEM_PROBE=1 \
+no_proxy=127.0.0.1,localhost,80.48.5.64,80.48.5.56,.huawei.com,local,.local \
+NO_PROXY=127.0.0.1,localhost,80.48.5.64,80.48.5.56,.huawei.com,local,.local \
+TP=2 \
+POLAR_TRAJECTORY_PG_FLOOR=0.05 \
+POLAR_ROLLOUT_URL=http://80.48.5.64:8180 \
+VLLM_ROUTER_PORT=8011 \
+FEAT_TRAIN_EXPANDABLE=1 \
+VIME_EMPTY_CACHE_PER_STEP=1 \
+POLAR_MAX_ACTIVE_SESSIONS=32 \
+TRANSFORMERS_VERBOSITY=error \
+HCCL_INTER_HCCS_DISABLE=false \
+HCCL_INTRA_ROCE_ENABLE=1 \
+HCCL_INTRA_PCIE_ENABLE=0 \
+HCCL_BUFFSIZE=512 \
+ROLLOUT_BATCH_SIZE=8  N_SAMPLES_PER_PROMPT=4  GLOBAL_BATCH_SIZE=32  NUM_ROLLOUT=100 \
+FEAT_DP_EXTERNAL_LB=0 FEAT_BALANCE_SCHED=0 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=0 \
+FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=0 FEAT_HCCL_AIV=1 \
+OPERATOR_DATA_ROOT=/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189 \
+OPERATOR_TASK_JSONL=/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189/operator_tasks.ascendc.jsonl \
+PROFILE_TRAIN=0 \
+PROFILE_TARGET=train_overall \
+PROFILE_STEP_START=1 PROFILE_STEP_END=2 \
+TENSORBOARD_DIR=/home/docker/logs/prof/$(date +%Y%m%d-%H%M%S) \
+PROFILE_OP=0 \
+PROFILE_RANKS="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15" \
+bash scripts/run-qwen36-35b-polar-multi-pd.sh
+# ── 【当前:单算子冒烟(3_Add)】验功能正确性,不是训练 ──
+#   OPERATOR_TASK_JSONL 只决定"跑哪些算子";OPERATOR_TASKS_DIR(默认 ${OPERATOR_DATA_ROOT}/op_tasks)
+#   保持全量目录不变,按 op_name 找 3_Add.py,多余文件无害。
+#   ROLLOUT_BATCH_SIZE 必须是 1:数据集只有 1 行 prompt,=2 会要两条不同的 prompt。
+#   N_SAMPLES_PER_PROMPT=4 → 同一算子 4 个并行 session,正好铺满 polar 的 4 张卡池(0-3)。
+#   验完恢复全量训练:把这 3 处改回 POLAR_MAX_ACTIVE_SESSIONS=24 /
+#   ROLLOUT_BATCH_SIZE=2 N_SAMPLES_PER_PROMPT=2 GLOBAL_BATCH_SIZE=4 NUM_ROLLOUT=200,
+#   并删掉 OPERATOR_TASK_JSONL 那行(缺省即回落到 ${OPERATOR_DATA_ROOT}/operator_tasks.jsonl 全 31 个)。
+#   单算子 jsonl 的生成方式(可复现):
+#     python3 ProRL-Agent-Server/deploy/ascend_operator/gen_ascendc_tasks.py \
+#         --benchmark-dir /home/docker/NPUKernelBench --level 1 --ops 3_Add \
+#         --out /home/docker/datasets/op_tasks/smoke_3add/operator_tasks.jsonl
+# ── 备选:跨 DP EP(DP+EP 同开)。冒烟通过 external-LB+Balance 后,把上面 FEAT_CROSS_DP_EP=0 改成 1 即可(其余不动;EP world=dp×tp=16,experts/card=256/16=16)。整行等价形式如下: ──
+# FEAT_DP_EXTERNAL_LB=1 FEAT_BALANCE_SCHED=1 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=1 FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=1 FEAT_HCCL_AIV=1 bash scripts/run-qwen36-35b-polar-minimal.sh
+# ── RL profiling 开关(默认全关;需要时把注释放到续行链里)──
+#   PROFILE_TRAIN=1                       训练侧 NPU 采集(torch_npu.profiler Level1,离线解析)
+#   PROFILE_TARGET=train_actor            train_overall(默认整步)| train_actor(前反向)| train_log_probs
+#   PROFILE_STEP_START=2 PROFILE_STEP_END=4   采第 3-4 个 rollout;落 ${TENSORBOARD_DIR:-outputs/profile}/
+#   PROFILE_OP=1                          rollout(vLLM)侧算子采集(140 的 worker 脚本也要设)
+#   注意:NPU 一次只能采一个 target;多目标分多次跑。
 
-# ── 卡位:worker 暴露 4-7 给 vime(推理4卡,P=4-5/D=6-7 同 HCCS 域);0-3 归 polar agent。
-#    必须与 layout 的 rollout devices "4-7" 完全一致,否则 ray 注册的卡与 layout 对不上 → select_role_bundles 报错。
-export ASCEND_RT_VISIBLE_DEVICES=4,5,6,7
-export NPUS_PER_NODE=4
-
-# ── 网络 / 角色 ──
-export CURRENT_IP=80.5.25.140
-export MASTER_ADDR=80.5.25.141
-export NNODES=2
-export SOCKET_IFNAME=enp48s3u1u1     # 140 上承载 80.5.25.140 的网卡;换机改这里
-
-# ── FEAT(与 head 保持一致;worker 的 raylet 环境会被远程引擎继承)──
-export FEAT_TRAIN_EXPANDABLE=1
-export VIME_EMPTY_CACHE_PER_STEP=1
-export FEAT_DP_EXTERNAL_LB=0 FEAT_BALANCE_SCHED=0 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=0
-export FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=0 FEAT_HCCL_AIV=1
-
-# ── [WSYNC 排障 2026-08-08] 与 head 的 start_pd.sh 同步,覆盖 run 脚本的 HCCL 默认 ──
-# 权重同步组跨 8-11/12-15 两个 HCCS 域;INTER_HCCS_DISABLE=true 时跨域只能走 RoCE(实测不通)→ 组 warmup 600s 超时。
-export TRANSFORMERS_VERBOSITY=error
-export HCCL_INTER_HCCS_DISABLE=false
-export HCCL_INTRA_ROCE_ENABLE=1
-export HCCL_INTRA_PCIE_ENABLE=0
-export HCCL_BUFFSIZE=512
-
-# ── [PD mooncake 修复 2026-08-08] adxl/hixl 建链两连坑(详见 memory weight-sync-hang-debug)──
-# ① hixl 取 device_ip:先读 /etc/hccn.conf,不存在才回退 hccn_tool。140 上是 0 字节空文件 →
-#    空表 → Connect PARAM_INVALID(103900)。两条防线:删空文件 + 保证 hccn_tool 可达。
-#    【需配合:mv /etc/hccn.conf /etc/hccn.conf.bak(空文件,无内容可失)】
-export PATH="/usr/local/Ascend/driver/tools:${PATH}"
-# ② 同机跨域建链实测要 ~10.1s,默认 ASCEND_CONNECT_TIMEOUT=10000 会竞态误判 timeout →
-#    调大到 60s(今早 141 的 "Connect timeout" 即此)。
-export ASCEND_CONNECT_TIMEOUT=${ASCEND_CONNECT_TIMEOUT:-60000}
-
-# ── RL profiling(rollout 侧;默认关,与 141 start_pd.sh 的开关成对使用)──
-# 要采 vLLM 引擎算子数据时,把下面三行取消注释(141 侧 start_pd.sh 也同时开 PROFILE_OP=1):
-#   引擎继承本机 raylet 环境,所以必须在这边设;训练侧的 PROFILE_TRAIN 与 140 无关,不用加。
-# export PROFILE_OP=1
-# export PROFILE_DIR=/home/docker/logs/opprof/$(date +%Y%m%d-%H%M%S)   # 落盘目录(140 本地,会自建)
-# export PROFILE_MAX_ITERS=20                                          # 每 worker 采 N 个 engine step 后自动停
-
-cd "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
-exec bash scripts/run-qwen36-35b-polar-multi-pd.sh

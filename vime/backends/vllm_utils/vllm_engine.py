@@ -332,6 +332,25 @@ def _build_mooncake_kv_transfer_config(server_args: dict[str, Any]) -> dict[str,
     }
     if is_npu():
         extra_config["use_ascend_direct"] = True
+        # [2026-08-14] ADXL 建链必需的本地 RoCE 端点资源,缺了 PD 一定跑不起来。
+        #   vllm-ascend 的 setup_ascend_local_comm_res(utils.py:568)只认这里的
+        #   ascend_local_comm_res_path,取不到就**静默 return**(:583),于是
+        #   ASCEND_LOCAL_COMM_RES 永不设置 → Mooncake 初始化 ADXL 时 getenv 拿到 NULL、
+        #   不传 adxl.LocalCommRes → Connect() 返回 adxl::PARAM_INVALID(103900,~1ms 即返回,
+        #   不是超时)→ Mooncake transfer ret=-1 → decode EngineCore 死 →
+        #   proxy preflight 永远 ready 不了 → rollout 全量 drop。全链路无一句告警。
+        #   目录里按**物理卡号**放 ub_endpoint_npu_<dev>.json(样例见 /workspace/pd_16/local_comm_res)。
+        local_comm_res_path = os.environ.get("ASCEND_LOCAL_COMM_RES_PATH")
+        if local_comm_res_path:
+            extra_config["ascend_local_comm_res_path"] = local_comm_res_path
+        elif os.environ.get("HCCL_INTRA_ROCE_ENABLE") == "1":
+            # 只有强制 RoCE 时才缺资源;默认 HCCS 路径不需要,别误报。
+            logger.warning(
+                "HCCL_INTRA_ROCE_ENABLE=1 强制节点内走 RoCE,但 ASCEND_LOCAL_COMM_RES_PATH 未设置 → "
+                "ADXL 拿不到本地 RoCE 端点资源,PD KV 传输会以 Connect status=103900(PARAM_INVALID)/"
+                "transfer ret=-1 失败。要么置 0 回落 HCCS(节点内 P/D 推荐,更快),"
+                "要么提供 ub_endpoint_npu_<物理卡号>.json 目录。"
+            )
     return {
         "kv_connector": _resolve_mooncake_connector_name(),
         "kv_buffer_device": "npu" if is_npu() else "cuda",

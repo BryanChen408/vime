@@ -443,16 +443,29 @@ def _npu_info_parse(out):
     #   [2026-08-10 修复] 旧正则首格只允许一个数,在 A3 上一行都匹配不到 → 面板只显示 8 模组且 aicore/hbm 恒 0。
     r2 = re.compile(r"\|\s*(\d+)(?:\s+(\d+))?\s*\|\s*[\w:.]+\s*\|"
                     r"\s*([\d.]+)\s+[\d.]+\s*/\s*[\d.]+\s+(\d+)\s*/\s*(\d+)")
+    last_npu_id = None   # 行1 刚给出的 NPU 号,留给紧随其后的行2 用
     for line in out.splitlines():
         m = r1.search(line)
         if m:
-            module_temp[int(m.group(1))] = int(m.group(2))
+            last_npu_id = int(m.group(1))
+            module_temp[last_npu_id] = int(m.group(2))
             continue
         m = r2.search(line)
         if m:
-            card_id = int(m.group(2)) if m.group(2) is not None else int(m.group(1))
+            if m.group(2) is not None:
+                # A3 双 die:首格是 "模组号 die号",die 的 Phy-ID(0-15)即卡号,温度按模组取。
+                card_id = int(m.group(2))
+                temp = module_temp.get(card_id // 2, 0)
+            else:
+                # [2026-08-14 修复] 单 die(910B2C 等):行2 首格是 **Chip 号**,恒为 0
+                #   —— 见 npu-smi 表头 "| Chip | Bus-Id | AICore(%) ... |",它不是卡号。
+                #   旧代码拿它当卡号 → 16 张卡全写进 cards[0],面板只剩 1 条、
+                #   且数值是最后一张卡的。卡号只在行1("| 0  910B2C | OK | ...")里,
+                #   所以这里回退到 r1 刚解析出的 NPU 号。
+                card_id = last_npu_id if last_npu_id is not None else int(m.group(1))
+                temp = module_temp.get(card_id, 0)
             cards[card_id] = {"id": card_id, "power": 0.0,
-                              "temp": module_temp.get(card_id // 2, 0),   # 模组号 = die Phy-ID // 2
+                              "temp": temp,
                               "aicore": int(float(m.group(3))),
                               "hbm_used": int(m.group(4)),
                               "hbm_total": int(m.group(5))}
@@ -490,7 +503,7 @@ def npu_info():
 # [2026-08-10] 跨机节点状态:140 跑 tools/node_exporter.py,这里定时拉取。
 # 无免密 ssh,故走 HTTP。拉取失败用 ≤120s 的旧缓存兜底,绝不让面板刷新被拖死。
 PEER_METRICS_URL = os.environ.get("PEER_METRICS_URL",
-                                  "http://80.5.25.140:6010/node_metrics")
+                                  "http://80.48.5.64:6010/node_metrics")
 PEER = {"last_try": 0.0, "good": None, "good_ts": 0.0}
 
 

@@ -1,13 +1,20 @@
-
 roles:
   actor:
-    - {node: 80.5.25.141, devices: "0-15"}
+    - {node: 80.48.5.56, devices: "0-15"}
   rollout:
-    - {node: 80.5.25.140, devices: "4-7"}
+    - {node: 80.48.5.64, devices: "4-15"}     # [2026-08-14] 12卡(4-15)→8卡(8-15):见下
   polar_reserved:
-    - {node: 80.5.25.140, devices: "0-3"}      # ← 补上
+    - {node: 80.48.5.64, devices: "0-3"}
 rollout:
-  num_gpus_per_engine: 2                 # 4 卡 → 2 个 tp2 engine(P=4-5 / D=6-7,同 HCCS 域);对应 PD 4卡 yaml
-  vllm_dp_size: 2                         # external-LB DP 组大小 = 引擎数(rollout 卡数 / num_gpus_per_engine = 4/2 = 2)。
-                                          #   仅 FEAT_DP_EXTERNAL_LB=1 时生效(基线忽略);须 == 引擎数,否则 arguments.py 报错。
-                                          #   改 num_gpus_per_engine 时此处同步改(如 TP8 → vllm_dp_size:2)。
+  num_gpus_per_engine: 2                 # 8 卡 → 4 个 tp2 engine(1P3D:P=8-9 / D=10-11,12-13,14-15)
+  vllm_dp_size: 6                        # external-LB DP 组大小 = 引擎数 = 8/2 = 4。
+                                         #   仅 FEAT_DP_EXTERNAL_LB=1 时生效;须 == 引擎数,否则 arguments.py 报错。
+                                         #   改 num_gpus_per_engine 时此处同步改(如 TP4 → vllm_dp_size:2)。
+# [2026-08-14] 为什么从 4-15(12卡)缩到 8-15(8卡):
+#   本机(910B2C)npu-smi info -t topo 显示两个 HCCS 域:0-7 和 8-15,跨域只有 SYS/PHB/PIX(PCIe),无 HCCS。
+#   旧的 4-15 让 prefill(4-7,域A)与 decode(8-15,域B)分处两域,PD 的 KV 传输必然跨域:
+#     HCCL_INTRA_ROCE_ENABLE=1 → ADXL Connect 返回 103900 PARAM_INVALID(RoCE 未配:
+#       hccn_tool -i N -ip -g 全部报 "no ip was preset",链路 UP 但无 IP)
+#     HCCL_INTRA_ROCE_ENABLE=0 → 103905 UNSUPPORTED(跨域压根没有 HCCS 链路)
+#   8-15 整体落在域 B 内,4 个引擎两两全 HCCS 可达,不需要 RoCE、不需要 ub_endpoint_npu_*.json。
+#   代价:卡 4-7 空置(0-3 已被 polar 占)。要用回 12 卡需平台侧先给 NPU 网口配 IP。

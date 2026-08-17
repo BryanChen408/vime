@@ -49,7 +49,7 @@ export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
 # torch_npu 从 ${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so 加载(libtorch_npu.so 内字符串
 #  ASCEND_CUSTOM_OPP_PATH + /op_api/lib/ + libcust_opapi.so),所以这里指到 **vendor 目录本身**。
 # 实测:设了它符号即可解析并进入 kernel(9.0.0 kernel × 9.2.0 runtime 未见加载期不兼容)。
-ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH:-/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer}
+ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH:-/usr/local/Ascend/cann-9.0.0/opp/vendors/fla_npu_transformer}
 if [ -f "${ASCEND_CUSTOM_OPP_PATH}/op_api/lib/libcust_opapi.so" ]; then
    export ASCEND_CUSTOM_OPP_PATH
    echo "[env] ASCEND_CUSTOM_OPP_PATH=${ASCEND_CUSTOM_OPP_PATH} (GDN aclnnRecomputeWUFwd)"
@@ -92,14 +92,31 @@ VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # polar profile 的推理端点指
 # PD proxy bind 在 RolloutManager 所在节点 = rollout 节点(见文件头说明),不是 head。
 VLLM_ROUTER_IP=${VLLM_ROUTER_IP:-${ROLLOUT_NODE_IP}}
 # rollout 侧 PD 拓扑:复用 PD 参考脚本那份 yaml(prefill 4 + decode 12,per_engine=4,共 16 卡)
-VLLM_PD_CONFIG=${VLLM_PD_CONFIG:-${VIME_ROOT}/scripts/vllm_qwen36_35b_polar_single56_pd_mooncake_rollout_only.yaml}
+VLLM_PD_CONFIG=${VLLM_PD_CONFIG:-}
 FEAT_PD_DISAGG=${FEAT_PD_DISAGG:-1}
 
 # ─── 环境 ───
 export PYTHONBUFFERED=16
 # 前置 site-packages = 新编 mooncake;vllm-023/vllm-ascend-023 = PD 验证过的那套(对齐 PD 参考脚本)
-export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
+# [2026-08-14] 这里**不能**再列 /workspace/vllm 与 /workspace/vllm-ascend:
+#   023 那套是 pip install -e 装的,靠 site-packages 的 __editable__ finder 提供
+#   (vllm→/workspace/vllm-023,vllm_ascend→/workspace/vllm-ascend-023)。而该 finder 是
+#   sys.meta_path.append() 注册的(finder:76)→ 排在内置 PathFinder **之后**,于是
+#   PYTHONPATH 里显式写的非 023 目录会把它整个遮蔽掉。
+#   rollout 节点(.64)上这两个非 023 目录恰好存在 → 引擎加载 vllm-ascend 的
+#   mooncake_connector(2632 行,缺 _handle_peer_requests / set_xfer_handshake_metadata_*),
+#   PD 交接握不上手:prefill 返回合法 kv_transfer_params 后 decode 永不拉 KV,
+#   proxy 的 preflight 永久挂死(timeout=None)→ 8011 不 ready → rollout 全量 drop。
+#   旧 rollout 机上没有这两个目录,遮蔽不成立,所以同样的脚本在那边是好的。
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
+# [2026-08-14] 必须 0.23.0,且必须与上面的 PYTHONPATH 配套改:
+#   /workspace/vllm-023=0.23.0(有 expert_map_manager) /workspace/vllm=0.21.0(没有);
+#   两棵 vllm-ascend 都要 0.23 的 API。vllm_ascend.utils.vllm_version_is(utils.py:610)
+#   **优先读这个 env**、而不是 vllm.__version__,于是它直接决定 patch 走哪个分支:
+#     patch_dp_device_ids.py:33  if not vllm_version_is("0.23.0"): <取 0.23 才有的符号>
+#   写 0.21.0 → 门控取反 → AttributeError: get_physical_gpu_ids_for_local_dp_rank。
+#   (0.21.0 是配 /workspace/vllm 那套错误组合时打的补丁,PYTHONPATH 修好后必须跟着回来。)
+export VLLM_VERSION=0.23.0  # 与 /workspace/vllm-023 的真实版本一致
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${CANN_TOOLKIT_ROOT}/x86_64-linux/lib64:${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${CANN_TOOLKIT_ROOT}/opp/lib64:${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH:-}"
 # Ascend 自定义 MoE 训练算子(--moe-grouped-gemm 用)。本容器两处都不存在 → ld 直接跳过、回退原生实现,

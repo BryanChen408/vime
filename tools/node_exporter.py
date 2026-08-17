@@ -7,6 +7,7 @@
 # 面板侧(141)默认拉 http://80.5.25.140:6010/node_metrics,可用 PEER_METRICS_URL 改。
 import argparse
 import json
+import os
 import re
 import socket
 import subprocess
@@ -25,16 +26,29 @@ def npu_info():
     r1 = re.compile(r"\|\s*(\d+)\s+\S+\s*\|\s*\w+\s*\|\s*(?:[\d.]+|-)\s+(\d+)\s")
     r2 = re.compile(r"\|\s*(\d+)(?:\s+(\d+))?\s*\|\s*[\w:.]+\s*\|"
                     r"\s*([\d.]+)\s+[\d.]+\s*/\s*[\d.]+\s+(\d+)\s*/\s*(\d+)")
+    last_npu_id = None   # 行1 刚给出的 NPU 号,留给紧随其后的行2 用
     for line in out.splitlines():
         m = r1.search(line)
         if m:
-            module_temp[int(m.group(1))] = int(m.group(2))
+            last_npu_id = int(m.group(1))
+            module_temp[last_npu_id] = int(m.group(2))
             continue
         m = r2.search(line)
         if m:
-            cid = int(m.group(2)) if m.group(2) is not None else int(m.group(1))
+            if m.group(2) is not None:
+                # A3 双 die:首格是 "模组号 die号",die 的 Phy-ID(0-15)即卡号。
+                cid = int(m.group(2))
+                temp = module_temp.get(cid // 2, 0)
+            else:
+                # [2026-08-14 修复] 单 die(910B2C 等):行2 首格是 **Chip 号**,恒为 0
+                #   —— 见 npu-smi 表头 "| Chip | Bus-Id | AICore(%) ... |",它不是卡号。
+                #   旧代码拿它当卡号 → 所有卡全写进 cards[0],只剩 1 条、且数值是最后
+                #   一张卡的。卡号只在行1 里,故回退到 r1 刚解析出的 NPU 号。
+                #   (rl_dashboard._npu_info_parse 同步修了同一处。)
+                cid = last_npu_id if last_npu_id is not None else int(m.group(1))
+                temp = module_temp.get(cid, 0)
             cards[cid] = {"id": cid, "power": 0.0,
-                          "temp": module_temp.get(cid // 2, 0),
+                          "temp": temp,
                           "aicore": int(float(m.group(3))),
                           "hbm_used": int(m.group(4)),
                           "hbm_total": int(m.group(5))}
@@ -69,15 +83,30 @@ _NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _local_ip():
-    """本机主网卡 IP(引擎绑的是节点 IP 而非 127.0.0.1,别用 loopback 探)。"""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("80.5.25.141", 80))   # 不真发包,只为拿到本地出口 IP
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+    """本机主网卡 IP(引擎绑的是节点 IP 而非 127.0.0.1,别用 loopback 探)。
+
+    [2026-08-14] 优先取 env。原先只有下面的 UDP-connect 探法,且目标写死旧集群的
+    80.5.25.141:换机后该地址无路由 → connect 抛异常 → 回落 127.0.0.1 →
+    _discover_engine_ports 扫 loopback → 引擎绑的是节点 IP,一个都扫不到,
+    面板的 engines 恒为空。目标地址只用于让内核选出口网卡,不发包。
+    """
+    for key in ("NODE_EXPORTER_HOST_IP", "VLLM_HOST_IP", "VIME_HOST_IP", "CURRENT_IP"):
+        ip = (os.environ.get(key) or "").strip()
+        if ip:
+            return ip
+    for target in (os.environ.get("MASTER_ADDR", "").strip(), "8.8.8.8"):
+        if not target:
+            continue
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((target, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127."):
+                return ip
+        except Exception:
+            continue
+    return "127.0.0.1"
 
 
 def _discover_engine_ports():

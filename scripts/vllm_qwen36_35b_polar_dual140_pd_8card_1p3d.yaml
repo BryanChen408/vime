@@ -1,10 +1,18 @@
-# [8卡 PD / 1P3D] 140 节点 rollout 8 卡(devices 8-15):prefill 2(tp2×1,卡8-9)+ decode 6(tp2×3,卡10-11/12-13/14-15)。
+# [8卡 PD / 1P3D] rollout 8 卡(devices 8-15):prefill 2(tp2×1,卡8-9)+ decode 6(tp2×3,卡10-11/12-13/14-15)。
 # 配比依据(2026-08-10 实测 131159/052057 两次 run 的引擎侧数据):
 #   prefill 有活率仅 6-20%(prefix cache 命中 66% 后需求更低),decode 100% 满载 →
 #   decode 是绝对瓶颈,prefill 1P1D 下闲置 80% → 1P3D 把 6 张卡全给 decode,容量 ≈1.8×。
-# HCCS 域:P(8-9)↔D1(10-11) 同域;P↔D2/D3 跨域 → 依赖 HCCL_INTER_HCCS_DISABLE=false
-#   + ASCEND_CONNECT_TIMEOUT=60000 + 140 无空 hccn.conf(均已固化在启动脚本,勿删)。
-# per_engine=2 与 start_pd.sh 的 ROLLOUT_NUM_GPUS_PER_ENGINE=2 一致;引擎数 4 = layout 的 vllm_dp_size。
+#   ⚠ 12卡 yaml 的头注释持相反结论(93K p50 prompt / 单 TP2 prefill 4.8K tok/s vs 需求 15K → "1P 必排队")。
+#     两份实测的负载不同,谁对取决于当前 prompt 长度分布;若观察到 prefill 排队,换 2P2D(见文末)。
+# [2026-08-14 迁移到 80.48.5.64] 原注释写的是 140 节点、且 P↔D2/D3 跨 HCCS 域、依赖
+#   HCCL_INTER_HCCS_DISABLE=false + 140 已配好的 hccn.conf —— 那套依赖在本机**不成立且不需要**:
+#   本机 npu-smi info -t topo 显示 HCCS 域是 0-7 / 8-15 两个 8 卡域,devices 8-15 整体落在域 B 内,
+#   4 个引擎两两全 HCCS 可达 → 无跨域、无需 RoCE、无需 ub_endpoint_npu_*.json。
+#   (本机 hccn_tool -i N -ip -g 全部报 "no ip was preset",RoCE 根本没配起来,跨域方案走不通。)
+#   配套:layout rollout devices=8-15 + vllm_dp_size=4;env 侧 ROLLOUT_NUM_GPUS=8、
+#   ASCEND_RT_VISIBLE_DEVICES=8..15、NPUS_PER_NODE=8、HCCL_INTRA_ROCE_ENABLE=0。
+# per_engine=2 与 start_pd_worker 的 ROLLOUT_NUM_GPUS_PER_ENGINE=2 一致;引擎数 4 = layout 的 vllm_dp_size。
+# 想要 2P2D:把 prefill.num_gpus 2→4、decode.num_gpus 6→4 即可(仍全部在域 B 内)。
 vllm:
   - name: default
     update_weights: true

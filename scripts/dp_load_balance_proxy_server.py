@@ -95,6 +95,7 @@ import heapq
 import json
 import os
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -133,6 +134,14 @@ except ImportError:
     pass
 
 
+# [2026-08-17] 新 session 的引擎选择策略:least_load(默认,选最闲) | hash(旧行为,md5 取模)
+_SESSION_POLICY = os.environ.get("VIME_LB_SESSION_POLICY", "least_load").strip().lower()
+# session 映射的存活期与清理间隔。session 实测 54 分钟/场、轮次间可能有分钟级空档,
+#   TTL 取 2 小时留足余量(误清只会让该 session 换引擎、丢一次前缀缓存,不会出错)。
+_SESSION_TTL = float(os.environ.get("VIME_LB_SESSION_TTL", "7200"))
+_SESSION_PRUNE_INTERVAL = 60.0
+
+
 class ServerState:
     def __init__(self, host, port):
         self.host = host
@@ -144,6 +153,10 @@ class ServerState:
             limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
         )
         self.active_tokens = 0
+        # [2026-08-17] 钉在本引擎的活跃 session 数。active_tokens 只反映"此刻在飞的请求",
+        #   而 polar 的 session 是 40+ 轮 / 54 分钟的长驻体、轮次之间有大段空档(编译/跑测试),
+        #   那时 active_tokens 归零但 session 仍会回来。给新 session 选引擎要看这个。
+        self.active_sessions = 0
         self.aborted_requests = set()  # Track aborted requests
 
 
@@ -158,6 +171,10 @@ class ProxyState:
         # Lower priority score = higher priority (less loaded)
         self.lb_heap = [(0, i, server) for i, server in enumerate(self.dp_servers)]
         heapq.heapify(self.lb_heap)
+        # session_id -> (server_idx, last_seen_monotonic)。首次出现时按负载选引擎并钉住,
+        #   之后同 session 恒定复用 → 前缀 KV 命中(实测 87-95%)靠它。
+        self.session_map: dict[str, tuple[int, float]] = {}
+        self._last_prune = time.monotonic()
 
     def _update_server_priority(self, server_idx: int):
         """Update the priority of a decoder server in the heap."""
@@ -186,12 +203,53 @@ class ProxyState:
 
         return chosen
 
+    def _maybe_prune_sessions(self, now: float) -> None:
+        """惰性清理过期 session 映射(最多每 _SESSION_PRUNE_INTERVAL 秒一次)。
+        不清理的话 session_map 会随 run 无界增长,active_sessions 也会只增不减、失去均衡意义。"""
+        if now - self._last_prune < _SESSION_PRUNE_INTERVAL:
+            return
+        self._last_prune = now
+        stale = [sid for sid, (_, ts) in self.session_map.items() if now - ts > _SESSION_TTL]
+        for sid in stale:
+            idx, _ = self.session_map.pop(sid)
+            if self.dp_servers[idx].active_sessions > 0:
+                self.dp_servers[idx].active_sessions -= 1
+        if stale:
+            logger.debug("Pruned %d stale session mappings", len(stale))
+
     def select_server_by_session(self, session_id: str, token_count):
-        """Session 亲和:把同一 session_id(vime 每条 rollout sample 一个)一致性哈希到固定引擎,
-        该 sample 多轮请求钉同一引擎、复用前缀 KV —— 对齐 vime/slime 上游默认 router_policy=consistent_hash
-        (x-session-id header)。static 引擎集下稳定哈希 %N 即恒定亲和;用 hashlib(非内置 hash():带
-        PYTHONHASHSEED 盐、进程间不定)。仍记 active_tokens 供 release/负载可见。"""
-        idx = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % len(self.dp_servers)
+        """Session 亲和:同一 session_id(vime 每条 rollout sample 一个)恒定钉在同一引擎,
+        多轮请求复用前缀 KV —— 对齐 vime/slime 上游 router_policy=consistent_hash 的效果。
+
+        [2026-08-17] 首次分配从"md5 取模"改成"选当前最闲的引擎"。
+          原实现一律 md5 %N,完全不看负载,而 _select_instance 只要带 x-session-id 就走这条 →
+          下面那个基于最小堆的 select_server()(真正的负载感知)永远执行不到。
+          小样本下 md5 分布不均:实测 6 引擎 / 每轮 32 session,累计完成量极差 2.9x、
+          变异系数 0.36,且长会话(54 分钟/40+ 轮)会把一次偏斜放大成整场偏斜。
+          亲和性不受影响 —— 只改"第一次选谁",选定后照样钉死。
+          置 VIME_LB_SESSION_POLICY=hash 可回退到旧的纯哈希行为。
+        """
+        now = time.monotonic()
+        self._maybe_prune_sessions(now)
+        entry = self.session_map.get(session_id)
+        if entry is not None:
+            idx = entry[0]
+        else:
+            if _SESSION_POLICY == "hash":
+                idx = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % len(self.dp_servers)
+            else:
+                # 主序:钉在该引擎的活跃 session 数;次序:此刻在飞的 token 数
+                idx = min(
+                    range(len(self.dp_servers)),
+                    key=lambda i: (self.dp_servers[i].active_sessions, self.dp_servers[i].active_tokens),
+                )
+            self.dp_servers[idx].active_sessions += 1
+            logger.debug(
+                "New session %s -> server %d (policy=%s, sessions=%s)",
+                session_id, idx, _SESSION_POLICY,
+                [sv.active_sessions for sv in self.dp_servers],
+            )
+        self.session_map[session_id] = (idx, now)
         self.dp_servers[idx].active_tokens += token_count
         self._update_server_priority(idx)
         return idx

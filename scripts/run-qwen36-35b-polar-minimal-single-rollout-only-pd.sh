@@ -36,7 +36,7 @@ export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${LD_LIBRARY_PA
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64:${LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH}"
 export PYTHONPATH="${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
+export VLLM_VERSION=0.21.0  # Match actual installed vllm version
 
 for required_dir in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACKAGES}"; do
    if [ ! -e "${required_dir}" ]; then
@@ -96,7 +96,7 @@ export PYTHONBUFFERED=16
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 # Prepend /usr/local/lib/python3.11/site-packages for newly compiled mooncake
 export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
+export VLLM_VERSION=0.21.0  # Match actual installed vllm version
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
