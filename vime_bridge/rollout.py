@@ -953,7 +953,6 @@ class AsyncPolarRolloutWorker:
         self.config = resolve_polar_slime_config(args)
         batch_size = int(getattr(args, "rollout_batch_size", 1) or 1)
         self._ready_groups: dict[int, _ReadyGroup] = {}
-        self._next_drain_group_id = 0
         self.deferred_queue: queue.Queue[_DeferredGroup] = queue.Queue()
         self._running = True
         self._thread: threading.Thread | None = None
@@ -1001,6 +1000,7 @@ class AsyncPolarRolloutWorker:
     def set_rollout_context(self, rollout_id: int) -> None:
         with self._state_lock:
             self._current_rollout_id = max(self._current_rollout_id, int(rollout_id))
+            self._policy_version = max(self._policy_version, int(rollout_id))
 
     def update_policy_version(self, policy_version: int) -> None:
         with self._state_lock:
@@ -1059,11 +1059,11 @@ class AsyncPolarRolloutWorker:
         accepted: list[_CompletedGroup] = []
         while len(accepted) < max_groups:
             with self._state_lock:
-                ready = self._ready_groups.pop(self._next_drain_group_id, None)
-                if ready is None:
+                if not self._ready_groups:
                     self._ready_group_count = len(self._ready_groups)
                     break
-                self._next_drain_group_id += 1
+                group_id = next(iter(self._ready_groups))
+                ready = self._ready_groups.pop(group_id)
                 self._ready_group_count = len(self._ready_groups)
 
             if ready.dropped:

@@ -44,31 +44,27 @@ def _polar_args(start_rollout_id=0, max_async_level=2, update_weights_interval=1
 
 # ---------------------------------------------------------------- G2-1
 
-def test_g2_1_policy_version_freeze_reproduced_and_fix_validated():
-    """The exact G2-1 mechanism, no threads/HTTP: with a frozen policy version the
-    staleness gate drops every group past max_off_policy_steps (=hang); advancing
-    the version each step (what our train_async fix does) keeps staleness bounded."""
+def test_g2_1_policy_version_advances_with_rollout_context():
+    """G2-1: a frozen policy version makes the staleness gate drop every group (=hang).
+    Advancing the version from set_rollout_context keeps staleness at 0; the external
+    update_policy_version channel still composes (both use max, so it only moves forward)."""
     args = _polar_args(start_rollout_id=0, max_async_level=2, update_weights_interval=1)
     worker = AsyncPolarRolloutWorker(args, _DummyDataSource())
     assert worker.config.max_off_policy_steps == 3   # 2 + 1
     assert worker._policy_version == 0
 
-    # BUG repro: only set_rollout_context advances rollout_id; version stays frozen.
+    # set_rollout_context alone (the call vime makes every rollout) advances the version.
     for rid in range(0, 5):
         worker.set_rollout_context(rid)
-    assert worker._policy_version == 0
-    staleness_frozen = worker._current_rollout_id - worker._policy_version  # 4 - 0
-    assert staleness_frozen == 4
-    assert staleness_frozen > worker.config.max_off_policy_steps  # -> group dropped -> hang
+        staleness = max(0, worker._current_rollout_id - worker._policy_version)
+        assert staleness == 0, f"rollout {rid} staleness={staleness}"
+    assert worker._policy_version == 4
 
-    # FIX: our train_async calls update_policy_version(rid+1) after each update_weights.
-    worker2 = AsyncPolarRolloutWorker(args, _DummyDataSource())
-    for rid in range(0, 5):
-        worker2.set_rollout_context(rid)
-        worker2.update_policy_version(rid + 1)
-    assert worker2._policy_version == 5
-    staleness_fixed = worker2._current_rollout_id - worker2._policy_version  # 4 - 5 -> clamped 0
-    assert max(0, staleness_fixed) <= worker2.config.max_off_policy_steps  # accepted -> no hang
+    # External channel composes: the version is monotonic and never moves back.
+    worker.update_policy_version(2)
+    assert worker._policy_version == 4
+    worker.update_policy_version(7)
+    assert worker._policy_version == 7
 
 
 def test_module_update_policy_version_hook_dispatch(monkeypatch):
