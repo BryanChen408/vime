@@ -207,8 +207,33 @@ def prepare_policy_update(args: Any, policy_version: int) -> None:
                 worker.pause_admission()
 
     if worker is not None and worker.config.scheduler_mode == "session_pool":
-        timeout_seconds = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
-        worker.wait_for_policy_update_drain(timeout=timeout_seconds)
+        # The session-level drain waits for whole agent sessions to finish, which can take
+        # far longer than any sane timeout. Two things matter here:
+        #   * It must not be the reason the weight update is skipped. The gateway pause and
+        #     the version stamp below are what actually protect the weight boundary, and they
+        #     run *after* this wait -- letting a slow drain raise past them means the boundary
+        #     is left unprotected exactly when there is most in-flight work to protect it from.
+        #   * Synchronous (colocate) training has no overlap window at all: the engines sleep
+        #     for the entire training step, so waiting for sessions only stalls training.
+        #     --no-polar-weight-update-drain-sessions skips the wait and abandons whatever is
+        #     in flight to the version-span guard (the gateway rejects a continuation whose
+        #     turn would cross the update), which comes back as an ERROR trajectory that
+        #     adapter.py excludes from training.
+        if bool(getattr(args, "polar_weight_update_drain_sessions", True)):
+            timeout_seconds = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
+            try:
+                worker.wait_for_policy_update_drain(timeout=timeout_seconds)
+            except PolarRolloutSchedulerError:
+                logger.warning(
+                    "Polar session drain did not finish within %.0fs; proceeding with the "
+                    "weight update anyway and leaving the stragglers to the version-span guard.",
+                    timeout_seconds,
+                )
+        else:
+            logger.info(
+                "Polar session drain skipped (--no-polar-weight-update-drain-sessions); "
+                "in-flight sessions are abandoned at the weight boundary."
+            )
 
     try:
         _pause_gateway_generation(args)
@@ -954,7 +979,6 @@ class AsyncPolarRolloutWorker:
         self.config = resolve_polar_slime_config(args)
         batch_size = int(getattr(args, "rollout_batch_size", 1) or 1)
         self._ready_groups: dict[int, _ReadyGroup] = {}
-        self._next_drain_group_id = 0
         self.deferred_queue: queue.Queue[_DeferredGroup] = queue.Queue()
         self._running = True
         self._thread: threading.Thread | None = None
@@ -1060,11 +1084,11 @@ class AsyncPolarRolloutWorker:
         accepted: list[_CompletedGroup] = []
         while len(accepted) < max_groups:
             with self._state_lock:
-                ready = self._ready_groups.pop(self._next_drain_group_id, None)
-                if ready is None:
+                if not self._ready_groups:
                     self._ready_group_count = len(self._ready_groups)
                     break
-                self._next_drain_group_id += 1
+                group_id = next(iter(self._ready_groups))
+                ready = self._ready_groups.pop(group_id)
                 self._ready_group_count = len(self._ready_groups)
 
             if ready.dropped:

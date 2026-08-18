@@ -83,6 +83,21 @@ ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-8}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-16}
 ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
 
+# ─── colocate(训推同卡、同步 train.py)───
+# FEAT_COLOCATE=1 时:
+#   * --resource-layout 与 --colocate 互斥(arguments.py:1817 直接 raise),故必须清空 layout;
+#   * arguments.py:1888-1908 会强制 offload_train/offload_rollout=True,并把
+#     num_gpus_per_node/rollout_num_gpus 覆盖成 actor_num_gpus_per_node(*actor_num_nodes),
+#     所以 ROLLOUT_NUM_GPUS 必须自己就等于 ACTOR_NUM_GPUS_PER_NODE*ACTOR_NUM_NODES,否则只是被静默改写;
+#   * 入口切 train.py —— train_async.py:11 有 assert not args.colocate。
+FEAT_COLOCATE=${FEAT_COLOCATE:-0}
+# train_async.py:11 assert not args.colocate → colocate 只能走同步入口
+TRAIN_ENTRY=$([ "${FEAT_COLOCATE}" = "1" ] && echo train.py || echo train_async.py)
+if [ "${FEAT_COLOCATE}" = "1" ]; then
+   RESOURCE_LAYOUT=""
+   ROLLOUT_NODE_IP="${MASTER_ADDR}"        # 引擎与 actor 同节点,metrics/proxy 发现目标随之回到本机
+fi
+
 # ─── polar 数据 / 端点 ───
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
 OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
@@ -244,6 +259,28 @@ ROLLOUT_ARGS=(
    --rollout-seed "${ROLLOUT_SEED:-42}"
 )
 
+# 权重更新时是否等 polar 的 in-flight session 排空。
+#   分离部署(异步):等 —— 生成与训练重叠,等一下就能把整组收完,不浪费。
+#   colocate(同步):不等 —— 引擎整个训练步都 sleep,等 session 纯粹是让训练干等;
+#     在跑的 session 直接放弃,交给 version-span guard 在 resume 时拒绝跨界续跑。
+#   POLAR_DRAIN_SESSIONS 可显式覆盖(1=等 / 0=不等)。
+if [ "${POLAR_DRAIN_SESSIONS:-$([ "${FEAT_COLOCATE:-0}" = "1" ] && echo 0 || echo 1)}" = "1" ]; then
+   DRAIN_ARGS=(--polar-weight-update-drain-sessions)
+else
+   DRAIN_ARGS=(--no-polar-weight-update-drain-sessions)
+fi
+
+# 跨权重更新的组要不要。默认(不传)沿用 max_async_level+update_weights_interval 的推导值,
+# 下限恒为 2 → 跨一次更新的 staleness=1 永远被接受,也就是混权轨迹会进训练集。
+# colocate 下 polar 侧没有 /admin/policy_version(version-span guard 会 404 降级),
+# 只能在这里丢:0 = 只收当轮生成的组,上一轮遗留的一律丢弃。
+POLAR_MAX_OFF_POLICY_STEPS=${POLAR_MAX_OFF_POLICY_STEPS:-$([ "${FEAT_COLOCATE:-0}" = "1" ] && echo 0 || echo "")}
+if [ -n "${POLAR_MAX_OFF_POLICY_STEPS}" ]; then
+   STALENESS_ARGS=(--rollout-max-off-policy-steps "${POLAR_MAX_OFF_POLICY_STEPS}")
+else
+   STALENESS_ARGS=()
+fi
+
 POLAR_ARGS=(
    --polar-url "${POLAR_ROLLOUT_URL}"
    --polar-run-id "${RUN_ID}"
@@ -251,11 +288,13 @@ POLAR_ARGS=(
    --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
    --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
    --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
-   --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
+   --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-9000}"
    --rollout-scheduler-mode session_pool
    --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
    --rollout-release-on-postrun
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6}"
+   ${DRAIN_ARGS[@]+"${DRAIN_ARGS[@]}"}
+   ${STALENESS_ARGS[@]+"${STALENESS_ARGS[@]}"}
 )
 
 # [FLOOR] 轨迹内 trace 保底权重(vime/ray/rollout.py 的 rollout_mask_sums 分母)。
@@ -302,6 +341,15 @@ OPTIMIZER_ARGS=(
    --use-precision-aware-optimizer
 )
 
+# actor 与 rollout 分居不同节点、卡不重叠 → 无需 offload 腾显存。
+# colocate 下两者共卡,必须 offload 才腾得出显存(不传的话 arguments.py:1888 也会强制置 True,
+# 这里显式留空是为了避免 --no-offload-* 与那段强制逻辑冲突)。
+if [ "${FEAT_COLOCATE:-0}" = "1" ]; then
+   OFFLOAD_ARGS=()
+else
+   OFFLOAD_ARGS=(--no-offload-train --no-offload-rollout)
+fi
+
 VLLM_ARGS=(
    --rollout-backend vllm
    --qwen-gdn-backend npu
@@ -317,9 +365,7 @@ VLLM_ARGS=(
    --vllm-enable-sleep-mode
    --vllm-compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
    --vllm-max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS:-16384}"
-   # actor 与 rollout 分居不同节点、卡不重叠 → 无需 offload 腾显存
-   --no-offload-train
-   --no-offload-rollout
+   ${OFFLOAD_ARGS[@]+"${OFFLOAD_ARGS[@]}"}
    # renderer 多 worker(前端渲染/tokenize 并行,长 prompt 提速)。注意必须与 mm-processor-cache-gb 0 同开:
    # vllm 校验"renderer_num_workers>1 与多模态缓存互斥"(缓存非线程安全),纯文本任务关它零损失。
    --vllm-renderer-num-workers 4
@@ -503,10 +549,20 @@ PY
          # layout 路径:清全局可见卡,交给 Ray 按 layout 钉卡(只影响 driver,raylet 不受影响)
          unset ASCEND_RT_VISIBLE_DEVICES HCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME TP_SOCKET_IFNAME HCCL_IF_IP
          EXTRA_ARGS=()
-         [ -n "${RESOURCE_LAYOUT:-}" ] && EXTRA_ARGS+=(--resource-layout "${RESOURCE_LAYOUT}")
+         # 注意:本文件开头是 `set -ex`。`[ cond ] && arr+=(...)` 在 cond 为假时整条 AND-list
+         # 退出码为 1 → 直接被 set -e 终止。colocate 会把 RESOURCE_LAYOUT 清空、非 colocate 又会
+         # 让 FEAT_COLOCATE 判假,两条都会踩到,所以这里一律用 if 而不是 &&。
+         if [ -n "${RESOURCE_LAYOUT:-}" ]; then
+            EXTRA_ARGS+=(--resource-layout "${RESOURCE_LAYOUT}")
+         fi
+         if [ "${FEAT_COLOCATE:-0}" = "1" ]; then
+            EXTRA_ARGS+=(--colocate)
+         fi
          # FEAT_LB_PROXY=1:Python 透传 LB proxy 替 Rust router(保 return_token_ids + 会话亲和);
          #   需把 polar 推理端点指向 :${VLLM_ROUTER_PORT}。见 docs/design/router_return_token_ids_passthrough.md §10。
-         [ "${FEAT_LB_PROXY:-0}" = "1" ] && EXTRA_ARGS+=(--rollout-lb-proxy)
+         if [ "${FEAT_LB_PROXY:-0}" = "1" ]; then
+            EXTRA_ARGS+=(--rollout-lb-proxy)
+         fi
          # ─── 启动 vLLM metrics 监控面板(旁路,失败不影响训练)───
          # 引擎由 head 的 driver 远程创建在 rollout 节点 → 发现目标必须是
          # ROLLOUT_NODE_IP(140),不是 CURRENT_IP(141 本机没有任何 engine)。
@@ -518,7 +574,7 @@ PY
          METRICS_HOST_IP="${ROLLOUT_NODE_IP}" \
          METRICS_ENGINE_INTERNAL_PORTS=$((1 + ROLLOUT_NUM_GPUS_PER_ENGINE)) \
             source "${VIME_ROOT}/scripts/common/start_metrics_monitor.sh"
-         python3 train_async.py \
+         python3 "${TRAIN_ENTRY}" \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             ${TOPO_ARGS[@]} ${MODEL_ARGS[@]} ${ROLLOUT_ARGS[@]} ${POLAR_ARGS[@]} \
             ${OPTIMIZER_ARGS[@]} ${GRPO_ARGS[@]} ${PERF_ARGS[@]} ${VLLM_ARGS[@]} \

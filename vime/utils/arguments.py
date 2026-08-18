@@ -673,6 +673,19 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--polar-tasks-dir", type=str, default=None)
             parser.add_argument("--rollout-max-async-level", type=int, default=None)
             parser.add_argument("--polar-max-async-level", type=int, default=None)
+            # 不传 = 沿用 max_async_level + update_weights_interval 的推导值(下限 2)。
+            # 传 0 = 只接受当轮生成的组,跨权重更新的一律丢弃(同步/colocate 用)。
+            parser.add_argument("--rollout-max-off-policy-steps", type=int, default=None)
+            # vime_bridge/rollout.py:210 的 drain 超时。同步(colocate)训练里 prepare_policy_update
+            # 要等 polar session 排空,而 agent session 动辄几十分钟,原来写死的 300s 必然超时。
+            parser.add_argument("--polar-weight-update-pause-timeout", type=float, default=300.0)
+            # 关掉 = 权重更新时不等 polar 的 in-flight session,直接丢。同步(colocate)训练下
+            # 引擎整个训练步都在 sleep,等 session 只是白等,见 vime_bridge/rollout.py prepare_policy_update。
+            parser.add_argument(
+                "--polar-weight-update-drain-sessions",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+            )
             parser.add_argument("--rollout-request-timeout", type=float, default=None)
             parser.add_argument("--polar-request-timeout", type=float, default=None)
             parser.add_argument("--rollout-scheduler-mode", type=str, default=None)

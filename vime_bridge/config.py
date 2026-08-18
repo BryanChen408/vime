@@ -98,7 +98,19 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         ),
         default=False,
     )
-    max_off_policy_steps = max_async_level + update_weights_interval
+    # 默认由 max_async_level + update_weights_interval 推导,下限恒为 2 —— 因为两者都强制 > 0。
+    # 但"跨一次权重更新"的 staleness 恰好是 1,永远落在允许区间内,所以推导值下丢不掉跨界的组。
+    # 同步(colocate)训练需要 0:本轮开的组当轮收完 staleness=0 正常接受,上一轮遗留的组
+    # staleness=1 直接丢 —— 即"权重一更新,polar 在跑的就不要了"。见 drain_completed。
+    max_off_policy_steps_override = _first_configured(
+        args, "rollout_max_off_policy_steps", "polar_max_off_policy_steps"
+    )
+    if max_off_policy_steps_override is None:
+        max_off_policy_steps = max_async_level + update_weights_interval
+    else:
+        max_off_policy_steps = int(max_off_policy_steps_override)
+        if max_off_policy_steps < 0:
+            raise ValueError("rollout_max_off_policy_steps must be >= 0")
 
     request_timeout = _first_configured(args, "rollout_request_timeout", "polar_request_timeout")
     if request_timeout is not None:
