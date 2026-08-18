@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
-import hashlib
 import json
 import logging
 import os
@@ -77,6 +76,7 @@ class ProxyState:
 
     def __init__(self, server_instances):
         self.dp_servers: list[ServerState] = [ServerState(host, port) for host, port in server_instances]
+        self.session_servers: dict[str, int] = {}
 
     async def aclose(self):
         for server in self.dp_servers:
@@ -91,12 +91,11 @@ class ProxyState:
         return idx
 
     def select_server_by_session(self, session_id: str, token_count: float) -> int:
-        """Pin a session to one engine so its later turns reuse that engine's prefix cache.
-
-        Hashed with md5 rather than the builtin hash(), which is salted per process and would
-        send the same session elsewhere after a restart.
-        """
-        idx = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % len(self.dp_servers)
+        """Place a new session by load, then pin its later turns to that engine."""
+        idx = self.session_servers.get(session_id)
+        if idx is None:
+            idx = min(range(len(self.dp_servers)), key=lambda i: self.dp_servers[i].active_tokens)
+            self.session_servers[session_id] = idx
         self.dp_servers[idx].active_tokens += token_count
         return idx
 
