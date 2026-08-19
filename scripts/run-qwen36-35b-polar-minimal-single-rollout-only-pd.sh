@@ -36,7 +36,15 @@ export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${LD_LIBRARY_PA
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64:${LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH}"
 export PYTHONPATH="${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH}"
-export VLLM_VERSION=0.21.0  # Match actual installed vllm version
+# [2026-08-19] 统一以当前 0.23.0 栈为准。本机只有一套 vllm:/workspace/vllm(editable,
+#   自报 0.23.1.dev5,基线 tag v0.23.0),/workspace/vllm-023 与 /workspace/vllm-ascend-023
+#   目录均不存在;vllm-ascend 为 /workspace/vllm-ascend(0.23.0rc2.dev94, vime-adapter 线)。
+#   vllm_ascend.utils.vllm_version_is() 优先读这个 env 而不是 vllm.__version__,写 0.21.0
+#   会让 patch 门控取反 → 取 0.23 才有的符号失败(patch_dp_device_ids: AttributeError
+#   get_physical_gpu_ids_for_local_dp_rank / expert_map_manager: ModuleNotFound)。
+#   原值原样保留在下一行注释里,回 0.21 环境时把两行对调即可。
+# export VLLM_VERSION=0.21.0  # Match actual installed vllm version
+export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
 
 for required_dir in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACKAGES}"; do
    if [ ! -e "${required_dir}" ]; then
@@ -99,7 +107,15 @@ export ASCEND_CONNECT_TIMEOUT=${ASCEND_CONNECT_TIMEOUT:-60000}
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 # Prepend /usr/local/lib/python3.11/site-packages for newly compiled mooncake
 export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
-export VLLM_VERSION=0.21.0  # Match actual installed vllm version
+# [2026-08-19] 统一以当前 0.23.0 栈为准。本机只有一套 vllm:/workspace/vllm(editable,
+#   自报 0.23.1.dev5,基线 tag v0.23.0),/workspace/vllm-023 与 /workspace/vllm-ascend-023
+#   目录均不存在;vllm-ascend 为 /workspace/vllm-ascend(0.23.0rc2.dev94, vime-adapter 线)。
+#   vllm_ascend.utils.vllm_version_is() 优先读这个 env 而不是 vllm.__version__,写 0.21.0
+#   会让 patch 门控取反 → 取 0.23 才有的符号失败(patch_dp_device_ids: AttributeError
+#   get_physical_gpu_ids_for_local_dp_rank / expert_map_manager: ModuleNotFound)。
+#   原值原样保留在下一行注释里,回 0.21 环境时把两行对调即可。
+# export VLLM_VERSION=0.21.0  # Match actual installed vllm version
+export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1

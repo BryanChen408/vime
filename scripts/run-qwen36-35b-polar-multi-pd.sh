@@ -123,7 +123,16 @@ export PYTHONBUFFERED=16
 #   PD 交接握不上手:prefill 返回合法 kv_transfer_params 后 decode 永不拉 KV,
 #   proxy 的 preflight 永久挂死(timeout=None)→ 8011 不 ready → rollout 全量 drop。
 #   旧 rollout 机上没有这两个目录,遮蔽不成立,所以同样的脚本在那边是好的。
-export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
+# [2026-08-19] 统一以当前 0.23.0 栈为准,显式列回 /workspace/vllm 与 /workspace/vllm-ascend:
+#   本机(A3/16 卡)只有一套 0.23 栈 —— /workspace/vllm=0.23.1.dev5(基线 tag v0.23.0)、
+#   /workspace/vllm-ascend=0.23.0rc2.dev94,都是 editable;/workspace/vllm-023 与
+#   /workspace/vllm-ascend-023 目录不存在。上面 08-14 那条"显式目录会遮蔽 023 editable
+#   finder"在这里不成立:被显式列出的就是 023 那棵树本身,遮蔽的是同一份代码,
+#   mooncake_connector 也来自同一棵 vllm-ascend,PD 握手不受影响。
+#   与 run-qwen36-35b-polar-minimal-single-rollout-only{,-pd}.sh 的 PYTHONPATH 保持一致。
+#   若回到有 /workspace/vllm-023 的老 rollout 机(.64)上跑,把下一行注释掉的 08-14 版本换回来。
+# export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"   # ← 08-14 原值(仅适用于存在 vllm-023 的机器)
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH:-}"
 # [2026-08-14] 必须 0.23.0,且必须与上面的 PYTHONPATH 配套改:
 #   /workspace/vllm-023=0.23.0(有 expert_map_manager) /workspace/vllm=0.21.0(没有);
 #   两棵 vllm-ascend 都要 0.23 的 API。vllm_ascend.utils.vllm_version_is(utils.py:610)
@@ -131,7 +140,7 @@ export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/Megatron-L
 #     patch_dp_device_ids.py:33  if not vllm_version_is("0.23.0"): <取 0.23 才有的符号>
 #   写 0.21.0 → 门控取反 → AttributeError: get_physical_gpu_ids_for_local_dp_rank。
 #   (0.21.0 是配 /workspace/vllm 那套错误组合时打的补丁,PYTHONPATH 修好后必须跟着回来。)
-export VLLM_VERSION=0.23.0  # 与 /workspace/vllm-023 的真实版本一致
+export VLLM_VERSION=0.23.0  # [2026-08-19] 与 /workspace/vllm 的真实版本一致(0.23.1.dev5,基线 tag v0.23.0)
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${CANN_TOOLKIT_ROOT}/x86_64-linux/lib64:${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${CANN_TOOLKIT_ROOT}/opp/lib64:${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH:-}"
 # Ascend 自定义 MoE 训练算子(--moe-grouped-gemm 用)。本容器两处都不存在 → ld 直接跳过、回退原生实现,

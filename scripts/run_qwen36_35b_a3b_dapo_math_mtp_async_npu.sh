@@ -68,7 +68,15 @@ export VLLM_ASCEND_ENABLE_NZ=0                 # must be 0 for RL weight-sync + 
 # vllm here is built 2 commits past the v0.21.0 tag → reports 0.21.1.dev2, which
 # makes vllm-ascend's vllm_version_is("0.21.0") guard take the wrong (main-only,
 # expert_map_manager) import branch. Pin it so it treats vllm as 0.21.0.
-export VLLM_VERSION=0.21.0
+# [2026-08-19] 统一以当前 0.23.0 栈为准。本机只有一套 vllm:/workspace/vllm(editable,
+#   自报 0.23.1.dev5,基线 tag v0.23.0),/workspace/vllm-023 与 /workspace/vllm-ascend-023
+#   目录均不存在;vllm-ascend 为 /workspace/vllm-ascend(0.23.0rc2.dev94, vime-adapter 线)。
+#   vllm_ascend.utils.vllm_version_is() 优先读这个 env 而不是 vllm.__version__,写 0.21.0
+#   会让 patch 门控取反 → 取 0.23 才有的符号失败(patch_dp_device_ids: AttributeError
+#   get_physical_gpu_ids_for_local_dp_rank / expert_map_manager: ModuleNotFound)。
+#   原值原样保留在下一行注释里,回 0.21 环境时把两行对调即可。
+# export VLLM_VERSION=0.21.0
+export VLLM_VERSION=0.23.0
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=0                         # stream logs (=1 batches duplicate lines → looks like it flushes every few min)
 export PYTHONUNBUFFERED=1                       # real-time stdout (polar's PYTHONBUFFERED=16 is a typo/no-op)

@@ -65,7 +65,15 @@ export VLLM_TOOL_CALL_PARSER=qwen3_coder
 export VLLM_REASONING_PARSER=qwen3
 # 本机 vllm = v0.21.0 tag + 2 commits → 自报 0.21.1.dev2,vllm-ascend 的 vllm_version_is("0.21.0")
 # 会误判 → 走 vllm-main 才有的 expert_map_manager 导入 → ModuleNotFound。钉成 0.21.0。
-export VLLM_VERSION=${VLLM_VERSION:-0.21.0}
+# [2026-08-19] 统一以当前 0.23.0 栈为准。本机只有一套 vllm:/workspace/vllm(editable,
+#   自报 0.23.1.dev5,基线 tag v0.23.0),/workspace/vllm-023 与 /workspace/vllm-ascend-023
+#   目录均不存在;vllm-ascend 为 /workspace/vllm-ascend(0.23.0rc2.dev94, vime-adapter 线)。
+#   vllm_ascend.utils.vllm_version_is() 优先读这个 env 而不是 vllm.__version__,写 0.21.0
+#   会让 patch 门控取反 → 取 0.23 才有的符号失败(patch_dp_device_ids: AttributeError
+#   get_physical_gpu_ids_for_local_dp_rank / expert_map_manager: ModuleNotFound)。
+#   原值原样保留在下一行注释里,回 0.21 环境时把两行对调即可。
+# export VLLM_VERSION=${VLLM_VERSION:-0.21.0}
+export VLLM_VERSION=${VLLM_VERSION:-0.23.0}
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=1
 # HCCL(节点内 HCCS + 跨机 socket;长跑 EI0013 容错 + 35B 权重广播大 buffer)
