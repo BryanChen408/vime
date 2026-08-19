@@ -475,7 +475,7 @@ RUN if [ "${WITH_MOONCAKE}" = "1" ]; then set -ex; \
             libcurl4-openssl-dev libhiredis-dev liburing-dev libjemalloc-dev libasio-dev \
             libyaml-cpp-dev libjsoncpp-dev libgoogle-glog-dev libibverbs-dev; \
         rm -rf /var/lib/apt/lists/*; \
-        cd /tmp && wget --no-check-certificate "https://mirrors.tuna.tsinghua.edu.cn/golang/go${GO_VERSION}.linux-arm64.tar.gz" && \
+        cd /tmp && wget --no-check-certificate "https://mirrors.aliyun.com/golang/go${GO_VERSION}.linux-arm64.tar.gz" && \
             tar -C /usr/local -xzf "go${GO_VERSION}.linux-arm64.tar.gz" && rm "go${GO_VERSION}.linux-arm64.tar.gz"; \
         export PATH=/usr/local/go/bin:${PATH}; go version; \
         cd /tmp && git clone --depth 1 --branch "${YALANTINGLIBS_VERSION}" https://github.com/alibaba/yalantinglibs.git && \
