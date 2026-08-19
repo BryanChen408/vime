@@ -287,7 +287,7 @@ POLAR_ARGS=(
    --polar-reward-key score
    --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
    --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
-   --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
+   --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-2}"
    --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-9000}"
    --rollout-scheduler-mode session_pool
    --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"

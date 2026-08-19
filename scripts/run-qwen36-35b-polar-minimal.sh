@@ -65,8 +65,8 @@ export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-600}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-2400}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}
-#export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
-#export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
+export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
+export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
 # 跨机 HCCL 必需(对齐 slime;缺则双机权重同步 world>N 卡死在 rendezvous):
 export HCCL_SOCKET_FAMILY=${HCCL_SOCKET_FAMILY:-AF_INET}       # 强制 IPv4(网卡带 IPv6 地址会 socket family mismatch)
 export HCCL_WHITELIST_DISABLE=${HCCL_WHITELIST_DISABLE:-1}     # 禁 IP 白名单(否则跨机对端 IP 不在白名单→连接被拒→卡死)
@@ -93,15 +93,15 @@ if [ -n "${SOCKET_IFNAME}" ]; then
 fi
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
-LOG_FILE=${LOG_FILE:-/mnt/share/c00937190/logs/train_${RUN_ID}.log}
+LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
 mkdir -p logs "${POLAR_OUTPUT_DIR}" /mnt/share/c00937190/logs
 
 # ─── 参数分组 ───
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CKPT:-/mnt/weight/Qwen3.6-35B-A3B}
-   --ref-load ${REF_LOAD:-/mnt/weight/Qwen3.6-35B-A3B_torch_dist}
+   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}
+   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
-   --save-interval 10
+   --save-interval 100
    --no-save-optim
    --megatron-to-hf-mode raw
    # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
@@ -131,7 +131,7 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
    --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-32768}"
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
-   --rollout-temperature 0.7
+   --rollout-temperature 1
    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
    --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
    --save-debug-train-data "${POLAR_OUTPUT_DIR}/vime_debug_train_${RUN_ID}_rollout_{rollout_id}_{rank}.pt"
@@ -153,10 +153,15 @@ POLAR_ARGS=(
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
 )
 
+# [FLOOR] 轨迹内 trace 保底权重(vime/ray/rollout.py 的 rollout_mask_sums 分母)。
+# 不设则不传该参,默认纯 token 加权,行为与之前完全一致。
+[ -n "${POLAR_TRAJECTORY_PG_FLOOR:-}" ] && \
+   POLAR_ARGS+=(--polar-trajectory-pg-floor "${POLAR_TRAJECTORY_PG_FLOOR}")
+
 PERF_ARGS=(
    --tensor-model-parallel-size "${TP:-2}"
    --pipeline-model-parallel-size "${PP:-1}"
-   --context-parallel-size "${CP:-4}"
+   --context-parallel-size "${CP:-8}"
    --expert-model-parallel-size "${EP:-8}"
    --expert-tensor-parallel-size 1
    --sequence-parallel
@@ -172,17 +177,17 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.001
-   --kl-loss-type low_var_kl
-   --entropy-coef 0.00
+   #--use-kl-loss
+   #--kl-loss-coef 0.001
+   #--kl-loss-type low_var_kl
+   --entropy-coef 0.001
    --eps-clip 0.2
    --use-tis
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 2e-6
+   --lr 1e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
@@ -271,10 +276,41 @@ ADDCFG_PARTS=()
 [ "${FEAT_OPT2:-0}" = "1" ] && PERF_ARGS+=(--moe-permute-fusion)
 echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
 
+# ─── 清本节点 rollout 卡残留(只清 $ASCEND_RT_VISIBLE_DEVICES 钉的卡)───
+# 上个 run 异常结束后,vllm 栈(ray::VLLMEngine / vllm serve / EngineCore / Worker)
+# 可能变成孤儿进程:占着 HBM(实测 55GB/卡)和 15000 端口,ray stop 清不干净。
+# 判定 = 进程 env 的 ASCEND_RT_VISIBLE_DEVICES 与本机 rollout 卡集求交;
+# Ascend 运行时不持 /dev/davinciN 句柄,fuser/fd 扫描不可靠,勿用。
+# 模式里禁止裸写 ray:::head 节点的 ray::IDLE 预启动 worker 池(约 200 个,env 全卡)
+# 会被扫进来 —— 它们不占 HBM/端口,杀之无益还会误伤共享集群的 worker 池。
+# 仅在 ray stop 之后、ray start 之前调用:此时卡上的 vllm 按定义都是残留,
+# 函数不区分残留与活 run,禁止单独手动执行。
+cleanup_rollout_residue() {
+   local devs="${ASCEND_RT_VISIBLE_DEVICES//[[:space:]]/}"
+   [ -n "$devs" ] || { echo "[cleanup] ASCEND_RT_VISIBLE_DEVICES 为空,跳过"; return 0; }
+   local pid env_devs overlap pass hit
+   for pass in TERM KILL; do
+      hit=0
+      for pid in $(pgrep -fi "vllm" 2>/dev/null); do
+         env_devs=$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null | sed -n 's/^ASCEND_RT_VISIBLE_DEVICES=//p' | head -1)
+         [ -n "$env_devs" ] || continue
+         overlap=$(printf '%s\n%s\n' "$devs" "$env_devs" | tr ',' '\n' | grep -E '^[0-9]+$' | sort -n | uniq -d | head -1)
+         [ -n "$overlap" ] || continue
+         echo "[cleanup] kill -$pass pid=$pid cards=[$env_devs] $(ps -o comm= -p "$pid" 2>/dev/null)"
+         kill -"$pass" "$pid" 2>/dev/null || true
+         hit=1
+      done
+      [ "$hit" = 0 ] && break
+      [ "$pass" = TERM ] && sleep 8
+   done
+   return 0
+}
+
 # ─── Ray(单机 NNODES=1 走 head 分支)+ 启动 ───
 if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
    ray stop --force
    rm -rf "${RAY_TEMP_DIR}"
+   cleanup_rollout_residue
    ray start --head --port "${RAY_PORT}" --dashboard-host=0.0.0.0 --node-ip-address="${CURRENT_IP}" --dashboard-port="${RAY_DASHBOARD_PORT}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
 
    while true; do
@@ -305,6 +341,7 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
 else
    ray stop --force
    rm -rf "${RAY_TEMP_DIR}"
+   cleanup_rollout_residue
    while true; do
       ray start --address="${MASTER_ADDR}:${RAY_PORT}" --node-ip-address="${CURRENT_IP}" --num-gpus="${NPUS_PER_NODE}" --resources='{"NPU": '"${NPUS_PER_NODE}"'}' --temp-dir="${RAY_TEMP_DIR}" --disable-usage-stats
       ray status && break

@@ -6,6 +6,15 @@
 # ─── 本变体 = 单机 rollout-only 混部方案 ───
 # 目的:只起 rollout/vLLM 侧,不起训练侧(actor)。rollout 共占 8 张卡(npu4-11),共 2 个 engine,
 #      每个 engine 4 卡。默认开 Python LB proxy,供 Polar 直接打 :8001。
+#
+# ─── [同步 2026-08-18] 环境/参数已与 run-qwen36-35b-polar-minimal-single-rollout-only-pd.sh 对齐 ───
+#   同步:CANN 路径覆盖、LD_LIBRARY_PATH/PYTHONPATH/VLLM_VERSION、OMP/WORKER_MULTIPROC、
+#   HCCL_INTER_HCCS_DISABLE、SOCKET_IFNAME 默认值、proxy unset、HCCL_IF_IP/TP_SOCKET_IFNAME、
+#   TOPO_ARGS --num-gpus-per-node、USE_WANDB=0、MTP speculative 关闭(0% acceptance)。
+#   排除(PD 分离专属):mooncake/KV transfer 参数、PD yaml、--vllm-router-ip、ASCEND_CONNECT_TIMEOUT、
+#   METRICS_ENGINE_INTERNAL_PORTS(engine 端口实测间隔 2:15000/15002/15004,隔离窗会吞掉相邻 engine)。
+#   按用户要求额外对齐:数据集、ROLLOUT_NUM_GPUS_PER_ENGINE=4、RAY 端口 26460/28290、POLAR_ROLLOUT_URL:8180。
+#   本变体自有值保持:模型路径、seq 长度(131072)、wandb 开关块、RAY_TEMP_DIR 命名。
 set -ex
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
@@ -14,6 +23,7 @@ cd "${VIME_ROOT}"
 
 ASCEND_ROOT=${ASCEND_ROOT:-/usr/local/Ascend}
 CANN_ROOT=${CANN_ROOT:-${ASCEND_ROOT}/cann}
+CANN_TOOLKIT_ROOT="${ASCEND_ROOT}/ascend-toolkit/cann-9.0.0"
 CANN_BIN_DIR="${CANN_ROOT}/bin"
 CANN_LIB_DIR="${CANN_ROOT}/lib64"
 CANN_PYTHON_SITE_PACKAGES="${CANN_ROOT}/python/site-packages"
@@ -23,6 +33,18 @@ CANN_HCCL_LIB_DIR="$(find /usr/local/Ascend -path '*/x86_64-linux/lib64/libhccl.
 
 source "${CANN_ROOT}/set_env.sh"
 source /usr/local/Ascend/nnal/atb/set_env.sh
+
+# Force override ASCEND paths to use CANN 9.2.0 (where we copied ops_legacy)
+# Must be AFTER set_env.sh to override any values it sets
+export ASCEND_OPP_PATH="${CANN_ROOT}/opp"
+export ASCEND_HOME_PATH="${CANN_ROOT}"
+export ASCEND_TOOLKIT_HOME="${CANN_ROOT}"
+export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/x86_64-linux/lib64:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH}"
+export PYTHONPATH="${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH}"
+export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
 
 for required_dir in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACKAGES}"; do
    if [ ! -e "${required_dir}" ]; then
@@ -35,23 +57,23 @@ done
 RUN_ID=${RUN_ID:-qwen36_polar_$(date +%Y%m%d-%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-$(hostname -I | awk '{print $1}')}   # [single52] 单机:master=本机 → Ray head 分支
 CURRENT_IP=${CURRENT_IP:-}
-SOCKET_IFNAME=${SOCKET_IFNAME:-}
+SOCKET_IFNAME=${SOCKET_IFNAME:-enp48s3u1u1}
 NNODES=${NNODES:-1}
 NPUS_PER_NODE=${NPUS_PER_NODE:-16}
-RAY_PORT=${RAY_PORT:-6460}
-RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8290}
+RAY_PORT=${RAY_PORT:-26460}
+RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-28290}
 RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_qwen36_vime_polar}
 
 # ─── 拓扑(gpu 计数;或设 RESOURCE_LAYOUT 走显式钉位)───
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
 ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-0}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-16}
-ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}
+ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
 
 # ─── polar 数据 / 端点 ───
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
-OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_single1}
-OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.jsonl}
+OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189}
+OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.ascendc.jsonl}
 OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
 VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # profile.vime.yaml 推理端点指向它
 # [single52] 单机基线默认开 LB proxy(Python 透传替 Rust router):单引擎 :8001 也保 return_token_ids
@@ -61,7 +83,7 @@ FEAT_LB_PROXY=${FEAT_LB_PROXY:-1}
 # ─── 环境 ───
 export PYTHONBUFFERED=16
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
-export PYTHONPATH="/workspace/vllm-023:/workspace/vllm-ascend-023:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
+export PYTHONPATH="/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
 # [复核-D 保留 2026-07-14] Ascend 自定义 MoE 训练算子库(moe_grouped_matmul/grouped_matmul_swiglu/swiglu)。
 #   --moe-grouped-gemm 用它;目录存在时 prepend，不存在则静默跳过。
 export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:${CANN_LIB_DIR}:${LD_LIBRARY_PATH:-}"
@@ -77,6 +99,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TASK_QUEUE_ENABLE=0                     # 必须 0:=1 会让 GDN/ring-attn 训练出 NaN
 export TORCHDYNAMO_DISABLE=1                   # 昇腾 inductor get_gpu_type() 断言 → 走 eager
 export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}   # NPU 邻近 NUMA 绑核,降延迟抖动
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
 export QWEN36_CP_MODE=ulysses
 export QWEN36_CAUSAL_CONV1D_IMPL=triton
 export QWEN36_CHUNK_LMHEAD=${QWEN36_CHUNK_LMHEAD:-0}   # =1 chunked LM-head logprob,长序列免 OOM
@@ -91,7 +115,8 @@ export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-600}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-2400}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}
-export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
+export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-0}
+export HCCL_INTER_HCCS_DISABLE=${HCCL_INTER_HCCS_DISABLE:-false}
 export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
 # 跨机 HCCL 必需(对齐 slime;缺则双机权重同步 world>N 卡死在 rendezvous):
 export HCCL_SOCKET_FAMILY=${HCCL_SOCKET_FAMILY:-AF_INET}       # 强制 IPv4(网卡带 IPv6 地址会 socket family mismatch)
@@ -111,16 +136,17 @@ if [ -n "${SOCKET_IFNAME}" ]; then
    CURRENT_IP=${CURRENT_IP:-$(ifconfig "${SOCKET_IFNAME}" 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]{1,3}\.){3}[0-9]{1,3}' | awk '{print $NF}')}
 fi
 CURRENT_IP=${CURRENT_IP:-$(hostname -I | awk '{print $1}')}
+unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY
 export no_proxy="127.0.0.1,localhost,${MASTER_ADDR},${CURRENT_IP}${no_proxy:+,${no_proxy}}"
 export NO_PROXY="${no_proxy}"
-if [ -n "${SOCKET_IFNAME}" ]; then
-   export HCCL_SOCKET_IFNAME="${SOCKET_IFNAME}"
-   export GLOO_SOCKET_IFNAME="${SOCKET_IFNAME}"
-fi
+export HCCL_SOCKET_IFNAME="${SOCKET_IFNAME}"
+export GLOO_SOCKET_IFNAME="${SOCKET_IFNAME}"
+export TP_SOCKET_IFNAME="${SOCKET_IFNAME}"
+export HCCL_IF_IP="${CURRENT_IP}"
 
-POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
+POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8180}
 LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
-USE_WANDB=${USE_WANDB:-1}
+USE_WANDB=${USE_WANDB:-0}   # 默认关(本机无 API key,与 pd 脚本对齐);可 USE_WANDB=1 显式开启
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_PROJECT=${WANDB_PROJECT:-qwen36-rollout-only}
 WANDB_GROUP=${WANDB_GROUP:-single-rollout}
@@ -167,6 +193,11 @@ TOPO_ARGS=(
    --actor-num-nodes ${ACTOR_NUM_NODES}
    --actor-num-gpus-per-node ${ACTOR_NUM_GPUS_PER_NODE}
    --rollout-num-gpus ${ROLLOUT_NUM_GPUS}
+   # 端口分配器用 num_gpus_per_node 算 num_engines_per_node = num_gpus_per_node // gpus_per_engine,
+   # 再用它算 node_index。不传则停在默认 8 → 8//2=4 → 单台 16 卡机被劈成两个虚构节点 →
+   # engine 端口游标回退 base_port,与前一 engine 撞区间。debug_rollout_only 走不到
+   # --resource-layout 的同源修正(arguments.py:1809 禁止共用),必须显式传。
+   --num-gpus-per-node ${NPUS_PER_NODE}
    --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE}
 )
 
@@ -181,10 +212,10 @@ ROLLOUT_ARGS=(
    --custom-reward-post-process-path vime_bridge.reward_post_process.post_process_rewards
    --rollout-shuffle
    --num-rollout "${NUM_ROLLOUT:-1}"
-   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-4}"
-   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-8}"
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-4}"
    --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-32768}"
-   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
+   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-262144}"
    --rollout-temperature 0.7
    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
    --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
@@ -202,7 +233,7 @@ POLAR_ARGS=(
    --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
    --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-8000}"
    --rollout-scheduler-mode session_pool
-   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
+   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-32}"
    --rollout-release-on-postrun
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.8}"
 )
@@ -221,7 +252,7 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-32768}"
    --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-64}"
-   --seq-length "${SEQ_LENGTH:-131072}"
+   --seq-length "${SEQ_LENGTH:-262144}"
 )
 
 GRPO_ARGS=(
@@ -256,10 +287,11 @@ VLLM_ARGS=(
    --no-vllm-weight-sync-packed
    --vllm-gpu-memory-utilization "${VLLM_GPU_MEM_UTIL:-0.8}"
    --vllm-max-num-seqs "${VLLM_MAX_NUM_SEQS:-96}"
-   --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-131072}"
+   --vllm-max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS:-16384}"
+   --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-262144}"
    --vllm-enable-sleep-mode
    --vllm-compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
-   --vllm-speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+   --vllm-speculative-config '{"method":"mtp","num_speculative_tokens":3}'
    --no-offload-train
    --no-offload-rollout
 )
@@ -341,7 +373,7 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
       echo "[stage] wait Ray nodes active=${active_node_count}/${NNODES}"
       if [ "$active_node_count" -eq "$NNODES" ]; then
          # layout 路径:清全局可见卡,交给 Ray 按 actor 钉卡
-         unset ASCEND_RT_VISIBLE_DEVICES HCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME
+         unset ASCEND_RT_VISIBLE_DEVICES HCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME TP_SOCKET_IFNAME HCCL_IF_IP
          EXTRA_ARGS=()
          [ -n "${RESOURCE_LAYOUT:-}" ] && EXTRA_ARGS+=(--resource-layout "${RESOURCE_LAYOUT}")
          # FEAT_LB_PROXY=1:Python 透传 LB proxy 替 Rust router(保 return_token_ids + 会话亲和);

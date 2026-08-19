@@ -8,6 +8,10 @@ vllm:
         overrides:
           disable_hybrid_kv_cache_manager: false
           enable_prefix_caching: true
+          speculative_config:
+            method: mtp
+            num_speculative_tokens: 1
+            enforce_eager: true
           pd_topology:
             prefill:
               dp_size: 1
@@ -22,14 +26,17 @@ vllm:
             ascend_compilation_config:
               enable_npugraph_ex: false
       - worker_type: decode
-        num_gpus: 8
+        num_gpus: 12
         num_gpus_per_engine: 4
         overrides:
           disable_hybrid_kv_cache_manager: false
           enable_prefix_caching: true
-          max_model_len: 131072
+          max_model_len: 262144
           compilation_config:
             cudagraph_mode: FULL_DECODE_ONLY
+          speculative_config:
+            method: mtp
+            num_speculative_tokens: 3
           pd_topology:
             prefill:
               dp_size: 1

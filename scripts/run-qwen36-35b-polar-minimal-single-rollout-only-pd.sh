@@ -45,10 +45,12 @@ for required_dir in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACK
    fi
 done
 
+FEAT_STATIC_KERNEL=0
+FEAT_HCCL_AIV=1
 RUN_ID=${RUN_ID:-qwen36_polar_pd_$(date +%Y%m%d-%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-$(hostname -I | awk '{print $1}')}
 CURRENT_IP=${CURRENT_IP:-}
-SOCKET_IFNAME=${SOCKET_IFNAME:-data0.172}
+SOCKET_IFNAME=${SOCKET_IFNAME:-enp48s3u1u1}
 RAY_HOST_IP=${RAY_HOST_IP:-}
 MOONCAKE_HOST_IP=${MOONCAKE_HOST_IP:-}
 
@@ -81,8 +83,8 @@ ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-16}
 ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
 
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
-OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
-OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.jsonl}
+OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189}
+OPERATOR_TASK_JSONL=${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.ascendc.jsonl}
 OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
 VLLM_ROUTER_IP=${VLLM_ROUTER_IP:-}
 VLLM_PD_CONFIG=${VLLM_PD_CONFIG:-${VIME_ROOT}/scripts/vllm_qwen36_35b_polar_single56_pd_mooncake_rollout_only.yaml}
@@ -93,6 +95,7 @@ VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-${PROXY_PORT}}
 KV_CONNECTOR=${KV_CONNECTOR:-MooncakeConnectorV1}
 
 export PYTHONBUFFERED=16
+export ASCEND_CONNECT_TIMEOUT=${ASCEND_CONNECT_TIMEOUT:-60000}
 export PATH="${CANN_BIN_DIR}:${PATH:-}"
 # Prepend /usr/local/lib/python3.11/site-packages for newly compiled mooncake
 export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/vllm:/workspace/vllm-ascend:/workspace/Megatron-LM:${VIME_ROOT}:${CANN_PYTHON_SITE_PACKAGES}:${CANN_TBE_DIR}:${PYTHONPATH:-}"
@@ -119,9 +122,9 @@ export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE:-61000-61050}
 export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-600}
 export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-2400}
 export HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}
-export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
-export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
-export HCCL_INTER_HCCS_DISABLE=${HCCL_INTER_HCCS_DISABLE:-true}
+# A3机器注释掉参数，使默认走HCCL非roce链路
+# export HCCL_INTRA_ROCE_ENABLE=${HCCL_INTRA_ROCE_ENABLE:-1}
+# export HCCL_INTRA_PCIE_ENABLE=${HCCL_INTRA_PCIE_ENABLE:-0}
 export HCCL_SOCKET_FAMILY=${HCCL_SOCKET_FAMILY:-AF_INET}
 export HCCL_WHITELIST_DISABLE=${HCCL_WHITELIST_DISABLE:-1}
 export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
@@ -159,7 +162,7 @@ export GLOO_SOCKET_IFNAME="${SOCKET_IFNAME}"
 export TP_SOCKET_IFNAME="${SOCKET_IFNAME}"
 export HCCL_IF_IP="${CURRENT_IP}"
 
-POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
+POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8180}
 LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
 USE_WANDB=0  # Disabled - no API key
 export USE_WANDB
@@ -226,7 +229,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-4}"
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-8}"
    --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-32768}"
-   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
+   --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-262144}"
    --rollout-temperature 0.7
    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
    --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
@@ -263,7 +266,7 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU:-32768}"
    --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-64}"
-   --seq-length "${SEQ_LENGTH:-131072}"
+   --seq-length "${SEQ_LENGTH:-262144}"
 )
 
 GRPO_ARGS=(
@@ -300,9 +303,10 @@ VLLM_ARGS=(
    --vllm-enable-expert-parallel
    --vllm-gpu-memory-utilization "${VLLM_GPU_MEM_UTIL:-0.8}"
    --vllm-max-num-seqs "${VLLM_MAX_NUM_SEQS:-96}"
-   --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-131072}"
+   --vllm-max-num-batched-tokens "${VLLM_MAX_NUM_BATCHED_TOKENS:-16384}"
+   --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-262144}"
    --vllm-enable-sleep-mode
-   --vllm-speculative-config '{"method":"mtp","num_speculative_tokens":3}'  # Disabled: 0% acceptance rate
+   --vllm-speculative-config '{"method":"mtp","num_speculative_tokens":3}'
    --vllm-compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
    --vllm-config "${VLLM_PD_CONFIG}"
    --disaggregation-backend mooncake
