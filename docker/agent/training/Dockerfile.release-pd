@@ -1,0 +1,341 @@
+# =============================================================================
+# vime PD dev image — RELEASE / one-click build for external hand-off
+# Target: A3 (Ascend 910_93-class) / aarch64, CANN 9.0.0
+#
+# Variant of Dockerfile.release with the vLLM stack upgraded to v0.23.0 and a
+# PD-disaggregation data plane (Mooncake) added. Same dependency model: clone
+# each dep from its OFFICIAL public upstream at a pinned ref, then apply a
+# small vime patch (patches/*.patch). No private forks, no local COPY of repos.
+# Deliverable = this Dockerfile + patches/ (+ optional wheels/). Build context
+# is tiny; build from a minimal dir (see BUILD below).
+#
+# Official baselines + patch sizes (each verified to apply cleanly on the
+# pristine baseline via `git apply --check`):
+#   vllm         vllm-project/vllm        @ v0.23.0   + patch  4 files
+#       (vllm-pd.patch: polar telemetry TTFT/decode instrumentation +
+#        qwen3.5/3.6 FusedMoE weight_loader re-attach for EP RL weight-sync.
+#        Extracted by extract_pd_patches.sh from ljyrj/vllm@releases/v0.23.0)
+#   vllm-ascend  vllm-project/vllm-ascend @ 88eac271  + patch  3 files
+#       (vllm-ascend-pd.patch: camem assert->warning + disable
+#        patch_dp_device_ids for vLLM v0.23.0 compat.
+#        IMPORTANT: the baseline is commit 88eac271 on the official
+#        releases/v0.23.0 BRANCH, NOT the v0.23.0 tag — the fork this patch
+#        was extracted from (ljyrj/vllm-ascend-023@vime-adapter-v023) is based
+#        on the branch and does not contain the tag commit.)
+#   Mooncake     kvcache-ai/Mooncake       @ v0.3.9   (no patch)
+#       (PD KV-transfer data plane, built -DUSE_ASCEND_DIRECT=ON; pulls in
+#        Go 1.23.8 / MPICH 4.2.3 / yalantinglibs 0.5.7 below)
+#   Megatron-LM  NVIDIA/Megatron-LM        @ 3714d81d + patch 22 files
+#   MindSpeed    gitcode Ascend/MindSpeed  @ fc63de5c + patch 26 files (GDN kernels)
+#   fla_npu      flashserve/flash-linear-attention-npu @ v26.1.0 (no patch)
+#   vime         github.com/BryanChen408/vime @ a3-pd (no patch)
+#       (a3-pd carries the PD runtime: mooncake proxy server, session-affinity
+#        router, PD rollout wiring in vime/ray/rollout.py)
+#
+# Baseline provenance: same as Dockerfile.release for the training stack
+# (Megatron/MindSpeed pins from the Ascend slime-ascend qwen3.5-9B tutorial).
+# vllm/vllm-ascend 0.23 baselines verified against local clones of both the
+# official repos and the former private forks (see extract_pd_patches.sh).
+#
+# Baked-in runtime fixes (previously applied by hand in the container):
+#   ENV VLLM_VERSION=0.23.0 ; patchelf $$ORIGIN->$ORIGIN on vllm_ascend_C*.so
+#   (patchelf runs inside build_npu_kernels.sh after the deferred kernel build).
+# Base note: quay.io/ascend/cann:9.0.0-a3-* ships the ascend910_93 op kernels,
+#   so no separate A3-ops .run is needed. CANN env at ascend-toolkit/set_env.sh.
+#   triton-ascend==3.2.1 is not on public PyPI (from PIP_INDEX_URL or ./wheels/).
+#   Base is py3.12; pins are py3.12-compatible.
+#
+# Dependency-version notes (verified against the official 0.23 baselines):
+#   - vllm-ascend@88eac271 declares torch==2.10.0 / triton-ascend==3.2.1 — an
+#     exact match for the training-stack pins below. It also declares
+#     torch-npu==2.10.0.post2 and transformers==5.5.4; we keep STOCK
+#     torch-npu 2.10.0 (fla_npu torchnpugen requirement) and transformers
+#     5.12.1 (training-stack-validated; vllm v0.23.0 allows both 5.5.4 and
+#     5.12.1). If PD smoke hits transformers/torch-npu issues, revisit these.
+#   - vllm v0.23.0 requires llguidance >=1.7.0,<1.8.0 — hence the bump from
+#     the 1.3.0 pin used by Dockerfile.release.
+#
+# BUILD (minimal context — avoids shipping /workspace):
+#   mkdir -p /tmp/vime-release-pd && cp -r Dockerfile.release-pd patches wheels /tmp/vime-release-pd/
+#   docker build -f Dockerfile.release-pd -t vime:a3-pd-release /tmp/vime-release-pd
+# =============================================================================
+
+ARG BASE_IMAGE=quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.12
+FROM ${BASE_IMAGE}
+
+# --- proxy / pip-mirror / optional wheel ---
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG NO_PROXY="localhost,127.0.0.1,::1"
+ARG no_proxy
+ARG PIP_INDEX_URL
+ARG PIP_TRUSTED_HOST
+ARG GIT_SSL_NO_VERIFY=1
+ARG TRITON_ASCEND_WHEEL=
+
+# --- dependency sources: OFFICIAL upstream repo + pinned baseline ref ---
+# (override with --build-arg to repoint; refs are pinned for reproducibility)
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_REF=v0.23.0
+ARG VLLM_ASCEND_REPO=https://github.com/vllm-project/vllm-ascend.git
+# Commit on the official releases/v0.23.0 branch (see header note — NOT the tag)
+ARG VLLM_ASCEND_REF=88eac2713b14beedc7a48803274f8d6cee3e9f30
+ARG MEGATRON_REPO=https://github.com/NVIDIA/Megatron-LM.git
+ARG MEGATRON_REF=3714d81d
+ARG MINDSPEED_REPO=https://gitcode.com/Ascend/MindSpeed.git
+ARG MINDSPEED_REF=fc63de5c
+ARG FLA_REPO=https://github.com/flashserve/flash-linear-attention-npu.git
+ARG FLA_REF=v26.1.0
+# vime — public repo, branch a3-pd (PD runtime + reward shaping). No patch.
+ARG VIME_REPO=https://github.com/BryanChen408/vime.git
+ARG VIME_REF=a3-pd
+
+# --- PD data plane (Mooncake) pinned versions ---
+# Go tarball mirror: Aliyun (the Tsinghua mirror proved unreliable in the
+# field — see vime commit aa0a3408 which switched the same download over).
+ARG GO_VERSION=1.23.8
+ARG GO_MIRROR=https://mirrors.aliyun.com/golang
+ARG MPICH_VERSION=4.2.3
+ARG YALANTINGLIBS_VERSION=0.5.7
+ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
+ARG MOONCAKE_REF=v0.3.9
+
+# A3 SoC + fla_npu GDN op set
+ARG FLA_SOC=ascend910_93
+ARG FLA_OPS=chunk_bwd_dv_local,chunk_bwd_dqkwg,chunk_gated_delta_rule_bwd_dhu,prepare_wy_repr_bwd_da,prepare_wy_repr_bwd_full,chunk_fwd_o,chunk_gated_delta_rule_fwd_h,recurrent_gated_delta_rule,recompute_wu_fwd,causal_conv1d
+
+ENV HTTP_PROXY=${HTTP_PROXY:-} \
+    HTTPS_PROXY=${HTTPS_PROXY:-} \
+    http_proxy=${http_proxy:-} \
+    https_proxy=${https_proxy:-} \
+    NO_PROXY="${NO_PROXY}" \
+    no_proxy="${no_proxy}" \
+    PIP_INDEX_URL=${PIP_INDEX_URL:-} \
+    PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST:-} \
+    GIT_SSL_NO_VERIFY=${GIT_SSL_NO_VERIFY}
+
+ENV CANN_HOME=/usr/local/Ascend/ascend-toolkit/latest
+ENV CANN_SETENV_A=/usr/local/Ascend/ascend-toolkit/set_env.sh
+ENV CANN_SETENV_B=/usr/local/Ascend/cann-9.0.0/set_env.sh
+
+# apt deps: base tools + fla_npu build deps + patchelf (RUNPATH fix)
+#           + Mooncake build deps (RDMA/gRPC/boost/etc.)
+RUN set -ex; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    # some base images ship apt keyrings not readable by the '_apt' user, which
+    # makes apt-get update fail with NO_PUBKEY; make them world-readable. No-op
+    # on a healthy base. Fall back to an insecure update only if that isn't enough.
+    chmod 0644 /etc/apt/trusted.gpg.d/*.gpg /etc/apt/keyrings/*.gpg 2>/dev/null || true; \
+    apt-get update \
+      || apt-get -o Acquire::AllowInsecureRepositories=true \
+                 -o Acquire::AllowDowngradeToInsecureRepositories=true update; \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        sshpass kmod numactl libjemalloc2 libjemalloc-dev patchelf \
+        git gawk pigz dos2unix libgtest-dev libgmock-dev pkg-config \
+        build-essential cmake make patch \
+        wget curl ca-certificates \
+        # --- Mooncake build deps ---
+        libibverbs-dev liburing-dev \
+        libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+        libboost-all-dev libhiredis-dev \
+        libyaml-cpp-dev libjsoncpp-dev libgoogle-glog-dev \
+        libasio-dev libcurl4-openssl-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+# NOTE: the first two lines cover what fla_npu's install_deps.sh would install
+# (gawk/pigz/dos2unix/gtest/cmake/make/gcc/patch); we install them directly and
+# skip install_deps.sh, which uses sudo + interactive prompts that stall in a
+# non-interactive docker build.
+
+# ============================ PD data plane ==================================
+# Mooncake is pure C++/Go: it needs CANN headers + the apt deps above, but NO
+# python packages — so it is built before the (slow) python/torch layers to
+# fail fast. ASCEND_DIRECT is the NPU-to-NPU KV direct-transfer path.
+
+# --- Go toolchain (Mooncake build requirement) ---
+RUN set -ex; \
+    wget --no-check-certificate -O /tmp/go.tgz \
+        "${GO_MIRROR}/go${GO_VERSION}.linux-arm64.tar.gz"; \
+    tar -C /usr/local -xzf /tmp/go.tgz; \
+    rm /tmp/go.tgz; \
+    /usr/local/go/bin/go version
+ENV PATH=/usr/local/go/bin:${PATH} \
+    GOPATH=/root/go \
+    GOPROXY=https://goproxy.cn,direct \
+    GO111MODULE=on
+
+# --- MPICH (Mooncake dependency) ---
+RUN set -ex; \
+    cd /tmp; \
+    wget -q "https://www.mpich.org/static/downloads/${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz"; \
+    tar -xzf "mpich-${MPICH_VERSION}.tar.gz"; \
+    cd "mpich-${MPICH_VERSION}"; \
+    ./configure --prefix=/usr/local --disable-fortran; \
+    make -j"$(nproc)"; \
+    make install; \
+    cd /tmp && rm -rf "mpich-${MPICH_VERSION}"*
+
+# --- yalantinglibs (Mooncake dependency) ---
+RUN set -ex; \
+    cd /tmp; \
+    git clone --depth 1 --branch "${YALANTINGLIBS_VERSION}" \
+        https://github.com/alibaba/yalantinglibs.git; \
+    cd yalantinglibs && mkdir build && cd build; \
+    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF; \
+    cmake --build . -j"$(nproc)"; \
+    cmake --install .; \
+    cd /tmp && rm -rf yalantinglibs
+
+# --- Mooncake v0.3.9 (official, no patch) with ASCEND_DIRECT ---
+RUN set -ex; \
+    cd /workspace; \
+    git clone --depth 1 --branch "${MOONCAKE_REF}" "${MOONCAKE_REPO}" Mooncake; \
+    cd Mooncake && git submodule update --init --recursive --recommend-shallow; \
+    { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    mkdir -p build && cd build; \
+    cmake .. -DUSE_ASCEND_DIRECT=ON; \
+    make -j"$(nproc)"; \
+    make install
+
+# ============================ Python stack ===================================
+
+# --- PyTorch stack (keep torch-npu STOCK 2.10.0 for fla_npu torchnpugen) ---
+# vllm-ascend@88eac271 declares torch==2.10.0 / triton-ascend==3.2.1 — exact
+# match with these pins. It declares torch-npu==2.10.0.post2; keep stock
+# unless the deferred kernel build proves otherwise (see header notes).
+RUN pip install --no-cache-dir \
+        torch==2.10.0 torch-npu==2.10.0 torchvision==0.25.0 torchaudio==2.10.0
+
+RUN pip install --no-cache-dir \
+        accelerate==1.13.0 datasets==4.8.5 einops==0.8.2 gpytorch==1.15.2 \
+        jsonargparse==4.49.0 mbridge==0.15.1 safetensors==0.7.0 \
+        tokenizers==0.22.2 transformers==5.12.1 huggingface_hub==1.21.0 \
+        sentencepiece==0.2.1 peft==0.19.1 timm==1.0.27 scipy==1.13.1 \
+        scikit-learn==1.9.0 pandas==3.0.3 numpy==1.26.4 ninja==1.13.0 \
+        pybind11==3.0.4 protobuf==6.33.6
+
+# triton-ascend — the vime stack was validated on 3.2.1, which is NOT on public
+# PyPI: download the aarch64 wheel from https://gitcode.com/Ascend/triton-ascend/releases
+# (3.2.1 needs CANN 9.0.0 B160+), drop it in ./wheels/, and pass
+#   --build-arg TRITON_ASCEND_WHEEL=<that-wheel-filename>
+# See README.md. NO fallback: 3.2.1 is not on public PyPI, so if neither a wheel
+# nor a 3.2.1-serving PIP_INDEX_URL is given the build ERRORS OUT (by design).
+COPY wheels/ /tmp/wheels/
+RUN set -ex; \
+    if [ -n "${TRITON_ASCEND_WHEEL}" ] && [ -f "/tmp/wheels/${TRITON_ASCEND_WHEEL}" ]; then \
+        pip install --no-cache-dir "/tmp/wheels/${TRITON_ASCEND_WHEEL}"; \
+    elif [ -n "${PIP_INDEX_URL}" ]; then \
+        pip install --no-cache-dir triton-ascend==3.2.1; \
+    else \
+        echo "ERROR: triton-ascend 3.2.1 is required and is NOT on public PyPI." >&2; \
+        echo "  Put the wheel in wheels/ and pass --build-arg TRITON_ASCEND_WHEEL=<file>," >&2; \
+        echo "  or pass --build-arg PIP_INDEX_URL=<mirror-with-3.2.1>." >&2; \
+        exit 1; \
+    fi
+
+RUN pip install --no-cache-dir \
+        ray[default]==2.48.0 vllm-router==0.1.14 blobfile==3.2.0 wandb==0.27.2 \
+        memray==1.19.3 tabulate==0.10.0 ring-flash-attn==0.1.8
+
+RUN pip install --no-cache-dir --no-deps latex2sympy2==1.9.1
+# NOTE: llguidance bumped 1.3.0 -> 1.7.x: vllm v0.23.0 requires
+# llguidance >=1.7.0,<1.8.0 (Dockerfile.release's 1.3.0 pin cannot resolve).
+RUN pip install --no-cache-dir \
+        pylatexenc==2.10 omegaconf==2.3.1 antlr4-python3-runtime==4.9.3 \
+        openai==2.43.0 pyarrow av==17.0.1 hf_xet==1.5.0 modelscope==1.37.1 \
+        aiohttp==3.14.0 fastapi==0.123.10 uvicorn==0.49.0 httpx==0.28.1 \
+        tiktoken==0.13.0 pyzmq==27.1.0 sentencepiece==0.2.1 GitPython==3.1.50 \
+        xgrammar==0.2.2 partial-json-parser==0.2.1.1.post7 llguidance==1.7.0 \
+        outlines-core==0.2.14
+
+RUN pip install -U setuptools pip setuptools_rust setuptools_scm nanobind
+RUN ln -sf "$(command -v ninja)" /usr/local/bin/ninja && /usr/local/bin/ninja --version
+
+# vime patches applied on top of the pinned official baselines
+COPY patches/ /tmp/patches/
+
+WORKDIR /workspace
+
+# --- vime (your own repo; no patch). a3-pd carries the PD runtime. ---
+RUN git clone "${VIME_REPO}" /workspace/vime && git -C /workspace/vime checkout "${VIME_REF}"
+RUN { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    pip install --no-cache-dir -e /workspace/vime --no-build-isolation
+
+# --- vllm: official v0.23.0 + vllm-pd.patch (device-less build) ---
+RUN git clone "${VLLM_REPO}" /workspace/vllm && git -C /workspace/vllm checkout "${VLLM_REF}" && \
+    git -C /workspace/vllm apply /tmp/patches/vllm-pd.patch
+RUN { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    VLLM_TARGET_DEVICE=empty pip install --no-cache-dir -v -e /workspace/vllm --no-build-isolation
+
+# Re-pin numpy (vllm pulls 2.x unpinned → breaks triton-ascend numpy-1 ABI)
+RUN pip install --no-cache-dir "numpy==1.26.0"
+
+# --- vllm-ascend: official releases/v0.23.0 branch @ 88eac271 + patch —
+# SOURCE ONLY (clone + patch + catlass submodule). The custom AscendC kernel
+# compile is DEFERRED to build_npu_kernels.sh (run inside the container on an
+# NPU host), because it needs npu-smi + the bisheng compiler + a real NPU env
+# that a docker build lacks. See README "first run".
+RUN git clone --recursive "${VLLM_ASCEND_REPO}" /workspace/vllm-ascend && \
+    git -C /workspace/vllm-ascend checkout "${VLLM_ASCEND_REF}" && \
+    git -C /workspace/vllm-ascend submodule update --init --recursive && \
+    git -C /workspace/vllm-ascend apply /tmp/patches/vllm-ascend-pd.patch
+
+# --- MindSpeed: official Ascend/MindSpeed @ fc63de5c + patch (GDN kernels) ---
+RUN git clone "${MINDSPEED_REPO}" /workspace/MindSpeed && git -C /workspace/MindSpeed checkout "${MINDSPEED_REF}" && \
+    git -C /workspace/MindSpeed apply /tmp/patches/mindspeed-vime.patch
+RUN { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    find /workspace/MindSpeed -name CMakeCache.txt -delete 2>/dev/null || true; \
+    pip install -v --no-cache-dir -e /workspace/MindSpeed --no-build-isolation
+
+# --- fla_npu: MindSpeed hard-imports it. SOURCE ONLY (clone + checkout). Its
+# AscendC op build (build.sh --soc --pkg --ops -> install .run ->
+# torch_custom/fla_npu/build.sh) is DEFERRED to build_npu_kernels.sh — it needs
+# bisheng + NPU env like vllm-ascend. Follows the slime-ascend tutorial there.
+RUN git clone "${FLA_REPO}" /workspace/flash-linear-attention-npu && \
+    git -C /workspace/flash-linear-attention-npu checkout "${FLA_REF}"
+# fla_npu vendor-op lib path at runtime (populated by build_npu_kernels.sh's .run
+# install). Both CANN layouts covered (ascend-toolkit/latest and cann-9.0.0).
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/cann-9.0.0/opp/vendors/custom_transformer/op_api/lib:${LD_LIBRARY_PATH}
+
+# --- Megatron-LM: official NVIDIA @ 3714d81d + patch (in-place, on PYTHONPATH) ---
+RUN git clone "${MEGATRON_REPO}" /workspace/Megatron-LM && git -C /workspace/Megatron-LM checkout "${MEGATRON_REF}" && \
+    git -C /workspace/Megatron-LM apply /tmp/patches/megatron-vime.patch
+ENV PYTHONPATH=/workspace/Megatron-LM:${PYTHONPATH}
+
+# Deferred NPU-kernel build script — run ONCE inside the container on an NPU host
+# to compile vllm-ascend custom AscendC kernels + fla_npu ops. See README.
+# verify_mooncake_pd.sh — standalone Mooncake PD data-plane verification
+# (linkage + vllm connector registry); see README section 5 "First run".
+COPY build_npu_kernels.sh verify_mooncake_pd.sh /workspace/
+RUN chmod +x /workspace/build_npu_kernels.sh /workspace/verify_mooncake_pd.sh
+
+# A3 chip + fla op set for build_npu_kernels.sh (npu-smi also auto-detects at runtime)
+ENV SOC_VERSION=ascend910_9391
+ENV FLA_SOC=${FLA_SOC}
+ENV FLA_OPS=${FLA_OPS}
+
+# vllm-ascend's vllm_version_is() guard for the v0.23.0 stack
+ENV VLLM_VERSION=0.23.0
+
+# ============================ Build-time smoke ===============================
+# Fail fast at image-build time instead of first NPU run:
+#   1. vllm imports (editable device-less install is importable);
+#   2. vllm's KV connector registry contains MooncakeConnectorV1 — this is
+#      exactly what vime/backends/vllm_utils/vllm_engine.py checks at runtime;
+#      without it PD cannot start;
+#   3. mooncake python bindings import (installed by Mooncake's make install).
+RUN python3 -c "\
+import vllm; \
+print('vllm', vllm.__version__); \
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory; \
+assert 'MooncakeConnectorV1' in KVConnectorFactory._registry, \
+    'MooncakeConnectorV1 not in vllm KV connector registry — PD will not start'; \
+print('MooncakeConnectorV1 registered: OK'); \
+import mooncake; \
+print('mooncake import: OK')"
+
+# Scrub build-time proxy so it never leaks into the running container
+ENV http_proxy= https_proxy= no_proxy= HTTP_PROXY= HTTPS_PROXY= NO_PROXY=
+
+CMD ["bash"]
