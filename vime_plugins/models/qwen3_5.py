@@ -622,6 +622,16 @@ def get_qwen3_5_spec(args, config, vp_stage):
 
     for layer_id in range(num_layers_to_build):
         if text_config.layer_types[layer_id + offset] == "linear_attention":
+            # [fix 2026-08-20] 环境无 NVIDIA transformer_engine 时,Megatron extensions 把
+            # core_attention 兜底成 MagicMock,deepcopy 会炸("cannot pickle 'cell' object")。
+            # 这些 GDN 层的 self_attention 随后整体被替换(下方 ModuleSpec(module=Attention)),
+            # 原 core_attention 不会被使用 —— deepcopy 前换成可用的本地实现即可。
+            _sa = transformer_layer_spec.layer_specs[layer_id].submodules.self_attention
+            _ca = getattr(_sa.submodules, "core_attention", None)
+            if _ca is not None and "Mock" in type(_ca).__name__:
+                from megatron.core.transformer.dot_product_attention import DotProductAttention
+
+                _sa.submodules.core_attention = DotProductAttention
             layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
             layer_specs.submodules.self_attention = ModuleSpec(
                 module=Attention,
