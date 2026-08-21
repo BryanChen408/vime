@@ -4,7 +4,8 @@
 # 与 start_pd.sh(异步分离)/ start_cola.sh(纯 colocate)的差异:
 #   * 入口 train.py(同步循环:收齐 → 训练 → 权重同步 → 再收),TRAIN_ENTRY 直切。
 #   * 布局 resource_layout.hybrid56cola64infer.yaml:
-#       .56 16 卡 = 训练 + 8 个 TP2 引擎(共卡分时);.64 4-15 = 6 个 TP2 引擎(纯推理)。
+#       .56 卡 1-14 = 7 个 TP2 引擎(共卡分时;卡 0 只训不推 —— HCCL 不允许权重同步域内
+#       trainer rank 0 与引擎 rank 同卡);.64 4-15 = 6 个 TP2 引擎(纯推理)。
 #   * FEAT_OFFLOAD=1:训推双侧 offload(训练窗口全部引擎 sleep;.56 引擎靠 needs_offload
 #     命中,.64 引擎不重叠不 sleep、常驻 —— 但网关被 prepare_policy_update 暂停,语义仍是同步)。
 #   * 权重同步走分布式 HCCL(world=1+28),不经 colocate 的 IPC 路径。
@@ -18,9 +19,9 @@
 #   rollout 窗口:.56 引擎 49G + 训练参数驻留 ~5G(default offloader 不卸参数) ✓
 #   train 窗口:训练 ~52G + 引擎 sleep 释放 ✓
 #   权重同步:引擎醒(权重 35G,无 KV)+ 训练参数+聚合缓冲 ~7G ✓
-#   host 预算(共卡 4 引擎驻留 4×70G=280G):训练 host ~700G + 驻留 280G + plasma 200G
-#     + 基线 ~150G ≈ 1.33T / 2T,富余充足。(磁盘重载 level=2 路径已否决:reload 在丢弃后
-#     storage 上 ACL 失败;故共卡引擎从 8 减到 4 来控制驻留。)
+#   host 预算(共卡 7 引擎驻留 7×70G=490G):训练 host ~1010G(实测) + 驻留 490G + plasma 200G
+#     + 基线 ~150G ≈ 1.85T / 2T,配 RAY_memory_usage_threshold=0.99 过启动瞬态。
+#     (磁盘重载 level=2 路径已否决:reload 在丢弃后 storage 上 ACL 失败;驻留靠共卡引擎数控制。)
 #   切勿设 VIME_OFFLOAD_PARAM_BUFFER=1(B 模式卸参数,会在权重同步时无参数可发)。
 # ─────────────────────────────────────────────────────────────────────────────
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
@@ -30,7 +31,7 @@ TRAIN_ENTRY=train.py \
 FEAT_OFFLOAD=1 \
 RESOURCE_LAYOUT=/workspace/vime/scripts/resource_layout.hybrid56cola64infer.yaml \
 ROLLOUT_NODE_IP=80.48.5.56 \
-ROLLOUT_NUM_GPUS=28 \
+ROLLOUT_NUM_GPUS=26 \
 ROLLOUT_NUM_GPUS_PER_ENGINE=2 \
 FEAT_PD_DISAGG=0 \
 VLLM_GPU_MEM_UTIL=0.80 \

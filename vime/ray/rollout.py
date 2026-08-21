@@ -198,12 +198,17 @@ class ServerGroup:
         spec = getattr(self.args, "resource_layout_spec", None)
         if spec is None or not getattr(spec, "rollout_has_share", False):
             return list(range(len(self.all_engines)))
-        megatron_num_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
+        # 共卡段约定写在 rollout 列表最前且连续(资源布局校验保证),故共享槽位
+        # 就是前 rollout_shared_num_gpus 个。判定必须跟**实际共享卡数**比,而不是
+        # megatron_num_gpus —— 两者在 HCCL 排他约束下会不同(权重同步域不允许
+        # trainer rank 0 与引擎 rank 同卡,共卡段须剔除 actor 首卡,见
+        # resource_layout.hybrid56cola64infer.yaml 注释)。
+        shared_num_gpus = spec.rollout_shared_num_gpus
         per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
         return [
             i
             for i in range(len(self.all_engines))
-            if self.gpu_offset + i * per_engine < megatron_num_gpus
+            if self.gpu_offset + i * per_engine < shared_num_gpus
         ]
 
     def offload(self):
