@@ -143,6 +143,22 @@ def _merge_ipc_update_infos(infos: Sequence[dict[str, list]]) -> dict[str, list]
     }
 
 
+def count_colocated_engines(
+    engine_gpu_offsets: Sequence[int], engine_gpu_counts: Sequence[int], total_actor_gpus: int
+) -> int:
+    """共卡(IPC)引擎数:GPU 槽位完全落在 actor 卡范围内的前缀引擎个数。
+
+    槽位在范围内的引擎走 IPC(与 actor 同节点);第一个越界的引擎及其后全部走
+    HCCL。专用段必须从越界处开始且连续(布局校验保证共卡段在前)。
+    """
+    colocate_engine_nums = 0
+    for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
+        if gpu_offset + gpu_count > total_actor_gpus:
+            break
+        colocate_engine_nums += 1
+    return colocate_engine_nums
+
+
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
@@ -218,11 +234,7 @@ class UpdateWeightFromTensor:
 
         # Compute colocated engine count: engines whose GPUs fall within actor GPU range.
         total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
-        colocate_engine_nums = 0
-        for gpu_offset, gpu_count in zip(engine_gpu_offsets, engine_gpu_counts, strict=True):
-            if gpu_offset + gpu_count > total_actor_gpus:
-                break
-            colocate_engine_nums += 1
+        colocate_engine_nums = count_colocated_engines(engine_gpu_offsets, engine_gpu_counts, total_actor_gpus)
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
 
