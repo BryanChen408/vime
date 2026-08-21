@@ -437,6 +437,32 @@ class _VLLMHijack:
         IPCWeightTransferEngine.receive_weights = _vime_receive_weights
         IPCWeightTransferEngine._vime_receive_patched = True  # type: ignore[attr-defined]
 
+        # vllm-ascend-023 的 NPUWorker 原生 start_weight_update 缺 weight_loader 重补丁:
+        # CaMem wake_up 的 w2/w13 transpose 重接线会造出丢失 weight_loader 的裸
+        # Parameter,layerwise reload 的 load_weights 会在 MoE 专家权重上炸
+        # AttributeError。在引擎子进程内包一层:先 capture/restore attrs,再委托原生。
+        try:
+            from vllm_ascend.worker.worker import NPUWorker
+        except Exception:
+            NPUWorker = None
+        if NPUWorker is not None and not getattr(NPUWorker, "_vime_start_patched", False):
+            _orig_start = NPUWorker.start_weight_update
+
+            def _vime_start_weight_update(self, is_checkpoint_format: bool = True, _orig=_orig_start):
+                model = self.model_runner.model
+                _capture_vllm_param_attrs(model)  # 首次后 no-op
+                patched = _restore_vllm_param_attrs(model)
+                if patched:
+                    logger.debug(
+                        "Re-patched weight_loader attrs on %d params: %s",
+                        len(patched),
+                        ", ".join(sorted(patched)[:10]),
+                    )
+                return _orig(self, is_checkpoint_format)
+
+            NPUWorker.start_weight_update = _vime_start_weight_update
+            NPUWorker._vime_start_patched = True  # type: ignore[attr-defined]
+
 
 def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
     """Copy vLLM custom attrs (set via ``set_weight_attrs``) from *src* to *dst*.
@@ -645,61 +671,7 @@ class vLLMColocateWorkerExtension:
         torch.accelerator.synchronize()
 
     # ── IPC weight-update lifecycle (init / start / finish) ───────────────────
-    # vllm's CUDA Worker (gpu_worker.py) provides these, but vllm-ascend's NPUWorker
-    # does not, so the extension supplies them. The vime IPC path reconstructs handles
-    # inline in update_weights_chunk and never uses a weight_transfer_engine, so engine
-    # init is a no-op and start/finish only manage the layerwise-reload + active flag.
-
-    def init_weight_transfer_engine(self, init_info: dict) -> None:
-        """No-op for the colocate IPC path (update_weights_chunk needs no transfer engine)."""
-        return None
-
-    def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
-        if getattr(self, "_weight_update_active", False):
-            raise RuntimeError(
-                "start_weight_update called while a weight update is already active. "
-                "Call finish_weight_update first."
-            )
-
-        model = self.model_runner.model
-
-        # ── Re-patch vLLM weight_loader attributes ──────────────────────────
-        # VERL-style re-patch: async IPC weight sync can happen long after
-        # init, and sleep level ≥ 2 discards param objects (CaMem pool reset)
-        # → weight_loader / weight_loader_impl / output_dim / etc. are lost.
-        # Capture once on first call, then re-apply any missing attributes on
-        # every subsequent call.  Idempotent — already-present attrs are
-        # NOT overwritten.
-        _capture_vllm_param_attrs(model)  # no-op after first call
-        patched = _restore_vllm_param_attrs(model)
-        if patched:
-            logger.debug(
-                "Re-patched weight_loader attrs on %d params: %s",
-                len(patched),
-                ", ".join(sorted(patched)[:10]),
-            )
-
-        # Layerwise reload un-does vllm's post-load kernel-format fusion so
-        # params are loadable again (they otherwise lack a weight_loader
-        # after process_weights_after_loading).  The earlier aclnnInplaceCopy
-        # failure here was because vllm was OFFLOADED (param.data on host);
-        # with --no-offload-rollout the params stay on NPU and the restore
-        # copy is d2d-valid.
-        if is_checkpoint_format:
-            from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
-
-            with torch.device(self.device):
-                initialize_layerwise_reload(model)
-        self._is_checkpoint_format = is_checkpoint_format
-        self._weight_update_active = True
-
-    def finish_weight_update(self) -> None:
-        if not getattr(self, "_weight_update_active", False):
-            raise RuntimeError("start_weight_update must be called before finish_weight_update.")
-        if self._is_checkpoint_format:
-            from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
-
-            model = self.model_runner.model
-            with torch.device(self.device):
-                finalize_layerwise_reload(model, self.model_config)
-        self._weight_update_active = False
+    # 当前 vllm-ascend-023 的 NPUWorker 已原生提供这三个方法(worker.py:289-375),
+    # 扩展类若再定义会触发 vLLM 的"属性冲突"断言导致 WorkerProc 起不来(2026-08-21
+    # 实爆)。故生命周期走原生方法;原生 start_weight_update 缺的 weight_loader
+    # 重补丁由 _VLLMHijack 在引擎子进程内包装注入(见 hijack)。

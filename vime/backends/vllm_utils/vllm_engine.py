@@ -566,7 +566,11 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
             _serialize_weight_transfer_config(args.vllm_weight_transfer_config),
         ]
     elif _colocated_engine:
-        cmd += ["--weight-transfer-config", '{"backend":"ipc"}']
+        # npu_ipc 而非 ipc:vllm-ascend 注册的 NPU 原生 IPC 引擎(torch_npu 的
+        # _share_npu_/rebuild_npu_tensor);vllm core 的 "ipc" 是 CUDA 语义。
+        # vime 的 update_weights_chunk 实际绕过 transfer engine,这里主要是构造期
+        # 与生命周期空操作不出错。
+        cmd += ["--weight-transfer-config", '{"backend":"npu_ipc"}']
     else:
         cmd += ["--weight-transfer-config", '{"backend":"nccl"}']
 
