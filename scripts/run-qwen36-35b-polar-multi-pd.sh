@@ -91,8 +91,9 @@ ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
 #     所以 ROLLOUT_NUM_GPUS 必须自己就等于 ACTOR_NUM_GPUS_PER_NODE*ACTOR_NUM_NODES,否则只是被静默改写;
 #   * 入口切 train.py —— train_async.py:11 有 assert not args.colocate。
 FEAT_COLOCATE=${FEAT_COLOCATE:-0}
-# train_async.py:11 assert not args.colocate → colocate 只能走同步入口
-TRAIN_ENTRY=$([ "${FEAT_COLOCATE}" = "1" ] && echo train.py || echo train_async.py)
+# train_async.py:11 assert not args.colocate → colocate 只能走同步入口;
+# TRAIN_ENTRY 可被环境变量覆盖(如混合同步部署用 TRAIN_ENTRY=train.py 直切,不经 FEAT_COLOCATE)。
+TRAIN_ENTRY=${TRAIN_ENTRY:-$([ "${FEAT_COLOCATE}" = "1" ] && echo train.py || echo train_async.py)}
 if [ "${FEAT_COLOCATE}" = "1" ]; then
    RESOURCE_LAYOUT=""
    ROLLOUT_NODE_IP="${MASTER_ADDR}"        # 引擎与 actor 同节点,metrics/proxy 发现目标随之回到本机
@@ -222,7 +223,7 @@ echo "[topo] role=${NODE_ROLE} ip=${CURRENT_IP} if=${SOCKET_IFNAME} npus=${NPUS_
 echo "[topo] actor=8卡@${MASTER_ADDR}  rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT_NODE_IP}(PD 1P3D tp4)  proxy=${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}"
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
-LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
+LOG_FILE=${LOG_FILE:-/mnt/pipeline-data/train_log/train_${RUN_ID}.log}
 mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
 
 # ─── 参数分组 ───
@@ -340,7 +341,7 @@ GRPO_ARGS=(
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 1e-6
+   --lr 2e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
@@ -353,7 +354,10 @@ OPTIMIZER_ARGS=(
 # actor 与 rollout 分居不同节点、卡不重叠 → 无需 offload 腾显存。
 # colocate 下两者共卡,必须 offload 才腾得出显存(不传的话 arguments.py:1888 也会强制置 True,
 # 这里显式留空是为了避免 --no-offload-* 与那段强制逻辑冲突)。
-if [ "${FEAT_COLOCATE:-0}" = "1" ]; then
+# FEAT_OFFLOAD=1(混合部署):不经 colocate 开关,显式打开训/推双侧 offload。
+if [ "${FEAT_OFFLOAD:-0}" = "1" ]; then
+   OFFLOAD_ARGS=(--offload-train --offload-rollout)
+elif [ "${FEAT_COLOCATE:-0}" = "1" ]; then
    OFFLOAD_ARGS=()
 else
    OFFLOAD_ARGS=(--no-offload-train --no-offload-rollout)
@@ -539,21 +543,45 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
          # ─── 卡位闸门:layout 要求的 (node, devices) 必须真的在集群里 ───
          # layout 的 node 必须与 Ray 看到的节点 IP 一致、devices 必须与该节点暴露的卡号一致,
          # 否则 _build_layout_bundles(placement_group.py:108)会在建 PG 时才报错。这里提前拦。
+         # [hybrid] 共卡(share)布局不再是"单 rollout 节点 NPU==rollout_num_gpus":
+         # 改按 layout 逐节点校验「专用卡数」(actor 段 + rollout 专用段;共卡段复用 actor 的 bundle,不另计)。
          python3 - "${MASTER_ADDR}" "${ROLLOUT_NODE_IP}" "${ACTOR_NUM_GPUS_PER_NODE}" "${ROLLOUT_NUM_GPUS}" <<'PY'
-import sys, ray
+import os, sys, ray
 actor_ip, rollout_ip, want_actor, want_rollout = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 ray.init(address="auto", ignore_reinit_error=True, logging_level="ERROR")
 npu = {n["NodeManagerAddress"]: int(n["Resources"].get("NPU", 0)) for n in ray.nodes() if n.get("Alive")}
 print(f"[gate] per-node NPU: {npu}")
 errs = []
-if npu.get(actor_ip, 0) != want_actor:
-    errs.append(f"训练节点 {actor_ip} NPU={npu.get(actor_ip, 0)},期望 {want_actor}(该节点只应暴露 0-7)")
-if npu.get(rollout_ip, 0) != want_rollout:
-    errs.append(f"rollout 节点 {rollout_ip} NPU={npu.get(rollout_ip, 0)},期望 {want_rollout}")
+layout = None
+layout_path = os.environ.get("RESOURCE_LAYOUT") or None
+if layout_path and os.path.exists(layout_path):
+    try:
+        from vime.ray.resource_layout import load_resource_layout
+        layout = load_resource_layout(layout_path)
+    except Exception as e:
+        print(f"[gate] layout 解析失败({e}),退回扁平校验")
+if layout is not None and getattr(layout, "rollout_has_share", False):
+    want: dict[str, int] = {}
+    for item in layout.actor:
+        want[item.node] = want.get(item.node, 0) + len(item.devices)
+    for item in layout.rollout:
+        if not item.share:
+            want[item.node] = want.get(item.node, 0) + len(item.devices)
+    for node, cnt in sorted(want.items()):
+        if npu.get(node, 0) != cnt:
+            errs.append(f"节点 {node} NPU={npu.get(node, 0)},期望 {cnt}(layout 专用卡;共卡段复用 actor 不另计)")
+    if not errs:
+        print(f"[gate] OK(hybrid): {want}")
+else:
+    if npu.get(actor_ip, 0) != want_actor:
+        errs.append(f"训练节点 {actor_ip} NPU={npu.get(actor_ip, 0)},期望 {want_actor}")
+    if npu.get(rollout_ip, 0) != want_rollout:
+        errs.append(f"rollout 节点 {rollout_ip} NPU={npu.get(rollout_ip, 0)},期望 {want_rollout}")
+    if not errs:
+        print(f"[gate] OK: actor {want_actor}卡@{actor_ip} + rollout {want_rollout}卡@{rollout_ip}")
 if errs:
     print("[gate][FATAL] 卡位不对,拒绝启动:", *(" - " + e for e in errs), sep="\n")
     sys.exit(1)
-print(f"[gate] OK: actor {want_actor}卡@{actor_ip} + rollout {want_rollout}卡@{rollout_ip}")
 PY
          # layout 路径:清全局可见卡,交给 Ray 按 layout 钉卡(只影响 driver,raylet 不受影响)
          unset ASCEND_RT_VISIBLE_DEVICES HCCL_SOCKET_IFNAME GLOO_SOCKET_IFNAME TP_SOCKET_IFNAME HCCL_IF_IP
