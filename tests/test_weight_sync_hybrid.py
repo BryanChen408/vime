@@ -237,8 +237,51 @@ def test_ipc_borrowed_tensor_lifetime_with_clone():
     assert torch.equal(model.layer1.w_b, sb_ref), "layer1.w_b 被污染"
 
 
+# ─── 5. 共享专家校验的就绪门控(run 172029 .64 失败根因) ───────────────────────
+def _ready_gate(se_module):
+    """以最小 fake 调用 vllm-ascend 的就绪门控(不构造 AscendFusedMoE)。"""
+    from vllm_ascend.ops.fused_moe.fused_moe_0_23_0 import AscendFusedMoE
+
+    fake_self = types.SimpleNamespace(_shared_experts=se_module)
+    return AscendFusedMoE._shared_experts_ready_for_validation(fake_self)
+
+
+def _make_info(load_numel, load_numel_total):
+    from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
+
+    info = LayerReloadingInfo(restore_metadata=({}, {}), restore_device=torch.device("cpu"))
+    info.load_numel = load_numel
+    info.load_numel_total = load_numel_total
+    return info
+
+
+def test_shared_expert_validation_gate():
+    from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+    se = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+    try:
+        # 启动期(无会话条目)→ 就绪,保持启动校验
+        assert _ready_gate(se) is True
+
+        # reload 会话中,共享专家参数未到齐 → 未就绪(跳过,finish 兜底)
+        LAYERWISE_INFO[se[0]] = _make_info(0, 16)
+        assert _ready_gate(se) is False
+
+        # 到齐 → 就绪
+        LAYERWISE_INFO[se[0]] = _make_info(16, 16)
+        assert _ready_gate(se) is True
+
+        # 另一个子模块未初始化会话(total=None)→ 不阻塞
+        LAYERWISE_INFO[se[1]] = _make_info(0, None)
+        assert _ready_gate(se) is True
+    finally:
+        for m in (se[0], se[1]):
+            LAYERWISE_INFO.pop(m, None)
+
+
 def test_ipc_borrowed_tensor_without_clone_is_corrupted():
     # 反事实:没 clone 时,缓冲的 w_a 必然读到覆写后的 NaN(证明测试有效)
     model, (_s0_ref, sa_ref, _sb_ref) = _run_chunked_ipc_reload(clone_on_receive=False, garbage_between_chunks=True)
     assert torch.isnan(model.layer1.w_a).any() or not torch.equal(model.layer1.w_a, sa_ref)
+
 
