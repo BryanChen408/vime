@@ -185,7 +185,11 @@ class MegatronTrainRayActor(TrainRayActor):
             hf_vocab = getattr(self.hf_config, "vocab_size", None)
             self.args.vocab_size = hf_vocab if hf_vocab is not None else self.tokenizer.vocab_size
 
-        if self.args.colocate:
+        # 混合(share)布局也用 UpdateWeightFromTensor:其内置混合分发会让共卡段引擎
+        # 走 NPU IPC(不进 HCCL 域,规避"同域两 rank 同卡"的 RanktableDetect 拒绝),
+        # 专用段引擎走 HCCL 广播(域 = trainer + 远程引擎,与异步 PD 同构)。
+        _spec = getattr(self.args, "resource_layout_spec", None)
+        if self.args.colocate or getattr(_spec, "rollout_has_share", False):
             update_weight_cls = UpdateWeightFromTensor
         else:
             update_weight_cls = UpdateWeightFromDistributed

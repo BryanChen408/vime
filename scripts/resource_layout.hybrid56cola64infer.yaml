@@ -1,32 +1,25 @@
 # 混合部署:.56 训推共卡 + .64 专用推理(同步 train.py 用)
 #
-# 拓扑:
-#   .56  16 卡  训练(TP2×CP8);rollout 窗口承载 7 个 TP2 引擎(与训练分时复用,训练窗口 sleep)
-#   .64  12 卡  6 个 TP2 引擎,纯推理(needs_offload=False,常驻不 sleep,省 offload 开销)
+# 拓扑(混合更新器:本机 IPC + 跨机 HCCL,2026-08-21 起):
+#   .56  16 卡  训练(TP2×CP8);rollout 窗口承载 8 个 TP2 引擎(共卡分时,训练窗口 sleep)
+#   .64  12 卡  6 个 TP2 引擎,纯推理(needs_offload=False,常驻不 sleep)
 #   .64  0-3    polar 算子评测池(不进 Ray)
 #
-# 顺序约定(代码强制):
-#   共卡段(share=actor)必须写在 rollout 列表最前 —— 槽位与 actor 同卡,
-#   needs_offload 命中(训练窗口释放显存);专用段在后,常驻。
+# 权重同步(UpdateWeightFromTensor 混合模式,slime 同款):
+#   .56 共卡引擎走 NPU IPC 直传,不进 HCCL 域 → HCCL "同域不同卡" 约束天然规避,
+#   卡 0 可用(HCCL 域 = trainer + 12 个 .64 rank,与异步 PD 同构)。
+#   share 段拆 0-7 / 8-15 两条是为 TP2 配对不跨 HCCS 域(配对按列表顺序两两切分)。
 #
-# 共卡段为何是 1-6 + 8-15 而非 0-15(两条硬约束,2026-08-21):
-#   1) HCCL RanktableDetect 实锤:权重同步域 world=1+2N 不允许两个 rank 同卡
-#      (trainer=megatron 全局 rank 0 固定坐卡 0;引擎 rank 也上卡 0 → device IP
-#      重复 → parameter error)。故卡 0 从 rollout 剔除,只训不推。
-#      注:纯 colocate(cola)不受影响 —— 它走 UpdateWeightFromTensor IPC 直传,
-#      不建 HCCL 域;IPC 出不了单机,混合跨机只能 HCCL。
-#   2) TP2 配对不跨 HCCS 域(0-7 | 8-15):连续 1-14 会拼出 (7,8) 跨域对;
-#      拆两段后配对为 (1,2)(3,4)(5,6)|(8,9)(10,11)(12,13)(14,15),全部域内,
-#      卡 7 轮空(域 A 余出的单卡)。
+# 顺序约定(代码强制):共卡段(share=actor)必须写在 rollout 列表最前。
 roles:
   actor:
     - {node: 80.48.5.56, devices: "0-15"}
   rollout:
-    - {node: 80.48.5.56, devices: "1-6", share: actor}    # 3 台共卡引擎(HCCS 域 A)
-    - {node: 80.48.5.56, devices: "8-15", share: actor}   # 4 台共卡引擎(HCCS 域 B)
-    - {node: 80.48.5.64, devices: "4-15"}                 # 6 台专用引擎,常驻
+    - {node: 80.48.5.56, devices: "0-7", share: actor}     # 4 台共卡引擎(HCCS 域 A)
+    - {node: 80.48.5.56, devices: "8-15", share: actor}    # 4 台共卡引擎(HCCS 域 B)
+    - {node: 80.48.5.64, devices: "4-15"}                  # 6 台专用引擎,常驻
   polar_reserved:
     - {node: 80.48.5.64, devices: "0-3"}
 rollout:
-  num_gpus_per_engine: 2                 # 13 个 TP2 引擎(7 共卡驻留 7×70G=490G + 6 专用)
+  num_gpus_per_engine: 2                 # 14 个 TP2 引擎(8 共卡驻留 8×70G=560G + 6 专用)
   # vllm_dp_size: 14                   # 仅 FEAT_DP_EXTERNAL_LB=1 时需要 == 引擎数

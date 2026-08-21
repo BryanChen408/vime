@@ -551,13 +551,21 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     #      update_weights_from_distributed; the vLLM engine still needs
     #      init_weight_transfer_engine to succeed (with NCCL the caller must supply
     #      master_address, master_port, rank_offset, and world_size separately).
+    #    - 混合(share)布局:按节点分叉 —— 与 actor 同节点的共卡引擎走 IPC,
+    #      其余(专用/远程)引擎走 NCCL/HCCL。共卡引擎不进 HCCL 域,规避
+    #      "同域两 rank 同卡" 的 RanktableDetect 拒绝。
     #    Users who pass ``--vllm-weight-transfer-config`` explicitly are honored.
+    _colocated_engine = getattr(args, "colocate", False)
+    _spec = getattr(args, "resource_layout_spec", None)
+    if not _colocated_engine and _spec is not None and getattr(_spec, "rollout_has_share", False):
+        _actor_nodes = {item.node for item in _spec.actor}
+        _colocated_engine = host_for_subprocess in _actor_nodes
     if _user_overrode(args, "vllm_weight_transfer_config"):
         cmd += [
             "--weight-transfer-config",
             _serialize_weight_transfer_config(args.vllm_weight_transfer_config),
         ]
-    elif getattr(args, "colocate", False):
+    elif _colocated_engine:
         cmd += ["--weight-transfer-config", '{"backend":"ipc"}']
     else:
         cmd += ["--weight-transfer-config", '{"backend":"nccl"}']
@@ -565,7 +573,7 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     worker_type = server_args.get("worker_type", "regular")
     disagg_backend = getattr(args, "disaggregation_backend", "nixl")
 
-    if getattr(args, "colocate", False) and "--worker-extension-cls" not in cmd:
+    if _colocated_engine and "--worker-extension-cls" not in cmd:
         cmd += [
             "--worker-extension-cls",
             "vime.backends.megatron_utils.update_weight.update_weight_from_tensor.vLLMColocateWorkerExtension",
