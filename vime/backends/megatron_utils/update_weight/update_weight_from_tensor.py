@@ -651,7 +651,13 @@ class vLLMColocateWorkerExtension:
             # Remap to the local (receiver-side) device index.
             list_args = list(args)
             list_args[6] = device_index
-            weight: torch.Tensor = func(*list_args)
+            # 克隆成引擎自有 tensor:IPC 重建的是 trainer 显存的借用视图,而 layerwise
+            # reload 会把未完整层的 loaded_weight 引用缓冲到后续 chunk(layerwise.py
+            # loaded_weights.append(bound_args) 不拷贝);trainer 在 ray.get 返回后即
+            # del + ipc_collect 并复用该显存 → 缓冲引用读到被覆写的内容(2026-08-21
+            # 共享专家一致性校验炸点,仅 IPC 路径;HCCL 路径 tensor 引擎自有,无此问题)。
+            # 末尾的 torch.accelerator.synchronize() 保证克隆在 RPC 返回前完成。
+            weight: torch.Tensor = func(*list_args).clone()
             weights.append((name, weight))
 
         # Load weights into the model.
