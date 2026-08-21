@@ -13,6 +13,11 @@ import yaml
 class NodeDevices:
     node: str
     devices: tuple[int, ...]
+    # share="actor": 与 actor 角色共享同一批物理卡 —— 不为这些设备新建 bundle,
+    # rollout 槽位直接映射到 actor 的 bundle 上(训推共卡)。目前仅支持 share="actor"
+    # 且只用于 rollout 角色。共卡段必须写在 rollout 列表最前(槽位 0..N-1),
+    # 使 needs_offload 正确命中(见 rollout.py _compute_rollout_offset)。
+    share: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -36,9 +41,36 @@ class ResourceLayout:
         return sum(len(item.devices) for item in self.rollout)
 
     @property
+    def rollout_shared_num_gpus(self) -> int:
+        """共卡(share)rollout 设备数 —— 复用 actor bundle,不占额外 Ray 资源。"""
+        return sum(len(item.devices) for item in self.rollout if item.share)
+
+    @property
+    def rollout_dedicated_num_gpus(self) -> int:
+        """专用(非共卡)rollout 设备数 —— 需要独立 bundle 的部分。"""
+        return sum(len(item.devices) for item in self.rollout if not item.share)
+
+    @property
+    def rollout_has_share(self) -> bool:
+        return any(item.share for item in self.rollout)
+
+    @property
     def rollout_num_gpus_per_node(self) -> int:
         if not self.rollout:
             return 0
+        if self.rollout_has_share:
+            # 混合(共卡+专用)布局:共卡段约定写在最前(槽位 0..N-1 与 actor 同卡),
+            # 端口分配器的"每节点引擎数"桶宽必须等于 actor 所在节点的 rollout 卡数
+            # (含共卡),否则跨节点的引擎会被分到错误的地址桶里。
+            counts_by_node = _device_counts_by_node(self.rollout)
+            for item in self.actor:
+                if item.node in counts_by_node:
+                    return counts_by_node[item.node]
+            raise ValueError(
+                "resource layout with share: actor's node must also appear in rollout entries "
+                f"(actor nodes: {sorted({i.node for i in self.actor})}, "
+                f"rollout nodes: {sorted(counts_by_node)})"
+            )
         counts = set(_device_counts_by_node(self.rollout).values())
         if len(counts) != 1:
             raise ValueError(
@@ -49,8 +81,9 @@ class ResourceLayout:
 
     @property
     def ray_num_gpus(self) -> int:
-        # critic 独立卡位时须计入(空 critic → critic_num_gpus=0,与共卡老路径一致)。
-        return self.actor_num_gpus + self.critic_num_gpus + self.rollout_num_gpus
+        # critic 独立卡位时须计入(空 critic → critic_num_gpus=0,与共卡老路径一致);
+        # rollout 的 share 段复用 actor bundle,不计入(否则 Ray 资源不可满足)。
+        return self.actor_num_gpus + self.critic_num_gpus + self.rollout_dedicated_num_gpus
 
     @property
     def actor_num_nodes(self) -> int:
@@ -240,7 +273,18 @@ def _parse_role(roles: dict[str, Any], name: str, *, required: bool = True) -> t
             raise ValueError(f"resource layout roles.{name}[{idx}].node is required")
         if "devices" not in raw_entry:
             raise ValueError(f"resource layout roles.{name}[{idx}].devices is required")
-        entries.append(NodeDevices(node=node, devices=parse_devices(raw_entry["devices"])))
+        share = raw_entry.get("share")
+        if share is not None:
+            share = str(share).strip()
+            if share != "actor":
+                raise ValueError(
+                    f"resource layout roles.{name}[{idx}].share only supports \"actor\" for now, got {share!r}"
+                )
+            if name != "rollout":
+                raise ValueError(
+                    f"resource layout roles.{name}[{idx}].share is only allowed on the rollout role"
+                )
+        entries.append(NodeDevices(node=node, devices=parse_devices(raw_entry["devices"]), share=share))
     return tuple(entries)
 
 
@@ -272,6 +316,9 @@ def _validate_layout(layout: ResourceLayout) -> None:
     _ = layout.rollout_num_gpus_per_node
 
     used: dict[tuple[str, int], str] = {}
+    actor_devices: set[tuple[str, int]] = {
+        (item.node, device) for item in layout.actor for device in item.devices
+    }
     for role_name, entries in (
         ("actor", layout.actor),
         ("critic", layout.critic),
@@ -283,7 +330,27 @@ def _validate_layout(layout: ResourceLayout) -> None:
                 key = (item.node, device)
                 prior = used.get(key)
                 if prior is not None:
+                    # rollout share="actor" 的共卡设备允许与 actor 重叠(且必须 ⊆ actor),
+                    # 其它一切角色间重叠照旧禁止。
+                    if item.share == "actor" and role_name == "rollout" and prior == "actor":
+                        continue
                     raise ValueError(
                         f"resource layout device overlap: {item.node}:{device} is in both {prior} and {role_name}"
                     )
                 used[key] = role_name
+    # share 语义校验:共卡设备必须确实在 actor 卡集合内;共卡段必须排在专用段之前
+    # (槽位顺序决定 needs_offload,见 rollout.py _compute_rollout_offset)。
+    seen_dedicated = False
+    for item in layout.rollout:
+        if item.share:
+            if seen_dedicated:
+                raise ValueError(
+                    "resource layout: shared (share=actor) rollout entries must be listed before dedicated ones"
+                )
+            for device in item.devices:
+                if (item.node, device) not in actor_devices:
+                    raise ValueError(
+                        f"resource layout: shared rollout device {item.node}:{device} is not in roles.actor"
+                    )
+        else:
+            seen_dedicated = True

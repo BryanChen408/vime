@@ -1,0 +1,21 @@
+# 混合部署:.56 训推共卡 + .64 专用推理(同步 train.py 用)
+#
+# 拓扑:
+#   .56  16 卡  训练(TP2×CP8);rollout 窗口同时承载 8 个 TP2 引擎(与训练分时复用,训练窗口 sleep)
+#   .64  12 卡  6 个 TP2 引擎,纯推理(needs_offload=False,常驻不 sleep,省 offload 开销)
+#   .64  0-3    polar 算子评测池(不进 Ray)
+#
+# 顺序约定(代码强制):
+#   共卡段(share=actor)必须写在 rollout 列表最前 —— 槽位 0..15 与 actor 同卡,
+#   needs_offload 命中(训练窗口释放显存);专用段在后,常驻。
+roles:
+  actor:
+    - {node: 80.48.5.56, devices: "0-15"}
+  rollout:
+    - {node: 80.48.5.56, devices: "0-15", share: actor}   # 16 卡全共卡(8 台引擎,驻留 560G;配 RAY_memory_usage_threshold=0.99 过启动瞬态)
+    - {node: 80.48.5.64, devices: "4-15"}
+  polar_reserved:
+    - {node: 80.48.5.64, devices: "0-3"}
+rollout:
+  num_gpus_per_engine: 2                 # 14 个 TP2 引擎(8 共卡 + 6 专用)
+  # vllm_dp_size: 14                   # 仅 FEAT_DP_EXTERNAL_LB=1 时需要 == 引擎数

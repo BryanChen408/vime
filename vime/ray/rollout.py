@@ -183,25 +183,68 @@ class ServerGroup:
         ]
         return init_handles, port_cursors
 
-    def offload(self):
-        """Fire release_memory_occupation on all engines (non-blocking).
+    def _offload_engine_indices(self) -> list[int]:
+        """Engine indices that must offload (sleep) during train windows.
 
-        Returns a list of Ray ObjectRefs.  Skipped for groups that do not
-        overlap with megatron GPUs (``needs_offload=False``).
+        Group-level ``needs_offload`` gates the feature as before. Within a hybrid
+        (share) layout — where one group spans actor-colocated AND dedicated
+        devices — only engine slots overlapping the actor's cards offload.
+        Dedicated engines stay resident: a level-1 sleep parks ~70G of weights in
+        host memory per engine, which is exactly what must not happen on hosts
+        that don't share GPUs with training (and doubly so on 1TB nodes).
         """
         if not self.needs_offload:
             return []
-        return [engine.release_memory_occupation.remote() for engine in self.engines if engine is not None]
+        spec = getattr(self.args, "resource_layout_spec", None)
+        if spec is None or not getattr(spec, "rollout_has_share", False):
+            return list(range(len(self.all_engines)))
+        megatron_num_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
+        per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
+        return [
+            i
+            for i in range(len(self.all_engines))
+            if self.gpu_offset + i * per_engine < megatron_num_gpus
+        ]
+
+    def offload(self):
+        """Fire release_memory_occupation on offloading engines (non-blocking).
+
+        Returns a list of Ray ObjectRefs.  Skipped for groups that do not
+        overlap with megatron GPUs (``needs_offload=False``); in hybrid layouts
+        only the actor-colocated subset fires (see _offload_engine_indices).
+        level=1(host 备份驻留)—— level=2 的磁盘重载路径已被生产否决
+        (reload_weights 在丢弃后的存储上 ACL stream sync 失败)。
+        """
+        indices = self._offload_engine_indices()
+        return [
+            self.all_engines[i].release_memory_occupation.remote()
+            for i in indices
+            if self.all_engines[i] is not None
+        ]
+
+    def onload_weights_for_shared(self, tags: list[str] | None = None):
+        """Restore weights for offloading (colocated) engines.
+
+        共卡(share)与非共卡统一走 level=1 host 备份恢复(resume_memory_occupation)
+        —— 磁盘重载路径已否决(reload_weights 在 level=2 丢弃后 ACL 失败);
+        共卡段的 host 占用靠"减共卡引擎数"控制,不走磁盘语义。
+        """
+        indices = self._offload_engine_indices()
+        return [
+            self.all_engines[i].resume_memory_occupation.remote(tags=tags)
+            for i in indices
+            if self.all_engines[i] is not None
+        ]
 
     def onload(self, tags: list[str] | None = None):
-        """Fire resume_memory_occupation on all engines (non-blocking).
+        """Fire resume_memory_occupation on offloading engines (non-blocking).
 
         Returns a list of Ray ObjectRefs.  Skipped for groups that do not
-        overlap with megatron GPUs (``needs_offload=False``).
+        overlap with megatron GPUs (``needs_offload=False``); in hybrid layouts
+        only the actor-colocated subset fires (see _offload_engine_indices).
         """
-        if not self.needs_offload:
-            return []
-        return [engine.resume_memory_occupation.remote(tags=tags) for engine in self.engines if engine is not None]
+        indices = self._offload_engine_indices()
+        return [self.all_engines[i].resume_memory_occupation.remote(tags=tags) for i in indices if self.all_engines[i] is not None]
 
     def onload_weights_from_disk(self):
         """Reload weights from ``model_path`` for non-updatable groups.
@@ -336,16 +379,16 @@ class RolloutServer:
     def onload_weights(self):
         """Restore weights for offloaded groups.
 
-        All groups resume from CPU cache via ``resume_memory_occupation``.
-        For updatable servers, weights will be overwritten by
-        ``update_weights`` shortly after.  For non-updatable servers the
-        CPU backup already contains the correct (unchanged) weights.
+        共卡(share)与专用引擎统一从 level=1 的 host 备份恢复
+        (``onload_weights_for_shared`` → ``resume_memory_occupation``)——
+        磁盘重载路径已否决(reload_weights 在 level=2 丢弃后的存储上 ACL 失败)。
+        对 updatable 引擎,恢复后 ``update_weights`` 会立即覆盖成最新权重。
         """
         handles = []
         for g in self.server_groups:
             if not g.needs_offload:
                 continue
-            handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
+            handles.extend(g.onload_weights_for_shared(tags=[GPU_MEMORY_TYPE_WEIGHTS]))
         return ray.get(handles) if handles else []
 
     def onload_kv(self):
@@ -1269,6 +1312,11 @@ def _start_mooncake_pd_proxy(args, router_ip, router_port, prefill_urls, decode_
 def _compute_rollout_offset(args) -> int:
     """Offset (in PG bundle slots) where rollout GPUs start."""
     if args.debug_train_only or args.debug_rollout_only or args.colocate:
+        return 0
+    spec = getattr(args, "resource_layout_spec", None)
+    if spec is not None and getattr(spec, "rollout_has_share", False):
+        # 混合(共卡+专用)布局:rollout 槽位与 megatron 同起点,前 actor_num_gpus 个
+        # 槽位是与 actor 共卡的设备(→ needs_offload=True),其后为专用推理卡。
         return 0
     offset = args.actor_num_nodes * args.actor_num_gpus_per_node
     return offset

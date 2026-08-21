@@ -113,8 +113,12 @@ def _build_layout_bundles(layout, device_name):
     node_resource_keys = _node_resource_keys_by_ip()
     bundles = []
     # layout.critic 默认空 () → 不产生额外 bundle(共卡老路径);非空则为独立 critic 卡位建 bundle。
+    # rollout 的 share="actor" 段与 actor 共卡 —— 复用 actor 已建的 bundle,不再新建
+    # (否则同一张卡被申请两次,Ray 资源不可满足)。
     for role in (layout.actor, layout.critic, layout.rollout):
         for item in role:
+            if getattr(item, "share", None):
+                continue
             node_resource_key = node_resource_keys.get(item.node)
             if node_resource_key is None:
                 available = ", ".join(sorted(node_resource_keys)) or "<none>"
@@ -149,6 +153,42 @@ def _create_placement_group(num_gpus):
     return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
 
 
+def _select_rollout_bundles_with_share(bundle_infos, layout):
+    """Rollout bundle 选择(支持 share 共卡)。
+
+    与 select_role_bundles 的区别:share="actor" 的 rollout 设备**复用** actor 已占的
+    bundle —— 同一个 (node, device) 允许同时被 actor 和 rollout 映射(共卡),
+    不再要求每个 rollout 设备独占一个 bundle。选择结果保持 YAML 顺序
+    (共卡段在前,与 needs_offload 的槽位约定一致)。
+    """
+    by_node_device: dict[tuple[str, int], int] = {}
+    for bundle_index, node, device in bundle_infos:
+        by_node_device[(str(node), int(device))] = int(bundle_index)
+
+    bundle_indices: list[int] = []
+    device_ids: list[int] = []
+    missing: list[str] = []
+    for item in layout.rollout:
+        for device in item.devices:
+            key = (item.node, device)
+            bundle_index = by_node_device.get(key)
+            if bundle_index is None:
+                missing.append(f"{item.node}:{device}")
+                continue
+            bundle_indices.append(bundle_index)
+            device_ids.append(device)
+
+    if missing:
+        available = ", ".join(
+            f"{node}:{device}" for _, node, device in sorted(bundle_infos, key=lambda x: (x[1], int(x[2])))
+        )
+        raise ValueError(
+            f"Ray cluster is missing requested rollout devices: {', '.join(missing)}. "
+            f"Available bundles: {available}"
+        )
+    return bundle_indices, device_ids
+
+
 def _create_placement_groups_from_layout(args):
     """Explicit-layout path: pin actor/rollout to the (node, devices) in the spec."""
     layout = args.resource_layout_spec
@@ -160,7 +200,16 @@ def _create_placement_groups_from_layout(args):
     )
 
     actor_bundle_indices, actor_gpu_ids = select_role_bundles(bundle_infos, layout.actor, role_name="actor")
-    rollout_bundle_indices, rollout_gpu_ids = select_role_bundles(bundle_infos, layout.rollout, role_name="rollout")
+    if getattr(layout, "rollout_has_share", False):
+        rollout_bundle_indices, rollout_gpu_ids = _select_rollout_bundles_with_share(bundle_infos, layout)
+        logger.info(
+            f"Rollout layout includes {layout.rollout_shared_num_gpus} shared (colocated with actor) "
+            f"devices and {layout.rollout_dedicated_num_gpus} dedicated devices."
+        )
+    else:
+        rollout_bundle_indices, rollout_gpu_ids = select_role_bundles(
+            bundle_infos, layout.rollout, role_name="rollout"
+        )
 
     logger.info("Actor placement from resource layout:")
     _log_bundle_order(bundle_infos, actor_bundle_indices)
