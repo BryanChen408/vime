@@ -33,7 +33,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ----------------------------- config -----------------------------
-LOG_DIR = "/home/docker/logs"
+# 日志目录:默认两个候选(pd 时代的 /home/docker/logs + 混合部署的 /mnt/pipeline-data/train_log),
+# latest_log 取全部候选里 mtime 最新的 train_*.log;可用 RL_LOG_DIRS="dir1:dir2" 覆盖。
+LOG_DIRS = os.environ.get("RL_LOG_DIRS", "/home/docker/logs:/mnt/pipeline-data/train_log").split(":")
 POLAR_RUNS = "/home/docker/polar_can/ProRL-Agent-Server/output/ascend_operator/runs"
 PORT = int(os.environ.get("PORT", "6007"))
 LOG_TAIL_INIT = 256 * 1024   # bytes shown on first paint (tail)
@@ -105,7 +107,9 @@ def _epoch_from(line):
 
 
 def latest_log():
-    files = glob.glob(os.path.join(LOG_DIR, "train_qwen36_polar_*.log"))
+    files = []
+    for d in LOG_DIRS:
+        files.extend(glob.glob(os.path.join(d, "train_qwen36_polar_*.log")))
     files = [f for f in files if os.path.getsize(f) > 0]
     return max(files, key=os.path.getmtime) if files else None
 
@@ -503,7 +507,7 @@ def npu_info():
 # [2026-08-10] 跨机节点状态:140 跑 tools/node_exporter.py,这里定时拉取。
 # 无免密 ssh,故走 HTTP。拉取失败用 ≤120s 的旧缓存兜底,绝不让面板刷新被拖死。
 PEER_METRICS_URL = os.environ.get("PEER_METRICS_URL",
-                                  "http://80.48.5.64:6010/node_metrics")
+                                  "http://80.48.5.64:19100/node_metrics")
 PEER = {"last_try": 0.0, "good": None, "good_ts": 0.0}
 
 
@@ -1288,6 +1292,10 @@ html[data-theme=dark] .right{box-shadow:-12px 0 32px rgba(0,0,0,.3)}
 ::-webkit-scrollbar-track{background:transparent}
 #logbox .logp{color:#ff3b30}html[data-theme=dark] #logbox .logp{color:#ff453a}
 #logbox .logt{color:#248a3d}html[data-theme=dark] #logbox .logt{color:#30d158}
+#logbox .logsrc-vllm{color:#0a84ff}html[data-theme=dark] #logbox .logsrc-vllm{color:#64d2ff}
+#logbox .logsrc-rollout{color:#af52de}html[data-theme=dark] #logbox .logsrc-rollout{color:#bf5af2}
+#logbox .logsrc-megatron{color:#e08600}html[data-theme=dark] #logbox .logsrc-megatron{color:#ff9f0a}
+#logbox .logsrc-ray{color:#8e8e93}html[data-theme=dark] #logbox .logsrc-ray{color:#98989d}
 header{display:flex;align-items:center;gap:14px;padding:9px 22px;flex:0 0 auto;z-index:8;flex-wrap:wrap;border-bottom:.5px solid var(--line);
   box-shadow:0 1px 12px rgba(0,0,0,.04);
   background:var(--panel);background:color-mix(in srgb,var(--panel) 72%,transparent);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px)}
@@ -1687,13 +1695,17 @@ const MA=(s,w,c,name)=>{const y=(s&&s.y)||[],x=(s&&s.x)||[],o=[];let q=[],sum=0;
   return{x,y:o,c,name,w:2.6};};  // 更粗、亮橙,压噪看趋势
 // ------------------------ 训练日志(右栏)------------------------
 const logbox=$('logbox');
-// 逐行着色:最左 (Actor pid=…) 红,时间戳 [YYYY-MM-DD HH:MM:SS …] 绿;其余原色。
+// 逐行着色:最左 (Actor …) 按来源着色 —— VLLMEngine 蓝 / RolloutManager 紫 /
+// MegatronTrainRayActor 橙 / raylet 灰 / 其他带 pid 的红;时间戳 [YYYY-MM-DD HH:MM:SS …] 绿。
 // 用 span+textContent 构造(不拼 innerHTML),日志里的 < { 等字符安全。
-const LOG_PID=/^\([A-Za-z_]\w* pid=\d+\)/, LOG_TS=/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^\]]*\]/;
+// 兼容三种形态:(Name pid=N)、(Name pid=N, ip=…)、(raylet)。
+const LOG_PID=/^\(([A-Za-z_]\w*)[^)]*\)/, LOG_TS=/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[^\]]*\]/;
+const LOG_SRC={VLLMEngine:'logsrc-vllm',RolloutManager:'logsrc-rollout',MegatronTrainRayActor:'logsrc-megatron',raylet:'logsrc-ray'};
+const logSrcCls=n=>LOG_SRC[n]||(n&&n.indexOf('ray')===0?'logsrc-ray':'logp');
 const LS=(cls,txt)=>{const e=document.createElement('span');e.className=cls;e.textContent=txt;return e;};
 function addLogLine(frag,line){
   let s=line;const mp=s.match(LOG_PID);
-  if(mp){frag.appendChild(LS('logp',mp[0]));s=s.slice(mp[0].length);}
+  if(mp){frag.appendChild(LS(logSrcCls(mp[1]),mp[0]));s=s.slice(mp[0].length);}
   const lead=(s.match(/^\s*/)||[''])[0],mt=s.slice(lead.length).match(LOG_TS);
   if(mt){if(lead)frag.appendChild(document.createTextNode(lead));
     frag.appendChild(LS('logt',mt[0]));s=s.slice(lead.length+mt[0].length);}
@@ -1767,14 +1779,14 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
-    global LOG_DIR, POLAR_RUNS, PORT
+    global LOG_DIRS, POLAR_RUNS, PORT
     ap = argparse.ArgumentParser()
-    ap.add_argument("--log", default=LOG_DIR, help="dir with train_*.log")
+    ap.add_argument("--log", default=":".join(LOG_DIRS), help="train_*.log dirs, colon-separated")
     ap.add_argument("--polar", default=POLAR_RUNS, help="polar runs dir")
     ap.add_argument("--port", type=int, default=PORT)
     a = ap.parse_args()
-    LOG_DIR, POLAR_RUNS, PORT = a.log, a.polar, a.port
-    print(f"[rl_dashboard] log dir : {LOG_DIR}")
+    LOG_DIRS, POLAR_RUNS, PORT = a.log.split(":"), a.polar, a.port
+    print(f"[rl_dashboard] log dirs: {LOG_DIRS}")
     print(f"[rl_dashboard] latest  : {latest_log()}")
     print(f"[rl_dashboard] polar   : {latest_polar_run()}")
     print(f"[rl_dashboard] serving : http://0.0.0.0:{PORT}/  (Ctrl-C to stop)")
