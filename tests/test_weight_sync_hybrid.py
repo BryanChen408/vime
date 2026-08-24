@@ -279,9 +279,78 @@ def test_shared_expert_validation_gate():
             LAYERWISE_INFO.pop(m, None)
 
 
+# ─── 6. TCPStore 端口竞态修复(20260824 连续两次 EADDRINUSE)────────────────────
+def test_dist_init_addr_parse():
+    from vime.backends.vllm_utils.vllm_engine import parse_dist_init_addr
+
+    assert parse_dist_init_addr("80.48.5.56:45000") == ("80.48.5.56", 45000)
+    assert parse_dist_init_addr("[::1]:46001") == ("::1", 46001)
+
+
+def test_dist_init_port_env_injection():
+    """build_vllm_subprocess_env 把 dist_init_port 注入 VLLM_DIST_INIT_PORT。"""
+    from vime.backends.vllm_utils.vllm_engine import build_vllm_subprocess_env
+
+    env = build_vllm_subprocess_env(
+        {
+            "args": types.SimpleNamespace(vllm_enable_deterministic_inference=False, colocate=False),
+            "dist_init_port": 45000,
+            "visible_devices": "0,1",
+        }
+    )
+    assert env["VLLM_DIST_INIT_PORT"] == "45000"
+
+
+def test_vllm_executor_honors_dist_init_port_env():
+    """vllm-023 multiproc_executor 必须读 VLLM_DIST_INIT_PORT 并回退 get_open_port。"""
+    src = open("/workspace/vllm-023/vllm/v1/executor/multiproc_executor.py").read()
+    assert 'os.environ.get("VLLM_DIST_INIT_PORT"' in src
+    assert "or get_open_port()" in src
+
+
+def test_cursor_allocation_unique_ports_per_node():
+    """真实分配器 + 假引擎/假 ray.get:8(.56)+6(.64) 台引擎的 dist_init 端口同节点互斥。"""
+    import ray
+
+    from vime.ray.rollout import _allocate_rollout_engine_addr_and_ports_normal
+
+    class FakeEngine:
+        def __init__(self, node_idx):
+            ip = "80.48.5.56" if node_idx == 0 else "80.48.5.64"
+            self._get_current_node_ip_and_free_port = types.SimpleNamespace(
+                remote=lambda start_port=None, consecutive=1: (ip, start_port)
+            )
+
+    engines = [(r, FakeEngine(0)) for r in range(8)] + [(r, FakeEngine(1)) for r in range(8, 14)]
+    args = types.SimpleNamespace(
+        rollout_num_gpus_per_engine=2,
+        num_gpus_per_node=16,
+        vllm_data_parallel_external_lb=False,
+        vllm_dp_size=1,
+    )
+
+    with mock.patch.object(ray, "get", side_effect=lambda v: v):
+        addr_and_ports, _ = _allocate_rollout_engine_addr_and_ports_normal(
+            args=args,
+            rollout_engines=engines,
+            worker_type="regular",
+            num_gpus_per_engine=2,
+            rank_offset=0,
+            base_port=15000,
+        )
+
+    ports_by_node: dict[str, list[int]] = {"80.48.5.56": [], "80.48.5.64": []}
+    for rank, info in addr_and_ports.items():
+        if rank > 13:
+            continue  # 分配器会对节点补满 8 槽,14/15 是虚位,不验
+        ip, port = info["dist_init_addr"].rsplit(":", 1)
+        ports_by_node[ip].append(int(port))
+    for ip, ports in ports_by_node.items():
+        assert len(ports) == len(set(ports)), f"节点 {ip} 的 dist_init 端口重复: {sorted(ports)}"
+    assert len(ports_by_node["80.48.5.56"]) == 8 and len(ports_by_node["80.48.5.64"]) == 6
+
+
 def test_ipc_borrowed_tensor_without_clone_is_corrupted():
     # 反事实:没 clone 时,缓冲的 w_a 必然读到覆写后的 NaN(证明测试有效)
     model, (_s0_ref, sa_ref, _sb_ref) = _run_chunked_ipc_reload(clone_on_receive=False, garbage_between_chunks=True)
     assert torch.isnan(model.layer1.w_a).any() or not torch.equal(model.layer1.w_a, sa_ref)
-
-

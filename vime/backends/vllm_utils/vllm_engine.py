@@ -449,6 +449,12 @@ def build_vllm_subprocess_env(server_args: dict[str, Any]) -> dict[str, str]:
     # torch.compile; the vLLM subprocess MUST have torch.compile enabled for
     # cudagraph capture.
     env.setdefault("NCCL_CUMEM_ENABLE", "0")
+    # 单机 TP 引擎的 TCPStore 端口:vllm 默认 get_open_port 先查后绑,多引擎并行
+    # 启动存在 check-then-bind 竞态(20260824 连续两次 EADDRINUSE 实锤)。
+    # 钉死为 rollout 按游标分配的 dist_init 端口(天然互斥);vllm-023 侧经
+    # multiproc_executor 读取 VLLM_DIST_INIT_PORT 生效(未设置回退 get_open_port)。
+    if server_args.get("dist_init_port") is not None:
+        env["VLLM_DIST_INIT_PORT"] = str(server_args["dist_init_port"])
     if is_npu():
         env["ASCEND_RT_VISIBLE_DEVICES"] = server_args["visible_devices"]
     else:
@@ -1287,6 +1293,13 @@ def _compute_server_args(
             raise ValueError("dist_init_addr is required when launching a multi-node vLLM engine")
         master_addr, master_port = parse_dist_init_addr(dist_init_addr)
 
+    # 单机 TP 引擎的 TCPStore 端口:dist_init_addr 由 rollout 游标分配、逐引擎互斥,
+    # 解析出端口供 build_vllm_subprocess_env 注入 VLLM_DIST_INIT_PORT 钉死
+    # (治 vllm get_open_port 的 check-then-bind 竞态,20260824 连续两次 EADDRINUSE)。
+    dist_init_port: int | None = None
+    if dist_init_addr:
+        _, dist_init_port = parse_dist_init_addr(dist_init_addr)
+
     pd_topology = None
     if vllm_overrides:
         raw_pd_topology = vllm_overrides.get("pd_topology")
@@ -1302,6 +1315,7 @@ def _compute_server_args(
         "port": port,
         "master_addr": master_addr,
         "master_port": master_port,
+        "dist_init_port": dist_init_port,
         "dist_init_addr": dist_init_addr,
         "nnodes": topology.nnodes,
         "node_rank": topology.node_rank,
