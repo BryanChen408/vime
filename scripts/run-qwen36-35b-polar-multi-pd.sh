@@ -328,10 +328,13 @@ GRPO_ARGS=(
    --entropy-coef 0.001
    --eps-clip 0.2
    --use-tis
-   # 共卡混合:同步期 trainer 与引擎同卡,512MB bucket 的 all_gather+IPC 瞬时块会
-   # 顶穿卡余量(20260824-142800 实锤 rank13 free 0.03G OOM)。默认 256MB,可 env 调。
-   --update-weight-buffer-size "${UPDATE_WEIGHT_BUFFER_SIZE:-268435456}"
 )
+# 共卡混合专属:同步期 trainer 与引擎同卡,512MB bucket 的 all_gather+IPC 瞬时块
+# 顶穿卡余量(20260824-142800 实锤 rank13 free 0.03G OOM),256MB 砍半。
+# PD(引擎在 .64 不共卡)保持 512MB 默认,不吃 chunk 翻倍的同步开销。
+if [ "${FEAT_OFFLOAD:-0}" = "1" ]; then
+   GRPO_ARGS+=(--update-weight-buffer-size "${UPDATE_WEIGHT_BUFFER_SIZE:-268435456}")
+fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
