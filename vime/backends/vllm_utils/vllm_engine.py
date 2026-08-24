@@ -604,6 +604,37 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     if _rp and "--reasoning-parser" not in cmd:
         cmd += ["--reasoning-parser", _rp]
     _forward_vllm_cli_args(args, cmd)
+
+    # 4) served-model-name 固定别名(20260824 no_completions 根因实锤):
+    #    引擎 serve 名默认 = 模型目录路径,模型目录在 bare/_fused/-bf16 变体间
+    #    切换时,与 polar profile 写死的模型名错开 → 每个请求 404 → 全量
+    #    no_completions(193305 名字对齐即 200 OK/200 tok/s,195819/182301
+    #    错开即全灭)。VLLM_SERVED_MODEL_NAME(空格分隔)提供与目录解耦的
+    #    固定别名;真实路径始终附带保留,vime 侧按路径的探测不受影响。
+    #    未设置时不加 flag,行为与之前一致(serve 名 = 模型路径)。
+    _served_alias = os.environ.get("VLLM_SERVED_MODEL_NAME", "").split()
+    if _served_alias and "--served-model-name" not in cmd:
+        _names = []
+        for _n in [str(server_args["model_path"]), *_served_alias]:
+            if _n not in _names:
+                _names.append(_n)
+        cmd += ["--served-model-name", *_names]
+
+    # 5) 混合(share)布局的按引擎显存水位分叉(20260824,run 203413 实锤):
+    #    共卡引擎与 trainer 同卡,rollout 窗口 = 引擎(util×61G)+ trainer 常驻
+    #    ~9.8G + 杂项 ~8G ≤ 61G,util 天花板 ≈0.70(KV ~7.4G);专用引擎独占
+    #    整卡,可用更高水位(PD 基线 0.85 → KV 16.5G)保 256K 长上下文的 KV
+    #    预算。全局 0.85 会让共卡引擎在 KV 唤醒时 aclrtMallocPhysical OOM
+    #    (引擎自身 51.85G + trainer 9.8G > 60.95G 总容量)。
+    #    VLLM_GPU_MEM_UTIL_DEDICATED 仅覆写非共卡引擎;未设置时全部引擎用
+    #    --vllm-gpu-memory-utilization 的统一值,行为与之前一致。
+    _util_dedicated = os.environ.get("VLLM_GPU_MEM_UTIL_DEDICATED")
+    if _util_dedicated and not _colocated_engine:
+        if "--gpu-memory-utilization" in cmd:
+            cmd[cmd.index("--gpu-memory-utilization") + 1] = _util_dedicated
+        else:
+            cmd += ["--gpu-memory-utilization", _util_dedicated]
+
     logger.info("Launching vLLM server: %s", redact_cmd_for_log(cmd))
     return cmd, env
 

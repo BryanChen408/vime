@@ -354,3 +354,87 @@ def test_ipc_borrowed_tensor_without_clone_is_corrupted():
     # 反事实:没 clone 时,缓冲的 w_a 必然读到覆写后的 NaN(证明测试有效)
     model, (_s0_ref, sa_ref, _sb_ref) = _run_chunked_ipc_reload(clone_on_receive=False, garbage_between_chunks=True)
     assert torch.isnan(model.layer1.w_a).any() or not torch.equal(model.layer1.w_a, sa_ref)
+
+
+# ─── 6. serve 名固定别名 + 按引擎 util 分叉(20260824 两颗实锤雷) ─────────────
+def _minimal_server_args(host: str, model_path: str = "/models/Qwen-x-bf16", hybrid: bool = True):
+    """build_vllm_cmd_and_env 的最小输入:hybrid share 布局,actor 在 .56。"""
+    from vime.backends.vllm_utils.vllm_engine import VllmEngineTopology
+
+    spec = None
+    if hybrid:
+        spec = types.SimpleNamespace(
+            rollout_has_share=True,
+            actor=[types.SimpleNamespace(node="80.48.5.56")],
+        )
+    args = types.SimpleNamespace(
+        colocate=False,
+        resource_layout_spec=spec,
+        vllm_enable_deterministic_inference=False,
+        vllm_gpu_memory_utilization=0.70,
+    )
+    return {
+        "args": args,
+        "topology": VllmEngineTopology(
+            nnodes=1, node_rank=0, local_num_gpus=2, tensor_parallel_size=2, pipeline_parallel_size=1
+        ),
+        "host": host,
+        "model_path": model_path,
+        "tp_size": 2,
+        "port": 15000,
+        "seed": 1234,
+        "pp_size": 1,
+        "visible_devices": "0,1",
+    }
+
+
+def _flag_value(cmd, flag):
+    assert flag in cmd, f"{flag} 不在 cmd 里: {cmd}"
+    return cmd[cmd.index(flag) + 1]
+
+
+def test_served_model_name_alias_decouples_model_dir():
+    """VLLM_SERVED_MODEL_NAME 设置后:cmd 带 --served-model-name [真实路径, 别名];
+    未设置时无该 flag(行为与之前一致)。20260824 no_completions 根因修复。"""
+    from vime.backends.vllm_utils.vllm_engine import build_vllm_cmd_and_env
+
+    with mock.patch.dict(os.environ, {"VLLM_SERVED_MODEL_NAME": "/home/docker/Qwen3.6-35B-A3B"}):
+        cmd, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.56"))
+    i = cmd.index("--served-model-name")
+    names = []
+    for v in cmd[i + 1 :]:
+        if v.startswith("--"):
+            break
+        names.append(v)
+    assert names == ["/models/Qwen-x-bf16", "/home/docker/Qwen3.6-35B-A3B"]
+
+    # 别名 == 真实路径时去重(模型目录恰好是 bare 名的 run)
+    with mock.patch.dict(os.environ, {"VLLM_SERVED_MODEL_NAME": "/models/Qwen-x-bf16"}):
+        cmd, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.56"))
+    i = cmd.index("--served-model-name")
+    assert cmd[i + 1 :] == ["/models/Qwen-x-bf16"]
+
+    # 未设置:无 flag
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VLLM_SERVED_MODEL_NAME", None)
+        cmd, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.56"))
+    assert "--served-model-name" not in cmd
+
+
+def test_per_engine_mem_util_split():
+    """VLLM_GPU_MEM_UTIL_DEDICATED 仅覆写非共卡引擎:共卡(.56)保持基础值 0.70,
+    专用(.64)用 0.85;未设置时两边都用基础值。run 203413 KV 唤醒 OOM 修复。"""
+    from vime.backends.vllm_utils.vllm_engine import build_vllm_cmd_and_env
+
+    with mock.patch.dict(os.environ, {"VLLM_GPU_MEM_UTIL_DEDICATED": "0.85"}):
+        cmd_colo, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.56"))
+        cmd_ded, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.64"))
+    assert _flag_value(cmd_colo, "--gpu-memory-utilization") == "0.7"
+    assert _flag_value(cmd_ded, "--gpu-memory-utilization") == "0.85"
+
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop("VLLM_GPU_MEM_UTIL_DEDICATED", None)
+        cmd_colo, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.56"))
+        cmd_ded, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.64"))
+    assert _flag_value(cmd_colo, "--gpu-memory-utilization") == "0.7"
+    assert _flag_value(cmd_ded, "--gpu-memory-utilization") == "0.7"
