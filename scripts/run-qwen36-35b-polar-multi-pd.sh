@@ -219,8 +219,8 @@ mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
 
 # ─── 参数分组 ───
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}
-   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
+   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
+   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
    --save-interval 100
    --no-save-optim
@@ -328,11 +328,14 @@ GRPO_ARGS=(
    --entropy-coef 0.001
    --eps-clip 0.2
    --use-tis
+   # 共卡混合:同步期 trainer 与引擎同卡,512MB bucket 的 all_gather+IPC 瞬时块会
+   # 顶穿卡余量(20260824-142800 实锤 rank13 free 0.03G OOM)。默认 256MB,可 env 调。
+   --update-weight-buffer-size "${UPDATE_WEIGHT_BUFFER_SIZE:-268435456}"
 )
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 2e-6
+   --lr 1e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
