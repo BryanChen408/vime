@@ -32,11 +32,11 @@ def train(args):
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
     if args.offload_rollout:
-        # [vime 2026-08-24] 唤醒顺序:KV 先于权重 —— sleep(level=1/2)后地址空间是
-        # 干净的,KV 的 ~10G 大块先拿连续物理页;权重壳后填。原顺序(权重→同步→KV)
-        # 让 KV 重映射落在 reload 搅动后的碎片上,halMemCreate 要连续块必然 OOM
-        # (20260824-093953/100522/125601 三次实锤,empty_cache 救不了碎片)。
-        ray.get(rollout_manager.onload_kv.remote())
+        # [vime 2026-08-24 定案] 同步窗口 KV 不驻留(verl/slime 同款):只醒权重壳
+        # 灌新权重,KV 同步后才醒。同步窗口瞬时最重(all_gather/reload 搅动),
+        # 必须让它空 —— 权重壳 35G+workspace 4G+trainer ~10G ≈ 50G,余量 11G+;
+        # KV 重映射只是同步后一次 ~1.4G 小额申请,放在 clear_memory 之后做。
+        # (此前"KV 先醒"把 KV 塞进同步窗口 → 顶格 OOM,141406/142800 实锤,回正。)
         ray.get(rollout_manager.onload_weights.remote())
 
     # Always push actor weights to rollout once weights are loaded.
@@ -48,6 +48,10 @@ def train(args):
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
+
+    if args.offload_rollout:
+        # 同步完成后醒 KV(与每步同序:权重壳 → 同步 → KV)。
+        ray.get(rollout_manager.onload_kv.remote())
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
@@ -125,8 +129,7 @@ def train(args):
 
             offload_train(actor_trains_this_step)
             if args.offload_rollout:
-                # KV 先于权重唤醒(理由见文件头注:保 KV 连续物理页,免碎片 OOM)。
-                ray.get(rollout_manager.onload_kv.remote())
+                # 同步窗口 KV 不驻留(定案,见文件头注):只醒权重壳做同步。
                 ray.get(rollout_manager.onload_weights.remote())
             actor_model.update_weights()
             # Advance policy version so off-policy staleness tracking (vime_bridge) stays
@@ -134,6 +137,9 @@ def train(args):
             # group as stale (see vime_bridge/rollout.py drain_completed ->
             # max_off_policy_steps), which hangs training a few rollouts in.
             ray.get(rollout_manager.update_policy_version.remote(next_policy_version))
+            if args.offload_rollout:
+                # 同步完成 + clear_memory 之后,才醒 KV(此时空闲最足,重映射最稳)。
+                ray.get(rollout_manager.onload_kv.remote())
         finally:
             # Engines are serving again -> let the gateway resume. In finally so a failed
             # training step can't strand the external gateway in the paused state.
