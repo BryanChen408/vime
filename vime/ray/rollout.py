@@ -217,12 +217,16 @@ class ServerGroup:
         Returns a list of Ray ObjectRefs.  Skipped for groups that do not
         overlap with megatron GPUs (``needs_offload=False``); in hybrid layouts
         only the actor-colocated subset fires (see _offload_engine_indices).
-        level=1(host 备份驻留)—— level=2 的磁盘重载路径已被生产否决
-        (reload_weights 在丢弃后的存储上 ACL stream sync 失败)。
+
+        level=2(丢弃,不驻留 host)—— slime 系 colo 内存管理语义(09450c1b):
+        训推分时场景下,训练窗口的推理权重是死重,每步权重更新都会经
+        wake 重映射空壳 + IPC/HCCL 全量覆写,level=1 的 host 驻留(70G/引擎)
+        纯属浪费。早期否决 level=2 的两个障碍已修:磁盘重载路径已弃用(改走
+        reload 会话)、wake 转置/校验抢跑已门控(560b39d6/5915d8f1)。
         """
         indices = self._offload_engine_indices()
         return [
-            self.all_engines[i].release_memory_occupation.remote()
+            self.all_engines[i].release_memory_occupation.remote(level=2)
             for i in indices
             if self.all_engines[i] is not None
         ]
@@ -230,9 +234,9 @@ class ServerGroup:
     def onload_weights_for_shared(self, tags: list[str] | None = None):
         """Restore weights for offloading (colocated) engines.
 
-        共卡(share)与非共卡统一走 level=1 host 备份恢复(resume_memory_occupation)
-        —— 磁盘重载路径已否决(reload_weights 在 level=2 丢弃后 ACL 失败);
-        共卡段的 host 占用靠"减共卡引擎数"控制,不走磁盘语义。
+        level=2 丢弃后,resume_memory_occupation 只负责把存储**重映射为空壳**
+        (camem create_and_map,无 host 备份可恢复);权重内容随后由
+        ``update_weights``(IPC clone / HCCL 广播)全量覆写 —— 内容零依赖。
         """
         indices = self._offload_engine_indices()
         return [

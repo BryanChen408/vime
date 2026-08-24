@@ -1017,12 +1017,12 @@ class VLLMEngine(RayActor):
     def release_memory_occupation(self, level: int = 1):
         """Flush prefix cache, then ``POST /sleep?level={level}``.
 
-        Default level=1 (offload weights to host, keep the param objects) NOT level=2.
-        On NPU (vllm-ascend), level=2 sleep discards weights and the subsequent
-        wake_up re-allocates them as plain tensors WITHOUT vllm's ``weight_loader``
-        attribute, breaking the RLHF weight update (`'Parameter' object has no
-        attribute 'weight_loader'`). Level 1 preserves the param objects (and thus
-        weight_loader) while still freeing GPU HBM for colocated training.
+        level=1 权重 park 到 host pinned(70G/引擎驻留);level=2 直接丢弃(仅
+        重映射空壳)。训推分时(共卡)场景用 level=2:权重随后必由 reload 会话
+        全量覆写,驻留纯属浪费(slime 09450c1b 语义)。历史上 level=2 的两个
+        障碍已消除:① wake 后 param 丢 weight_loader —— 由 _VLLMHijack 在
+        start_weight_update 重补丁;② wake 转置与 layerwise copy-back 冲突 ——
+        已按 LAYERWISE_INFO 门控跳过(vllm-ascend-023 560b39d6)。
         """
         if self.node_rank != 0:
             return None

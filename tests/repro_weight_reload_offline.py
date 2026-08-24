@@ -121,6 +121,14 @@ def main() -> None:
         print("[repro] wake_up(tags=['weights']) ...", flush=True)
         llm.wake_up(tags=["weights"])
         time.sleep(2)
+    elif scenario == "B2":
+        # level=2 丢弃式 sleep(slime colo 语义):权重不 park host,wake 重映射空壳,
+        # reload 全量覆写 —— 验证"丢弃 + wake + reload 会话"组合的正确性
+        print("[repro] sleep(level=2,丢弃不驻留) ...", flush=True)
+        llm.sleep(level=2)
+        print("[repro] wake_up(tags=['weights'],空壳重映射) ...", flush=True)
+        llm.wake_up(tags=["weights"])
+        time.sleep(2)
 
     if is_d:
         run_scenario_d(llm)
