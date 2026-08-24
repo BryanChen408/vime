@@ -129,6 +129,14 @@ def main() -> None:
         print("[repro] wake_up(tags=['weights'],空壳重映射) ...", flush=True)
         llm.wake_up(tags=["weights"])
         time.sleep(2)
+    elif scenario == "B3":
+        # 定案流程全周期(2026-08-24):sleep(2) → 只醒权重壳 → reload(同步)
+        #   → 再醒 KV —— 验证"同步窗口 KV 不驻留"下 KV 重映射不 OOM
+        print("[repro] sleep(level=2) ...", flush=True)
+        llm.sleep(level=2)
+        print("[repro] wake_up(tags=['weights'],只醒权重壳) ...", flush=True)
+        llm.wake_up(tags=["weights"])
+        time.sleep(1)
 
     if is_d:
         run_scenario_d(llm)
@@ -168,7 +176,16 @@ def main() -> None:
             "reload_weights",
             kwargs={"weights_path": MODEL, "is_checkpoint_format": True},
         )
-    print(f"[repro] PASS —— reload 完成且共享专家校验通过,耗时 {time.time() - t0:.1f}s", flush=True)
+    print(f"[repro] reload done,耗时 {time.time() - t0:.1f}s", flush=True)
+
+    if scenario == "B3":
+        # 同步完成后才醒 KV(定案):验证此时空闲最足,KV 重映射不 OOM
+        print("[repro] 同步完成,wake_up(tags=['kv_cache']) 醒 KV ...", flush=True)
+        llm.wake_up(tags=["kv_cache"])
+        print("[repro] KV 唤醒成功", flush=True)
+        print("[repro] PASS —— 全流程(sleep→权重壳→reload→KV)通过", flush=True)
+    else:
+        print(f"[repro] PASS —— reload 完成且共享专家校验通过,耗时 {time.time() - t0:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
