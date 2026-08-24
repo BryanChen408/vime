@@ -697,6 +697,12 @@ class MegatronTrainRayActor(TrainRayActor):
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
+            # [vime 2026-08-24] 权重同步期间 trainer 侧缓存分配器会多 reserve ~10G
+            # (all_gather/contiguous/IPC handle 的瞬时块);不归还给驱动的话,共卡引擎
+            # 随后 kv_cache 唤醒时 CaMem 拿不到连续物理页 → MallocPhysical 驱动级 OOM
+            # (run 20260824-100522 实锤:rank13 卡 used 57.6G,1.35G 申请失败)。
+            # 此处只清缓存池,存活参数不受影响。
+            clear_memory()
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
