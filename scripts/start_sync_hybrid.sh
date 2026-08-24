@@ -15,15 +15,15 @@
 #   2) polar 卡池 "0-15" 改为 "0-3"(或按实际剩余);
 #   3) .64 先跑 start_pd_worker.sh 加入 Ray(同 pd 流程);老的分离部署进程先清干净。
 #
-# 内存账(61G/卡,VLLM_GPU_MEM_UTIL=0.75 → 引擎预留 ~46G):
-#   rollout 窗口:.56 引擎 46G + 训练参数驻留 ~5G(default offloader 不卸参数) ✓
+# 内存账(61G/卡,VLLM_GPU_MEM_UTIL=0.85 → 引擎预留 ~52G,KV ~16.5G 对齐 PD 基线):
+#   rollout 窗口:.56 引擎 ~52G + 训练参数驻留 ~5G ≈ 57G ✓
 #   train 窗口:训练 ~52G + 引擎 sleep 释放 ✓
-#   权重同步:引擎醒(权重 35G + KV ~9G)+ 训练参数+同步瞬时 ~7G ≈ 56G ✓
-#     (0.80 时同步窗口顶穿 —— 20260824-141406 实锤 trainer 卡 free 1.09G OOM;
-#      KV 后醒的碎片 OOM 已用 KV 先醒换序解决,e5b93a05。)
-#   host 预算(共卡 8 引擎驻留 8×70G=560G):训练 host ~1010G(实测) + 驻留 560G + plasma 200G
-#     + 基线 ~150G ≈ 1.92T / 2T,配 RAY_memory_usage_threshold=0.99 过启动瞬态。
-#     (level=2 切换后驻留归零,host 降至 ~1.35T,阈值可待冒烟过后回默认。)
+#   权重同步:引擎醒(权重壳 35G,**KV 不驻留**)+ 训练参数+同步瞬时 ~7G ≈ 47G ✓
+#   注:同步窗口的安全由「KV 移出同步窗口」结构保证(权重壳→同步→再醒 KV,0aab9283),
+#     与 util 高低无关 —— 故 util 可拉回 0.85 保 256K 长上下文 session 的 KV 预算
+#     (0.70 时 KV 仅 7.4G,长 session 撑爆引擎致 no_completions,20260824 实锤)。
+#   host 预算:level=2 驻留归零,训练 host ~1010G + plasma 200G + 基线 ~150G ≈ 1.35T / 2T,
+#     远低于 Ray 阈值,RAY_memory_usage_threshold=0.99 可回默认。
 #   切勿设 VIME_OFFLOAD_PARAM_BUFFER=1(B 模式卸参数,会在权重同步时无参数可发)。
 # ─────────────────────────────────────────────────────────────────────────────
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
@@ -36,7 +36,7 @@ ROLLOUT_NODE_IP=80.48.5.56 \
 ROLLOUT_NUM_GPUS=28 \
 ROLLOUT_NUM_GPUS_PER_ENGINE=2 \
 FEAT_PD_DISAGG=0 \
-VLLM_GPU_MEM_UTIL=0.70 \
+VLLM_GPU_MEM_UTIL=0.85 \
 MAX_TOKENS_PER_GPU=32768 \
 SEQ_LENGTH=262144 \
 ROLLOUT_MAX_CONTEXT_LEN=262144 \
