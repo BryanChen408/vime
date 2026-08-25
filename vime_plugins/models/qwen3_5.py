@@ -620,22 +620,40 @@ def get_qwen3_5_spec(args, config, vp_stage):
             "full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(n)
         ]
 
-    for layer_id in range(num_layers_to_build):
-        if text_config.layer_types[layer_id + offset] == "linear_attention":
-            # [fix 2026-08-20] 环境无 NVIDIA transformer_engine 时,Megatron extensions 把
-            # core_attention 兜底成 MagicMock,deepcopy 会炸("cannot pickle 'cell' object")。
-            # 这些 GDN 层的 self_attention 随后整体被替换(下方 ModuleSpec(module=Attention)),
-            # 原 core_attention 不会被使用 —— deepcopy 前换成可用的本地实现即可。
-            _sa = transformer_layer_spec.layer_specs[layer_id].submodules.self_attention
-            _ca = getattr(_sa.submodules, "core_attention", None)
-            if _ca is not None and "Mock" in type(_ca).__name__:
-                from megatron.core.transformer.dot_product_attention import DotProductAttention
+    import dataclasses
 
-                _sa.submodules.core_attention = DotProductAttention
-            layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
-            layer_specs.submodules.self_attention = ModuleSpec(
-                module=Attention,
-                params={"args": args},
+    for layer_id in range(num_layers_to_build):
+        _spec_i = transformer_layer_spec.layer_specs[layer_id]
+        _sa = _spec_i.submodules.self_attention
+        _ca = getattr(_sa.submodules, "core_attention", None)
+        _ca_is_mock = _ca is not None and "Mock" in type(_ca).__name__
+        if text_config.layer_types[layer_id + offset] == "linear_attention":
+            # [fix 2026-08-25] eb10b0bd 的就地改 core_attention 会污染跨层共享模板
+            # (block spec 所有层共享同一份 submodules,实测 spec[0] is spec[3]),
+            # 全注意力层被连带换成不支持 packed sequence 的本地 DotProductAttention,
+            # train forward 断言(run 20260825-172714)。改为整体换新:self_attention
+            # 直接换成 vime 的 Attention(内含 GDN)的新 ModuleSpec —— 新对象里不含
+            # Mock,deepcopy 安全,且共享模板不被触碰。
+            _new_subs = dataclasses.replace(
+                _spec_i.submodules,
+                self_attention=ModuleSpec(module=Attention, params={"args": args}),
             )
-            transformer_layer_spec.layer_specs[layer_id] = layer_specs
+            transformer_layer_spec.layer_specs[layer_id] = copy.deepcopy(
+                dataclasses.replace(_spec_i, submodules=_new_subs)
+            )
+        elif _ca_is_mock:
+            # [fix 2026-08-25] TE 补丁丢失时全注意力层的 core_attention 也是 MagicMock,
+            # 无法实例化。补成 MindSpeedTEDotProductAttention(mindspeed 自带实现,
+            # 支持 thd/packed,不依赖 TE),与健康路径(repatch 生效)的产物一致。
+            from mindspeed.te.pytorch.attention.dot_product_attention.dot_product_attention import (
+                MindSpeedTEDotProductAttention,
+            )
+
+            _new_sa = dataclasses.replace(
+                _sa,
+                submodules=dataclasses.replace(_sa.submodules, core_attention=MindSpeedTEDotProductAttention),
+            )
+            transformer_layer_spec.layer_specs[layer_id] = dataclasses.replace(
+                _spec_i, submodules=dataclasses.replace(_spec_i.submodules, self_attention=_new_sa)
+            )
     return transformer_layer_spec
