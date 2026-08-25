@@ -56,7 +56,7 @@
 #     the 1.3.0 pin used by Dockerfile.release.
 #
 # BUILD (minimal context — avoids shipping /workspace):
-#   mkdir -p /tmp/vime-release-pd && cp -r Dockerfile.release-pd patches wheels /tmp/vime-release-pd/
+#   mkdir -p /tmp/vime-release-pd && cp -r Dockerfile.release-pd patches wheels vendor /tmp/vime-release-pd/
 #   docker build -f Dockerfile.release-pd -t vime:a3-pd-release /tmp/vime-release-pd
 # =============================================================================
 
@@ -98,6 +98,10 @@ ARG VIME_REF=a3-pd
 ARG GO_VERSION=1.23.8
 ARG GO_MIRROR=https://mirrors.aliyun.com/golang
 ARG MPICH_VERSION=4.2.3
+# MPICH tarball: GitHub releases. www.mpich.org is unreachable from the build
+# site; mirrors.huaweicloud.com/mpich now returns a JS portal page instead of
+# files (verified 2026-08) — do not use it.
+ARG MPICH_URL=https://github.com/pmodels/mpich/releases/download/v${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz
 ARG YALANTINGLIBS_VERSION=0.5.7
 ARG MOONCAKE_REPO=https://github.com/kvcache-ai/Mooncake.git
 ARG MOONCAKE_REF=v0.3.9
@@ -122,8 +126,13 @@ ENV CANN_SETENV_B=/usr/local/Ascend/cann-9.0.0/set_env.sh
 
 # apt deps: base tools + fla_npu build deps + patchelf (RUNPATH fix)
 #           + Mooncake build deps (RDMA/gRPC/boost/etc.)
+# Base image ships ports.ubuntu.com sources, which is unreachable from the
+# build site (direct egress blocked) — rewrite to the Huawei Cloud
+# ubuntu-ports mirror before apt-get update. Override with APT_MIRROR.
+ARG APT_MIRROR=http://mirrors.huaweicloud.com/ubuntu-ports
 RUN set -ex; \
     export DEBIAN_FRONTEND=noninteractive; \
+    sed -i "s|http://ports.ubuntu.com/ubuntu-ports|${APT_MIRROR}|g" /etc/apt/sources.list; \
     # some base images ship apt keyrings not readable by the '_apt' user, which
     # makes apt-get update fail with NO_PUBKEY; make them world-readable. No-op
     # on a healthy base. Fall back to an insecure update only if that isn't enough.
@@ -142,11 +151,17 @@ RUN set -ex; \
         libboost-all-dev libhiredis-dev \
         libyaml-cpp-dev libjsoncpp-dev libgoogle-glog-dev \
         libasio-dev libcurl4-openssl-dev libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 # NOTE: the first two lines cover what fla_npu's install_deps.sh would install
 # (gawk/pigz/dos2unix/gtest/cmake/make/gcc/patch); we install them directly and
 # skip install_deps.sh, which uses sudo + interactive prompts that stall in a
 # non-interactive docker build.
+
+# Workspace for all source checkouts (Mooncake in the PD data plane below;
+# vime/vllm/MindSpeed/fla_npu/Megatron further down). Declared before first
+# use; WORKDIR creates the directory if missing.
+WORKDIR /workspace
 
 # ============================ PD data plane ==================================
 # Mooncake is pure C++/Go: it needs CANN headers + the apt deps above, but NO
@@ -166,9 +181,21 @@ ENV PATH=/usr/local/go/bin:${PATH} \
     GO111MODULE=on
 
 # --- MPICH (Mooncake dependency) ---
+# Local-first / wget-fallback: if the build context ships a vendored tarball at
+# vendor/mpich-<ver>.tar.gz (recommended — the gateway throttles GitHub release
+# downloads to ~100KB/s), it is used as-is; otherwise wget from MPICH_URL.
+# The gzip -t guard fails fast on HTML error pages from dead mirrors.
+COPY vendor/ /tmp/vendor/
 RUN set -ex; \
     cd /tmp; \
-    wget -q "https://www.mpich.org/static/downloads/${MPICH_VERSION}/mpich-${MPICH_VERSION}.tar.gz"; \
+    if [ -f "/tmp/vendor/mpich-${MPICH_VERSION}.tar.gz" ]; then \
+        echo "MPICH: using vendored tarball vendor/mpich-${MPICH_VERSION}.tar.gz"; \
+        cp "/tmp/vendor/mpich-${MPICH_VERSION}.tar.gz" .; \
+    else \
+        echo "MPICH: no vendored tarball, downloading ${MPICH_URL}"; \
+        wget -q "${MPICH_URL}"; \
+    fi; \
+    gzip -t "mpich-${MPICH_VERSION}.tar.gz"; \
     tar -xzf "mpich-${MPICH_VERSION}.tar.gz"; \
     cd "mpich-${MPICH_VERSION}"; \
     ./configure --prefix=/usr/local --disable-fortran; \
@@ -188,6 +215,12 @@ RUN set -ex; \
     cd /tmp && rm -rf yalantinglibs
 
 # --- Mooncake v0.3.9 (official, no patch) with ASCEND_DIRECT ---
+# The trailing rm purges, IN THE SAME LAYER, everything the build produces
+# that the runtime does not need: the cmake build tree (.o files, often 1-3GB)
+# and the Go module/build caches. Layers are additive — files deleted in a
+# LATER layer would still occupy the image, so the purge must happen here.
+# /workspace/Mooncake source is kept (verify_mooncake_pd.sh uses it as the
+# PD-image marker; re-cmake restores the build tree if ever needed).
 RUN set -ex; \
     cd /workspace; \
     git clone --depth 1 --branch "${MOONCAKE_REF}" "${MOONCAKE_REPO}" Mooncake; \
@@ -196,7 +229,8 @@ RUN set -ex; \
     mkdir -p build && cd build; \
     cmake .. -DUSE_ASCEND_DIRECT=ON; \
     make -j"$(nproc)"; \
-    make install
+    make install; \
+    cd / && rm -rf /workspace/Mooncake/build /root/.cache/go-build /root/go/pkg
 
 # ============================ Python stack ===================================
 
@@ -249,13 +283,11 @@ RUN pip install --no-cache-dir \
         xgrammar==0.2.2 partial-json-parser==0.2.1.1.post7 llguidance==1.7.0 \
         outlines-core==0.2.14
 
-RUN pip install -U setuptools pip setuptools_rust setuptools_scm nanobind
+RUN pip install -U --no-cache-dir setuptools pip setuptools_rust setuptools_scm nanobind
 RUN ln -sf "$(command -v ninja)" /usr/local/bin/ninja && /usr/local/bin/ninja --version
 
 # vime patches applied on top of the pinned official baselines
 COPY patches/ /tmp/patches/
-
-WORKDIR /workspace
 
 # --- vime (your own repo; no patch). a3-pd carries the PD runtime. ---
 RUN git clone "${VIME_REPO}" /workspace/vime && git -C /workspace/vime checkout "${VIME_REF}"
@@ -321,21 +353,44 @@ ENV VLLM_VERSION=0.23.0
 # ============================ Build-time smoke ===============================
 # Fail fast at image-build time instead of first NPU run:
 #   1. vllm imports (editable device-less install is importable);
-#   2. vllm's KV connector registry contains MooncakeConnectorV1 — this is
-#      exactly what vime/backends/vllm_utils/vllm_engine.py checks at runtime;
-#      without it PD cannot start;
-#   3. mooncake python bindings import (installed by Mooncake's make install).
-RUN python3 -c "\
+#   2. vllm's KV connector registry has a Mooncake connector — this is exactly
+#      what vime/backends/vllm_utils/vllm_engine.py probes at runtime. Official
+#      vllm v0.23.0 ships "MooncakeConnector" ("MooncakeConnectorV1" only
+#      existed in the former private fork) — accept either, like vllm_engine.py.
+#   3. mooncake python bindings import (CANN 9.0.0 bundles its own mooncake
+#      package under cann-9.0.0/python/site-packages; either source satisfies
+#      this check — runtime compatibility is a first-run validation item).
+# Runs from /tmp, NOT /workspace: python puts cwd first on sys.path, and the
+# /workspace/vllm repo ROOT (no __init__.py; the real package is one level
+# deeper) would shadow the PEP 660 editable install as an empty namespace
+# package — import "succeeds" but vllm.__version__ is missing.
+# CANN env is sourced so torch_npu can find libascend_hal at import time.
+RUN { . ${CANN_SETENV_A} 2>/dev/null || . ${CANN_SETENV_B}; }; \
+    cd /tmp && python3 -c "\
 import vllm; \
 print('vllm', vllm.__version__); \
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory; \
-assert 'MooncakeConnectorV1' in KVConnectorFactory._registry, \
-    'MooncakeConnectorV1 not in vllm KV connector registry — PD will not start'; \
-print('MooncakeConnectorV1 registered: OK'); \
+assert {'MooncakeConnectorV1', 'MooncakeConnector'} & set(KVConnectorFactory._registry), \
+    'no Mooncake connector in vllm KV connector registry — PD will not start'; \
+print('Mooncake connector registered: OK'); \
 import mooncake; \
 print('mooncake import: OK')"
 
-# Scrub build-time proxy so it never leaks into the running container
-ENV http_proxy= https_proxy= no_proxy= HTTP_PROXY= HTTPS_PROXY= NO_PROXY=
+# ============================ Final cache sweep ==============================
+# Layers are additive — a late rm cannot shrink earlier layers, so the real
+# purges live in the RUNs that create the caches (apt-get clean in the apt
+# layer, pip --no-cache-dir everywhere, build-tree/go-cache purge in the
+# Mooncake layer). This sweep only nets leftovers of the LAST layers: the
+# build-only COPY staging (/tmp/patches, /tmp/vendor, /tmp/wheels — already
+# consumed by git apply / pip) and any /root/.cache residue. Placed after the
+# smoke step so it never masks a smoke failure.
+RUN rm -rf /root/.cache /tmp/patches /tmp/vendor /tmp/wheels /var/tmp/*
+
+# Scrub build-time network config so it never leaks into the running container
+# (proxy AND pip mirror — a leftover PIP_INDEX_URL makes runtime pip silently
+# use the build-site mirror, and without proxy env the container has no direct
+# egress: confusing SSL/hang failures at first run)
+ENV http_proxy= https_proxy= no_proxy= HTTP_PROXY= HTTPS_PROXY= NO_PROXY= \
+    PIP_INDEX_URL= PIP_TRUSTED_HOST=
 
 CMD ["bash"]

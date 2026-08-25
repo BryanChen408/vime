@@ -59,10 +59,12 @@ fi
 echo "OK: linkage resolves ($mooncake_so)"
 
 # --- 4) vllm KV connector registry -------------------------------------------
+# Mirrors vime/backends/vllm_utils/vllm_engine.py: official vllm v0.23.0 ships
+# "MooncakeConnector"; "MooncakeConnectorV1" only existed in the former fork.
 python3 -c "\
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory; \
-assert 'MooncakeConnectorV1' in KVConnectorFactory._registry, \
-    'MooncakeConnectorV1 not in vllm KV connector registry — PD will not start'; \
-print('OK: MooncakeConnectorV1 registered in vllm')"
+assert {'MooncakeConnectorV1', 'MooncakeConnector'} & set(KVConnectorFactory._registry), \
+    'no Mooncake connector in vllm KV connector registry — PD will not start'; \
+print('OK: Mooncake connector registered in vllm')"
 
 echo "=== ✅ Mooncake PD data plane verified ==="

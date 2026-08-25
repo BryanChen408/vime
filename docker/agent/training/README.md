@@ -125,7 +125,7 @@ pulling the quay base:
 ## 5. PD variant — `Dockerfile.release-pd` (vLLM v0.23.0 + Mooncake)
 
 `Dockerfile.release-pd` is a variant of `Dockerfile.release` for the
-**prefill/decode-disaggregated** rollout path (vime branch `a3-pd`). It keeps
+**prefill/decode-disaggregated** rollout. It keeps
 the release image's dependency model (official upstream + pinned ref + small
 patch) and its entire training stack, and changes only what PD requires:
 
@@ -136,8 +136,7 @@ patch) and its entire training stack, and changes only what PD requires:
 | PD data plane | — | **Mooncake v0.3.9** (official, no patch), built `-DUSE_ASCEND_DIRECT=ON`; pulls in Go 1.23.8 / MPICH 4.2.3 / yalantinglibs 0.5.7 + RDMA/gRPC apt deps |
 | vime ref | `feature/swe-tasks` | **`a3-pd`** (carries the PD runtime: mooncake proxy, session-affinity router) |
 | `VLLM_VERSION` | `0.21.0` | `0.23.0` |
-| llguidance | 1.3.0 | **1.7.0** (vllm v0.23.0 requires `>=1.7.0,<1.8.0` — the 1.3.0 pin cannot resolve) |
-| build-time smoke | — | asserts `MooncakeConnectorV1` is in vllm's KV connector registry (what `vime/backends/vllm_utils/vllm_engine.py` probes at runtime) + `import mooncake` |
+| build-time smoke | — | asserts a Mooncake connector is in vllm's KV connector registry (what `vime/backends/vllm_utils/vllm_engine.py` probes at runtime — official v0.23.0 ships `MooncakeConnector`; `MooncakeConnectorV1` only existed in the former fork, either name passes) + `import mooncake` |
 
 Everything else — base image, proxy machinery, torch 2.10.0 stack,
 triton-ascend 3.2.1 wheel gate, MindSpeed/Megatron/fla_npu sections and their
@@ -147,7 +146,7 @@ patches, the deferred NPU-kernel build (section 2) — is identical to
 ### Baseline notes (PD-specific)
 
 - **vllm-ascend's baseline is a BRANCH commit, not the v0.23.0 tag.** The two
-  PD patches were extracted by `extract_pd_patches.sh` from the former private
+  PD patches were extracted from the former private
   forks (`ljyrj/vllm@releases/v0.23.0`, `ljyrj/vllm-ascend-023@vime-adapter-v023`).
   The vllm fork sits directly on tag `v0.23.0`; the vllm-ascend fork is based
   on commit `88eac271` of the official `releases/v0.23.0` **branch** (which is
@@ -171,12 +170,25 @@ wheel), then:
 
 ```
 docker build -f Dockerfile.release-pd -t vime:a3-pd-release \
+  --build-arg HTTP_PROXY=$http_proxy --build-arg HTTPS_PROXY=$http_proxy \
   --build-arg TRITON_ASCEND_WHEEL=triton_ascend-3.2.1-<...>-aarch64.whl \
   .
 ```
 
 The build fails fast if Mooncake does not compile or if vllm's KV connector
-registry lacks `MooncakeConnectorV1` (build-time smoke step).
+registry lacks a Mooncake connector (build-time smoke step, run from `/tmp`
+with the CANN env sourced — running it from `/workspace` would shadow the
+editable vllm install with the source repo root).
+
+**Vendored tarballs (local-first / wget-fallback).** Large tarballs that are
+slow or unreliable through the gateway can be dropped into `vendor/` in the
+build context (`vendor/` is gitignored, like `wheels/`). A vendored file is
+used as-is; otherwise the Dockerfile downloads from the pinned URL:
+
+| file | fallback URL (build-arg) |
+|------|--------------------------|
+| `vendor/mpich-4.2.3.tar.gz` | GitHub releases (`MPICH_URL`) |
+
 
 ### First run
 
@@ -192,7 +204,8 @@ bash /workspace/verify_mooncake_pd.sh
 It checks, in order: the `/workspace/Mooncake` tree (skips silently on non-PD
 images), the `mooncake` python bindings, transfer-engine `.so` linkage via
 `ldd` (the ASCEND_DIRECT path resolves CANN libs — needs the CANN env, so run
-on an NPU host / with driver mounts), and that `MooncakeConnectorV1` is in
-vllm's KV connector registry. Re-run it after `docker commit`, driver-mount
+on an NPU host / with driver mounts), and that a Mooncake connector
+(`MooncakeConnector` on official v0.23.0) is in vllm's KV connector registry.
+Re-run it after `docker commit`, driver-mount
 or CANN env changes. PD serving itself (prefill/decode topology, proxy,
 router) is driven by the vime `a3-pd` runtime configs, not by this image.
