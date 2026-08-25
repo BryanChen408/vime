@@ -438,3 +438,30 @@ def test_per_engine_mem_util_split():
         cmd_ded, _ = build_vllm_cmd_and_env(_minimal_server_args("80.48.5.64"))
     assert _flag_value(cmd_colo, "--gpu-memory-utilization") == "0.7"
     assert _flag_value(cmd_ded, "--gpu-memory-utilization") == "0.7"
+
+
+def test_served_alias_and_util_split_via_args_namespace():
+    """跨节点通道:args 命名空间携带(20260825 修复)——远程 actor 的 os.environ 是
+    该节点 raylet 的 env,driver 节点(start_sync_hybrid.sh)设的 env 到不了 .64。
+    模拟远程 actor:env 全无、args 带值,别名与 util 分叉必须仍生效。"""
+    from vime.backends.vllm_utils.vllm_engine import build_vllm_cmd_and_env
+
+    sa = _minimal_server_args("80.48.5.64")  # 专用引擎(.64)
+    sa["args"].vllm_served_model_name_alias = "/home/docker/Qwen3.6-35B-A3B"
+    sa["args"].vllm_gpu_mem_util_dedicated = "0.85"
+    env_clean = {k: v for k, v in os.environ.items()
+                 if k not in ("VLLM_SERVED_MODEL_NAME", "VLLM_GPU_MEM_UTIL_DEDICATED")}
+    with mock.patch.dict(os.environ, env_clean, clear=True):
+        cmd, _ = build_vllm_cmd_and_env(sa)
+    assert "--served-model-name" in cmd
+    assert "/home/docker/Qwen3.6-35B-A3B" in cmd
+    assert _flag_value(cmd, "--gpu-memory-utilization") == "0.85"
+
+    # args 空串 + env 也无 → 无别名、util 保持基础值(回归保护)
+    sa2 = _minimal_server_args("80.48.5.64")
+    sa2["args"].vllm_served_model_name_alias = ""
+    sa2["args"].vllm_gpu_mem_util_dedicated = ""
+    with mock.patch.dict(os.environ, env_clean, clear=True):
+        cmd2, _ = build_vllm_cmd_and_env(sa2)
+    assert "--served-model-name" not in cmd2
+    assert _flag_value(cmd2, "--gpu-memory-utilization") == "0.7"

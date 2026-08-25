@@ -1874,6 +1874,15 @@ def vime_validate_args(args):
                 )
             args.vllm_data_parallel_size = layout.vllm_dp_size
 
+    # [2026-08-25] 把引擎侧 launcher env 固化进 args 命名空间:build_vllm_cmd_and_env
+    # 在目标节点的 VLLMEngine actor 里执行,os.environ 是该节点 raylet 的环境 —— 只设
+    # 在 driver 节点的变量(如 start_sync_hybrid.sh 的 VLLM_SERVED_MODEL_NAME /
+    # VLLM_GPU_MEM_UTIL_DEDICATED)到不了经 start_pd_worker.sh 入组的远程节点(.64)。
+    # args 随 Ray 序列化天然跨节点携带,是唯一可信通道(先例:上方 RESOURCE_LAYOUT
+    # 的 env 兜底)。未设置时为空串,引擎侧回退读 os.environ,行为与之前一致。
+    args.vllm_served_model_name_alias = os.environ.get("VLLM_SERVED_MODEL_NAME", "")
+    args.vllm_gpu_mem_util_dedicated = os.environ.get("VLLM_GPU_MEM_UTIL_DEDICATED", "")
+
     if args.debug_rollout_only:
         if args.colocate and (not args.rollout_num_gpus):
             args.rollout_num_gpus = args.actor_num_gpus_per_node * args.actor_num_nodes

@@ -612,7 +612,9 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     #    错开即全灭)。VLLM_SERVED_MODEL_NAME(空格分隔)提供与目录解耦的
     #    固定别名;真实路径始终附带保留,vime 侧按路径的探测不受影响。
     #    未设置时不加 flag,行为与之前一致(serve 名 = 模型路径)。
-    _served_alias = os.environ.get("VLLM_SERVED_MODEL_NAME", "").split()
+    _served_alias = (
+        getattr(args, "vllm_served_model_name_alias", "") or os.environ.get("VLLM_SERVED_MODEL_NAME", "")
+    ).split()
     if _served_alias and "--served-model-name" not in cmd:
         _names = []
         for _n in [str(server_args["model_path"]), *_served_alias]:
@@ -628,7 +630,9 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     #    (引擎自身 51.85G + trainer 9.8G > 60.95G 总容量)。
     #    VLLM_GPU_MEM_UTIL_DEDICATED 仅覆写非共卡引擎;未设置时全部引擎用
     #    --vllm-gpu-memory-utilization 的统一值,行为与之前一致。
-    _util_dedicated = os.environ.get("VLLM_GPU_MEM_UTIL_DEDICATED")
+    _util_dedicated = getattr(args, "vllm_gpu_mem_util_dedicated", "") or os.environ.get(
+        "VLLM_GPU_MEM_UTIL_DEDICATED"
+    )
     if _util_dedicated and not _colocated_engine:
         if "--gpu-memory-utilization" in cmd:
             cmd[cmd.index("--gpu-memory-utilization") + 1] = _util_dedicated
