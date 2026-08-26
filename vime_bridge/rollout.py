@@ -38,6 +38,8 @@ from vime_bridge.config import (
 )
 from vime_bridge.wire import SessionStatus, TaskResult, TaskStatus
 from vime_bridge.version_span import push_policy_version_to_gateway
+from vime.rollout.filter_hub.base_types import call_dynamic_filter
+from vime.utils.misc import load_function
 
 logger = logging.getLogger(__name__)
 
@@ -2241,6 +2243,12 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     async_worker = get_global_async_worker(args, data_source)
     async_worker.set_rollout_context(rollout_id)
     target = getattr(args, "rollout_batch_size", 1)
+    dynamic_filter = (
+        load_function(args.dynamic_sampling_filter_path)
+        if getattr(args, "dynamic_sampling_filter_path", None) is not None
+        else None
+    )
+    dynamic_filter_drops: dict[str, int] = {}
 
     data: list[list[Any]] = []
     start = time.monotonic()
@@ -2253,6 +2261,14 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
             rollout_id=rollout_id,
         )
         for completed in completed_groups:
+            if dynamic_filter is not None:
+                _validate_trajectory_rewards(completed.samples, async_worker.config.reward_key)
+            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, completed.samples)
+            if not dynamic_filter_output.keep:
+                reason = dynamic_filter_output.reason or "unknown"
+                dynamic_filter_drops[reason] = dynamic_filter_drops.get(reason, 0) + 1
+                made_progress = True
+                continue
             data.append(completed.samples)
             made_progress = True
 
@@ -2279,6 +2295,7 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     rewards = [_extract_sample_reward(s, async_worker.config.reward_key) for s in flat]
     metrics: dict[str, Any] = {}
     metrics.update(_polar_extra_metrics(flat, rewards, async_worker.config.reward_key))
+    metrics.update({f"rollout/dynamic_filter/drop_{reason}": count for reason, count in dynamic_filter_drops.items()})
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
 
@@ -2390,6 +2407,19 @@ def _extract_sample_reward(sample: Any, reward_key: str) -> float:
     if isinstance(reward, (int, float)):
         return float(reward)
     return 0.0
+
+
+def _validate_trajectory_rewards(samples: list[Any], reward_key: str) -> None:
+    rewards_by_trajectory: dict[tuple[int, int], float] = {}
+    for sample in samples:
+        key = (int(sample.group_index), int(sample.index))
+        reward = _extract_sample_reward(sample, reward_key)
+        previous = rewards_by_trajectory.get(key)
+        if previous is not None and reward != previous:
+            raise ValueError(
+                f"Trajectory {key} has inconsistent trace rewards: {previous} vs {reward}"
+            )
+        rewards_by_trajectory[key] = reward
 
 
 def _polar_extra_metrics(

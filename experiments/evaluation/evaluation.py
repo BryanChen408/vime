@@ -134,7 +134,54 @@ def _sample_metrics(samples, reward_key):
         })
     metrics.update(_report_metrics(reports))
     metrics.update(_operator_evaluation_metrics(evaluation_metrics, len(session_ids)))
+    metrics.update(_pass_at_k(samples))
     return metrics
+
+
+def _pass_at_k(samples):
+    """按 group_index 分组，算 pass@1 和 pass@k。
+
+    分组依据是样本的 group_index（同一个 prompt 的多个候选共享同一 group）；
+    候选顺序用样本的 index 字段；判断依据是 Polar 评测器上报的
+    correctness_ok / success 字段。
+
+    - pass@1：每个 group 的第 1 个候选正确（单次采样正确率）
+    - pass@k：每个 group 的 k 个候选里至少一个正确
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(dict)  # group_index -> {session_key: (index, metrics)}
+    for sample in samples:
+        gi = sample.get("group_index")
+        if gi is None:
+            continue
+        polar = sample.get("metadata", {}).get("polar", {})
+        session_id = polar.get("session_id")
+        metrics = (polar.get("trajectory_metadata") or {}).get("evaluation", {}).get("metrics") or {}
+        key = session_id or id(metrics)
+        idx = int(sample.get("index", 0) or 0)
+        groups[gi][key] = (idx, metrics)
+
+    if not groups:
+        return {}
+
+    result = {
+        "pass_at_k_num_groups": len(groups),
+        "pass_at_k_samples_per_group": max(len(v) for v in groups.values()),
+    }
+    for field, label in (("ast_check_ok", "ast"), ("correctness_ok", "correctness"), ("success", "success")):
+        first_ok = 0
+        any_ok = 0
+        for v in groups.values():
+            ordered = [m for _, m in sorted(v.values(), key=lambda x: x[0])]
+            oks = [m.get(field) is True for m in ordered]
+            if oks and oks[0]:
+                first_ok += 1
+            if any(oks):
+                any_ok += 1
+        result[f"pass_at_1_{label}"] = first_ok / len(groups)
+        result[f"pass_at_k_{label}"] = any_ok / len(groups)
+    return result
 
 
 def _flatten_report(value, prefix=""):

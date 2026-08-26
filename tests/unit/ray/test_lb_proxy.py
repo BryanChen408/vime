@@ -122,6 +122,7 @@ def test_load_is_released_on_every_path(proxy):
     for _ in range(3):
         client.post("/v1/completions", json={"prompt": "hello world"})
     assert [server.active_tokens for server in app.state.proxy.dp_servers] == [0, 0]
+    assert [server.active_requests for server in app.state.proxy.dp_servers] == [0, 0]
 
 
 @pytest.mark.unit
@@ -131,6 +132,22 @@ def test_requests_without_a_session_go_to_the_least_loaded_engine():
     assert state.select_server(1) == 1
     assert state.select_server(1) == 1
     assert [server.active_tokens for server in state.dp_servers] == [10, 2]
+
+
+@pytest.mark.unit
+def test_new_sessions_prefer_fewer_active_requests_then_fewer_tokens():
+    state = ProxyState(ENGINES)
+    state.dp_servers[0].active_requests = 2
+    state.dp_servers[0].active_tokens = 10
+    state.dp_servers[1].active_requests = 1
+    state.dp_servers[1].active_tokens = 100
+    assert state.select_server_by_session("session-a", 1) == 1
+
+    state.dp_servers[0].active_requests = 2
+    state.dp_servers[0].active_tokens = 10
+    state.dp_servers[1].active_requests = 2
+    state.dp_servers[1].active_tokens = 100
+    assert state.select_server_by_session("session-b", 1) == 0
 
 
 @pytest.mark.unit

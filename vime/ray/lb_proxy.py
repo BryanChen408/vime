@@ -61,6 +61,7 @@ class ServerState:
             limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
         )
         self.active_tokens = 0
+        self.active_requests = 0
 
 
 @dataclass
@@ -82,25 +83,39 @@ class ProxyState:
         for server in self.dp_servers:
             await server.client.aclose()
 
+    def _charge_server(self, token_count: float, preferred: int | None = None) -> int:
+        if preferred is not None:
+            idx = preferred
+        else:
+            idx = min(
+                range(len(self.dp_servers)),
+                key=lambda i: (
+                    self.dp_servers[i].active_requests,
+                    self.dp_servers[i].active_tokens,
+                ),
+            )
+        self.dp_servers[idx].active_tokens += token_count
+        self.dp_servers[idx].active_requests += 1
+        return idx
+
     def select_server(self, token_count: float) -> int:
         """Charge the request to the least loaded engine and return its index."""
         if not self.dp_servers:
             raise RuntimeError("no rollout engines registered")
-        idx = min(range(len(self.dp_servers)), key=lambda i: self.dp_servers[i].active_tokens)
-        self.dp_servers[idx].active_tokens += token_count
-        return idx
+        return self._charge_server(token_count)
 
     def select_server_by_session(self, session_id: str, token_count: float) -> int:
         """Place a new session by load, then pin its later turns to that engine."""
         idx = self.session_servers.get(session_id)
         if idx is None:
-            idx = min(range(len(self.dp_servers)), key=lambda i: self.dp_servers[i].active_tokens)
+            idx = self._charge_server(token_count)
             self.session_servers[session_id] = idx
-        self.dp_servers[idx].active_tokens += token_count
-        return idx
+            return idx
+        return self._charge_server(token_count, preferred=idx)
 
     def release_server(self, idx: int, token_count: float):
         self.dp_servers[idx].active_tokens -= token_count
+        self.dp_servers[idx].active_requests -= 1
 
     def score_request(self, request_length: int, max_tokens: int, ignore_eos: bool) -> float:
         if ignore_eos:
