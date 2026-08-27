@@ -167,6 +167,12 @@ class RayTrainGroup:
         """Broadcast weights from rank 0 to all other ranks."""
         return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
 
+    def prepare_memory_handoff(self):
+        return ray.get([actor.prepare_memory_handoff.remote() for actor in self._actor_handlers])
+
+    def finish_memory_handoff(self):
+        return ray.get([actor.finish_memory_handoff.remote() for actor in self._actor_handlers])
+
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
 

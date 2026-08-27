@@ -12,7 +12,13 @@ import vime.utils.eval_config
 from vime.ray.ray_actor import RayActor
 from vime.utils.distributed_utils import init_gloo_group
 from vime.utils.logging_utils import configure_logger
-from vime.utils.memory_utils import clear_memory, print_memory
+from vime.utils.memory_utils import (
+    aggressive_empty_cache,
+    clear_memory,
+    expandable_segments_enabled,
+    print_memory,
+    set_expandable_segments,
+)
 from vime.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
@@ -58,6 +64,8 @@ class TrainRayActor(RayActor):
         self.role = role
         self.with_ref = with_ref
         self.with_opd_teacher = with_opd_teacher
+        self._memory_handoff_active = False
+        self._restore_expandable_segments = False
 
         torch.serialization.add_safe_globals([vime.utils.eval_config.EvalDatasetConfig])
 
@@ -102,6 +110,43 @@ class TrainRayActor(RayActor):
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
+
+    def prepare_memory_handoff(self) -> None:
+        """Prepare a colocated NPU actor allocator before rollout weights wake."""
+        if not (
+            is_npu()
+            and getattr(self.args, "offload_train", False)
+            and getattr(self, "_rollout_shares_actor_devices", False)
+        ):
+            return
+        if self._memory_handoff_active:
+            logger.info("NPU memory handoff is already active; skipping duplicate prepare")
+            return
+
+        self._memory_handoff_active = True
+        self._restore_expandable_segments = expandable_segments_enabled()
+
+        # Port the allocator bracket used by verl: synchronization/update
+        # temporaries must be allocated while expandable segments are disabled,
+        # so they can be returned cleanly before vLLM remaps its KV cache.
+        set_expandable_segments(False)
+        aggressive_empty_cache(force_sync=True)
+        print_memory("after memory handoff prepare (before rollout weights wake)")
+
+    def finish_memory_handoff(self) -> None:
+        """Close a successful handoff after rollout KV cache is fully awake."""
+        if not getattr(self, "_memory_handoff_active", False):
+            return
+
+        try:
+            # mem_get_info is device-global, so this records the trainer residue
+            # together with the fully restored vLLM weights/KV/graphs.
+            print_memory("after rollout KV cache wake")
+        finally:
+            if self._restore_expandable_segments:
+                set_expandable_segments(True)
+            self._restore_expandable_segments = False
+            self._memory_handoff_active = False
 
     @abc.abstractmethod
     def sleep(self, tags):

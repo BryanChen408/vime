@@ -25,7 +25,7 @@ from vime.utils import train_dump_utils
 from vime.utils.data import process_rollout_data
 from vime.utils.distributed_utils import get_gloo_group
 from vime.utils.logging_utils import init_tracking
-from vime.utils.memory_utils import clear_memory, print_memory
+from vime.utils.memory_utils import aggressive_empty_cache, clear_memory, print_memory
 from vime.utils.misc import Box
 from vime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from vime.utils.routing_replay import RoutingReplay
@@ -712,8 +712,9 @@ class MegatronTrainRayActor(TrainRayActor):
             # (all_gather/contiguous/IPC handle 的瞬时块);不归还给驱动的话,共卡引擎
             # 随后 kv_cache 唤醒时 CaMem 拿不到连续物理页 → MallocPhysical 驱动级 OOM
             # (run 20260824-100522 实锤:rank13 卡 used 57.6G,1.35G 申请失败)。
-            # 此处只清缓存池,存活参数不受影响。
-            clear_memory()
+            # 非共卡路径维持原单次清理；共卡交接要等进程组销毁后再做 verl 式多轮清理。
+            if not self._memory_handoff_active:
+                clear_memory()
 
             if self.args.ci_test and len(rollout_engines) > 0:
                 engine = random.choice(rollout_engines)
@@ -739,6 +740,14 @@ class MegatronTrainRayActor(TrainRayActor):
             self.sleep()
         elif self.args.offload_train:
             destroy_process_groups()
+
+        if self._memory_handoff_active:
+            # Match verl's second cleanup after actor offload. In VIME the actor
+            # flat buffers were already released after training, so the last
+            # reclaimable allocations are weight-sync temporaries and destroyed
+            # process-group buffers. KV wake happens only after this RPC returns.
+            aggressive_empty_cache(force_sync=True)
+            print_memory("after weight sync cleanup (before rollout KV wake)")
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune

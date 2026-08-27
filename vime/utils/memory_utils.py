@@ -1,5 +1,6 @@
 import gc
 import logging
+import os
 
 import psutil
 import torch
@@ -7,6 +8,8 @@ import torch.distributed as dist
 from vime.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
+
+_GIB = 1024**3
 
 
 def clear_memory(clear_host_memory: bool = False):
@@ -23,6 +26,67 @@ def clear_memory(clear_host_memory: bool = False):
             torch.npu.empty_cache()
         else:
             torch._C._host_emptyCache()
+
+
+def expandable_segments_enabled() -> bool:
+    """Return the training allocator's configured expandable-segment policy."""
+    config = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
+    for setting in config.split(","):
+        name, separator, value = setting.partition(":")
+        if separator and name.strip().lower() == "expandable_segments":
+            return value.strip().lower() in {"1", "true"}
+    return False
+
+
+def set_expandable_segments(enable: bool) -> None:
+    """Apply verl's runtime expandable-segment switch on torch-npu."""
+    if not is_npu():
+        return
+
+    try:
+        torch.npu.memory._set_allocator_settings(f"expandable_segments:{enable}")
+        logger.info("Set NPU allocator expandable_segments=%s", enable)
+    except Exception:
+        # Match verl's NPU platform behavior: older torch-npu builds keep their
+        # existing allocator policy, while the rest of the handoff still runs.
+        logger.warning(
+            "Current torch-npu does not support runtime allocator settings; "
+            "continuing with the existing expandable_segments policy",
+            exc_info=True,
+        )
+
+
+def aggressive_empty_cache(force_sync: bool = True, max_retries: int = 3) -> None:
+    """Release cached device blocks using verl's bounded multi-pass cleanup."""
+    device = torch.npu if is_npu() else torch.cuda
+    if not device.is_available():
+        return
+
+    for attempt in range(max_retries):
+        before_reserved = device.memory_reserved()
+        before_allocated = device.memory_allocated()
+
+        gc.collect()
+        device.empty_cache()
+        if force_sync:
+            device.synchronize()
+
+        after_reserved = device.memory_reserved()
+        after_allocated = device.memory_allocated()
+        reserved_freed = before_reserved - after_reserved
+        allocated_freed = before_allocated - after_allocated
+        logger.info(
+            "Memory cleanup attempt %d: freed %.2f GiB reserved, %.2f GiB allocated",
+            attempt + 1,
+            reserved_freed / _GIB,
+            allocated_freed / _GIB,
+        )
+
+        # A following pass is only worthwhile when the last pass returned at
+        # least 1 GiB. Synchronization can make more blocks reclaimable on the
+        # next pass, but the loop remains strictly bounded.
+        if reserved_freed < _GIB:
+            break
 
 
 def available_memory():
