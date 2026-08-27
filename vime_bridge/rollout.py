@@ -195,8 +195,14 @@ def update_policy_version(args: Any, policy_version: int) -> None:
             _global_async_worker.update_policy_version(policy_version)
 
 
-def prepare_policy_update(args: Any, policy_version: int) -> None:
-    """Optional hook called by Slime before overlapping inference weight sync."""
+def prepare_policy_update(args: Any, policy_version: int) -> dict[str, Any]:
+    """Close Polar admission before VIME aborts serving-engine requests.
+
+    This hook deliberately does not resume on failure and does not advance the gateway
+    version yet.  ``RolloutManager.prepare_policy_update`` first calls this hook, aborts
+    every serving engine, and then calls ``commit_policy_update_boundary`` below.  That
+    ordering prevents an old-weight completion from being stamped with the new version.
+    """
     logger.info("Preparing Polar bridge for policy_version=%s weight update", policy_version)
     with _worker_lock:
         worker = _global_async_worker
@@ -209,10 +215,10 @@ def prepare_policy_update(args: Any, policy_version: int) -> None:
     if worker is not None and worker.config.scheduler_mode == "session_pool":
         # The session-level drain waits for whole agent sessions to finish, which can take
         # far longer than any sane timeout. Two things matter here:
-        #   * It must not be the reason the weight update is skipped. The gateway pause and
-        #     the version stamp below are what actually protect the weight boundary, and they
-        #     run *after* this wait -- letting a slow drain raise past them means the boundary
-        #     is left unprotected exactly when there is most in-flight work to protect it from.
+        #   * It must not be the reason the weight update is skipped. The gateway admission
+        #     pause below and the post-abort drain/version commit are what protect the weight
+        #     boundary; letting a slow session drain raise before them would leave the boundary
+        #     unprotected exactly when there is most in-flight work to protect it from.
         #   * Synchronous (colocate) training has no overlap window at all: the engines sleep
         #     for the entire training step, so waiting for sessions only stalls training.
         #     --no-polar-weight-update-drain-sessions skips the wait and abandons whatever is
@@ -235,42 +241,43 @@ def prepare_policy_update(args: Any, policy_version: int) -> None:
                 "in-flight sessions are abandoned at the weight boundary."
             )
 
-    try:
-        _pause_gateway_generation(args)
-        # version-span guard: gateway now paused -> stamp the new version so every turn
-        # generated after resume is v_{N+1}; best-effort, never blocks the sync.
-        push_policy_version_to_gateway(args, policy_version)
-    except Exception:
-        try:
-            _resume_gateway_generation(args)
-        except Exception:
-            logger.warning("Failed to resume Polar gateway after prepare_policy_update error", exc_info=True)
-        with _worker_lock:
-            worker = _global_async_worker
-            if worker is not None:
-                if worker.config.scheduler_mode == "session_pool":
-                    worker.finish_policy_update_drain()
-                else:
-                    worker.resume_admission()
-        raise
+    return _pause_gateway_generation(args, require_drained=False)
+
+
+def commit_policy_update_boundary(args: Any, policy_version: int) -> dict[str, Any]:
+    """Confirm engine abort propagation, then publish the next policy version.
+
+    Called only after VIME's rollout-engine ``/pause?mode=abort`` fanout succeeds.
+    Failure is fatal and leaves both Polar and the local scheduler closed.
+    """
+    timeout_seconds = float(getattr(args, "polar_gateway_control_timeout", 30.0))
+    status = _pause_gateway_generation(
+        args,
+        timeout_seconds=timeout_seconds,
+        require_drained=True,
+    )
+    if not push_policy_version_to_gateway(args, policy_version):
+        raise PolarRolloutSchedulerError(
+            f"Failed to publish Polar policy_version={policy_version} while admission "
+            "was paused"
+        )
+    return status
 
 
 def finish_policy_update(args: Any, policy_version: int) -> None:
     """Optional hook called by Slime after overlapping inference weight sync."""
-    try:
-        with _worker_lock:
-            worker = _global_async_worker
-            if worker is not None and worker.config.scheduler_mode == "session_pool":
-                worker.update_policy_version(policy_version)
-        _resume_gateway_generation(args)
-    finally:
-        with _worker_lock:
-            worker = _global_async_worker
-            if worker is not None:
-                if worker.config.scheduler_mode == "session_pool":
-                    worker.finish_policy_update_drain()
-                else:
-                    worker.resume_admission()
+    with _worker_lock:
+        worker = _global_async_worker
+        if worker is not None and worker.config.scheduler_mode == "session_pool":
+            worker.update_policy_version(policy_version)
+    _resume_gateway_generation(args)
+    with _worker_lock:
+        worker = _global_async_worker
+        if worker is not None:
+            if worker.config.scheduler_mode == "session_pool":
+                worker.finish_policy_update_drain()
+            else:
+                worker.resume_admission()
     logger.info("Finished Polar bridge policy_version=%s weight update", policy_version)
 
 
@@ -288,46 +295,118 @@ def _resolve_rollout_url(args: Any) -> str | None:
     return None
 
 
-def _pause_gateway_generation(args: Any) -> None:
-    rollout_url = _resolve_rollout_url(args)
-    if rollout_url:
-        timeout_seconds = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
-        request_timeout = max(timeout_seconds + 15.0, 20.0)
-        with httpx.Client(timeout=request_timeout) as client:
-            response = client.post(
-                f"{rollout_url}/rollout/admin/inference/pause",
-                params={"timeout_seconds": timeout_seconds},
-            )
+def _control_post_json(
+    url: str,
+    *,
+    action: str,
+    timeout: float,
+    params: dict[str, object] | None = None,
+) -> dict[str, Any]:
+    """POST one control request without leaking non-pickleable httpx exceptions to Ray."""
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(url, params=params)
             response.raise_for_status()
-            logger.info("Paused Polar gateway generation via rollout server: %s", response.json())
-        return
-
-    gateway_url = _resolve_gateway_url(args)
-    if not gateway_url:
+            payload = response.json()
+    except httpx.HTTPError as exc:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        try:
+            detail = response.text if response is not None else str(exc)
+        except Exception:
+            detail = str(exc)
         raise PolarRolloutSchedulerError(
-            "polar_url, polar_rollout_url, or polar_gateway_url is required when "
-            "polar_allow_weight_update_overlap is enabled"
+            f"Polar {action} failed at {url}: status={status} detail={detail}"
+        ) from None
+    except (TypeError, ValueError) as exc:
+        raise PolarRolloutSchedulerError(
+            f"Polar {action} returned invalid JSON at {url}: {exc}"
+        ) from None
+
+    if not isinstance(payload, dict):
+        raise PolarRolloutSchedulerError(
+            f"Polar {action} returned non-object JSON at {url}: {type(payload).__name__}"
+        )
+    return payload
+
+
+def _pause_gateway_generation(
+    args: Any,
+    *,
+    timeout_seconds: float | None = None,
+    require_drained: bool,
+) -> dict[str, Any]:
+    rollout_url = _resolve_rollout_url(args)
+    effective_timeout = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
+    )
+    if rollout_url:
+        url = f"{rollout_url}/rollout/admin/inference/pause"
+        payload = _control_post_json(
+            url,
+            action="rollout gateway pause",
+            timeout=max(effective_timeout + 15.0, 20.0),
+            params={"timeout_seconds": effective_timeout},
+        )
+        all_paused = payload.get("all_paused") is True
+        all_drained = payload.get("all_drained") is True
+        inflight = int(payload.get("inflight", 0) or 0)
+    else:
+        gateway_url = _resolve_gateway_url(args)
+        if not gateway_url:
+            raise PolarRolloutSchedulerError(
+                "polar_url, polar_rollout_url, or polar_gateway_url is required when "
+                "polar_allow_weight_update_overlap is enabled"
+            )
+
+        url = f"{gateway_url}/admin/inference/pause"
+        payload = _control_post_json(
+            url,
+            action="gateway pause",
+            timeout=max(effective_timeout + 5.0, 10.0),
+            params={"timeout_seconds": effective_timeout},
+        )
+        all_paused = payload.get("paused") is True
+        all_drained = payload.get("drained") is True
+        inflight = int(payload.get("inflight", 0) or 0)
+
+    if not all_paused:
+        raise PolarRolloutSchedulerError(
+            f"Polar admission pause was not acknowledged: {payload}"
+        )
+    if require_drained and not all_drained:
+        raise PolarRolloutSchedulerError(
+            f"Polar remained non-drained after VIME aborted rollout engines: inflight={inflight} "
+            f"payload={payload}"
         )
 
-    timeout_seconds = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
-    request_timeout = max(timeout_seconds + 5.0, 10.0)
-    with httpx.Client(timeout=request_timeout) as client:
-        response = client.post(
-            f"{gateway_url}/admin/inference/pause",
-            params={"timeout_seconds": timeout_seconds},
-        )
-        response.raise_for_status()
-        logger.info("Paused Polar gateway generation for inference weight update: %s", response.json())
+    status = {
+        "all_paused": all_paused,
+        "all_drained": all_drained,
+        "inflight": inflight,
+        "payload": payload,
+    }
+    logger.info(
+        "Polar gateway pause acknowledged: paused=%s drained=%s inflight=%s",
+        all_paused,
+        all_drained,
+        inflight,
+    )
+    return status
 
 
 def _resume_gateway_generation(args: Any) -> None:
     rollout_url = _resolve_rollout_url(args)
     if rollout_url:
         request_timeout = float(getattr(args, "polar_gateway_control_timeout", 30.0))
-        with httpx.Client(timeout=max(request_timeout, 5.0)) as client:
-            response = client.post(f"{rollout_url}/rollout/admin/inference/resume")
-            response.raise_for_status()
-            logger.info("Resumed Polar gateway generation via rollout server: %s", response.json())
+        payload = _control_post_json(
+            f"{rollout_url}/rollout/admin/inference/resume",
+            action="rollout gateway resume",
+            timeout=max(request_timeout, 5.0),
+        )
+        logger.info("Resumed Polar gateway generation via rollout server: %s", payload)
         return
 
     gateway_url = _resolve_gateway_url(args)
@@ -335,10 +414,12 @@ def _resume_gateway_generation(args: Any) -> None:
         return
 
     request_timeout = float(getattr(args, "polar_gateway_control_timeout", 30.0))
-    with httpx.Client(timeout=max(request_timeout, 5.0)) as client:
-        response = client.post(f"{gateway_url}/admin/inference/resume")
-        response.raise_for_status()
-        logger.info("Resumed Polar gateway generation after inference weight update: %s", response.json())
+    payload = _control_post_json(
+        f"{gateway_url}/admin/inference/resume",
+        action="gateway resume",
+        timeout=max(request_timeout, 5.0),
+    )
+    logger.info("Resumed Polar gateway generation after inference weight update: %s", payload)
 
 
 # ---------------------------------------------------------------------------

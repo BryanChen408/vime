@@ -93,55 +93,45 @@ def train(args):
         # without the hook.
         next_policy_version = rollout_id + 1
         if args.offload_rollout:
-            # Best-effort: the drain raises PolarRolloutSchedulerError on timeout
-            # (vime_bridge/rollout.py wait_for_policy_update_drain), and an agent session
-            # can legitimately outlive the timeout. Failing to drain only means a few
-            # in-flight sessions hit sleeping engines and come back as ERROR trajectories,
-            # which are excluded from training anyway -- not a reason to kill the run.
-            try:
-                ray.get(rollout_manager.prepare_policy_update.remote(next_policy_version))
-            except Exception:
-                logger.warning(
-                    "prepare_policy_update failed before offloading rollout engines; "
-                    "in-flight sessions may error out. Continuing.",
-                    exc_info=True,
-                )
-        try:
-            if args.offload_rollout:
-                ray.get(rollout_manager.offload.remote())
+            # Hard safety gate: this returns only after Polar admission is closed,
+            # every serving engine has aborted old requests, and Polar confirms drained.
+            # Any failure propagates and leaves the gateway closed; sleeping an engine
+            # without that proof caused the 20260826 507001 half-wake crash.
+            ray.get(rollout_manager.prepare_policy_update.remote(next_policy_version))
 
-            actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+        if args.offload_rollout:
+            ray.get(rollout_manager.offload.remote())
 
-            if args.use_critic:
-                value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
-                if actor_trains_this_step:
-                    ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
-                else:
-                    ray.get(value_refs)
+        actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+
+        if args.use_critic:
+            value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
+            if actor_trains_this_step:
+                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
             else:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                ray.get(value_refs)
+        else:
+            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
-            if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-                save(rollout_id)
+        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+            save(rollout_id)
 
-            offload_train(actor_trains_this_step)
-            if args.offload_rollout:
-                # 同步窗口 KV 不驻留(定案,见文件头注):只醒权重壳做同步。
-                ray.get(rollout_manager.onload_weights.remote())
-            actor_model.update_weights()
-            # Advance policy version so off-policy staleness tracking (vime_bridge) stays
-            # live; a frozen version makes staleness grow without bound and drops every
-            # group as stale (see vime_bridge/rollout.py drain_completed ->
-            # max_off_policy_steps), which hangs training a few rollouts in.
-            ray.get(rollout_manager.update_policy_version.remote(next_policy_version))
-            if args.offload_rollout:
-                # 同步完成 + clear_memory 之后,才醒 KV(此时空闲最足,重映射最稳)。
-                ray.get(rollout_manager.onload_kv.remote())
-        finally:
-            # Engines are serving again -> let the gateway resume. In finally so a failed
-            # training step can't strand the external gateway in the paused state.
-            if args.offload_rollout:
-                ray.get(rollout_manager.finish_policy_update.remote(next_policy_version))
+        offload_train(actor_trains_this_step)
+        if args.offload_rollout:
+            # 同步窗口 KV 不驻留(定案,见文件头注):只醒权重壳做同步。
+            ray.get(rollout_manager.onload_weights.remote())
+        actor_model.update_weights()
+        # Advance policy version so off-policy staleness tracking (vime_bridge) stays
+        # live; a frozen version makes staleness grow without bound and drops every
+        # group as stale (see vime_bridge/rollout.py drain_completed ->
+        # max_off_policy_steps), which hangs training a few rollouts in.
+        ray.get(rollout_manager.update_policy_version.remote(next_policy_version))
+        if args.offload_rollout:
+            # 同步完成 + clear_memory 之后,才醒 KV(此时空闲最足,重映射最稳)。
+            ray.get(rollout_manager.onload_kv.remote())
+            # Resume only after train, weight sync, and KV restoration all succeeded.
+            # On any exception above the gateway intentionally remains fail-closed.
+            ray.get(rollout_manager.finish_policy_update.remote(next_policy_version))
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))

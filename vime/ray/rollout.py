@@ -581,23 +581,62 @@ class RolloutManager:
             module = importlib.import_module(module_name)
             hook = getattr(module, hook_name, None)
             if callable(hook):
-                hook(self.args, *hook_args)
+                return hook(self.args, *hook_args)
         except Exception:
             if raise_on_error:
                 raise
             logger.warning("Failed to call rollout function hook %s", hook_name, exc_info=True)
 
     def prepare_policy_update(self, policy_version: int):
-        """Notify a custom rollout function before serving weights advance."""
-        self._call_rollout_function_hook("prepare_policy_update", policy_version, raise_on_error=True)
+        """Close external admission, abort engines, and commit a clean weight boundary."""
+        status = self._call_rollout_function_hook(
+            "prepare_policy_update",
+            policy_version,
+            raise_on_error=True,
+        )
+        if status is None:
+            return None
+        if not isinstance(status, dict) or status.get("all_paused") is not True:
+            raise RuntimeError(
+                f"prepare_policy_update did not prove admission was paused: {status!r}"
+            )
+
+        # The gateway pause closes admission first.  Abort every serving engine (shared
+        # and dedicated) while they are still fully awake; only after those RPCs return
+        # may a shared engine enter level-2 sleep.  This uses the same vLLM endpoint as
+        # the updater, just at the safe side of the sleep/wake boundary.
+        engines = [engine for engine in self.rollout_engines if engine is not None]
+        if engines:
+            logger.info(
+                "Aborting in-flight generation on %d rollout engines before offload",
+                len(engines),
+            )
+            ray.get([engine.pause_generation.remote() for engine in engines])
+
+        # Polar re-checks drained state after the abort fanout and only then stamps the
+        # next version.  Modules without this optional hook remain backward-compatible.
+        self._call_rollout_function_hook(
+            "commit_policy_update_boundary",
+            policy_version,
+            raise_on_error=True,
+        )
+        return status
 
     def update_policy_version(self, policy_version: int):
         """Notify a custom rollout function that serving weights advanced."""
-        self._call_rollout_function_hook("update_policy_version", policy_version)
+        self._call_rollout_function_hook(
+            "update_policy_version",
+            policy_version,
+            raise_on_error=True,
+        )
 
     def finish_policy_update(self, policy_version: int):
         """Notify a custom rollout function after serving weights advance."""
-        self._call_rollout_function_hook("finish_policy_update", policy_version)
+        self._call_rollout_function_hook(
+            "finish_policy_update",
+            policy_version,
+            raise_on_error=True,
+        )
 
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
