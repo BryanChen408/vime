@@ -10,6 +10,9 @@ import torch
 import torch.nn as nn
 
 
+NUM_GPUS = 0
+
+
 def install_megatron_stubs() -> None:
     if "megatron" in sys.modules:
         return
@@ -22,6 +25,8 @@ def install_megatron_stubs() -> None:
     inference_mod = types.ModuleType("megatron.core.inference")
     inference_contexts_mod = types.ModuleType("megatron.core.inference.contexts")
     packed_seq_mod = types.ModuleType("megatron.core.packed_seq_params")
+    tensor_parallel_mod = types.ModuleType("megatron.core.tensor_parallel")
+    tensor_parallel_layers_mod = types.ModuleType("megatron.core.tensor_parallel.layers")
     transformer_mod = types.ModuleType("megatron.core.transformer")
     transformer_module_mod = types.ModuleType("megatron.core.transformer.module")
     spec_utils_mod = types.ModuleType("megatron.core.transformer.spec_utils")
@@ -49,10 +54,10 @@ def install_megatron_stubs() -> None:
         get_context_parallel_rank=lambda: 0,
         get_tensor_model_parallel_group=lambda: None,
     )
-    tensor_parallel_stub = types.SimpleNamespace(
-        gather_from_sequence_parallel_region=lambda x, group=None: x,
-        scatter_to_sequence_parallel_region=lambda x, group=None: x,
-    )
+    tensor_parallel_mod.gather_from_sequence_parallel_region = lambda x, group=None: x
+    tensor_parallel_mod.scatter_to_sequence_parallel_region = lambda x, group=None: x
+    tensor_parallel_layers_mod.ColumnParallelLinear = nn.Linear
+    tensor_parallel_layers_mod.RowParallelLinear = nn.Linear
 
     gpt_layer_specs_mod.get_gpt_decoder_block_spec = lambda *args, **kwargs: None
     inference_contexts_mod.BaseInferenceContext = type("BaseInferenceContext", (), {})
@@ -63,7 +68,7 @@ def install_megatron_stubs() -> None:
     transformer_layer_mod.get_transformer_layer_offset = lambda *args, **kwargs: 0
 
     core_mod.mpu = mpu_stub
-    core_mod.tensor_parallel = tensor_parallel_stub
+    core_mod.tensor_parallel = tensor_parallel_mod
 
     sys.modules["megatron"] = megatron_mod
     sys.modules["megatron.core"] = core_mod
@@ -73,6 +78,8 @@ def install_megatron_stubs() -> None:
     sys.modules["megatron.core.inference"] = inference_mod
     sys.modules["megatron.core.inference.contexts"] = inference_contexts_mod
     sys.modules["megatron.core.packed_seq_params"] = packed_seq_mod
+    sys.modules["megatron.core.tensor_parallel"] = tensor_parallel_mod
+    sys.modules["megatron.core.tensor_parallel.layers"] = tensor_parallel_layers_mod
     sys.modules["megatron.core.transformer"] = transformer_mod
     sys.modules["megatron.core.transformer.module"] = transformer_module_mod
     sys.modules["megatron.core.transformer.spec_utils"] = spec_utils_mod
@@ -188,3 +195,7 @@ def test_linear_attention_forwards_cu_seqlens_to_chunk_kernel(
     assert output.shape == hidden_states.shape
     assert len(chunk_calls) == 1
     assert torch.equal(chunk_calls[0], cu_seqlens)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

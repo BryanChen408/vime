@@ -1,4 +1,5 @@
 import copy
+import dataclasses
 import os
 
 import torch
@@ -620,20 +621,13 @@ def get_qwen3_5_spec(args, config, vp_stage):
             "full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(n)
         ]
 
-    import dataclasses
-
     for layer_id in range(num_layers_to_build):
         _spec_i = transformer_layer_spec.layer_specs[layer_id]
-        _sa = _spec_i.submodules.self_attention
-        _ca = getattr(_sa.submodules, "core_attention", None)
-        _ca_is_mock = _ca is not None and "Mock" in type(_ca).__name__
         if text_config.layer_types[layer_id + offset] == "linear_attention":
-            # [fix 2026-08-25] eb10b0bd 的就地改 core_attention 会污染跨层共享模板
-            # (block spec 所有层共享同一份 submodules,实测 spec[0] is spec[3]),
-            # 全注意力层被连带换成不支持 packed sequence 的本地 DotProductAttention,
-            # train forward 断言(run 20260825-172714)。改为整体换新:self_attention
-            # 直接换成 vime 的 Attention(内含 GDN)的新 ModuleSpec —— 新对象里不含
-            # Mock,deepcopy 安全,且共享模板不被触碰。
+            # Megatron intentionally reuses layer-spec templates.  Replace the
+            # complete self-attention spec before deepcopy so an unavailable TE
+            # placeholder is never copied and the shared full-attention template
+            # is never mutated.
             _new_subs = dataclasses.replace(
                 _spec_i.submodules,
                 self_attention=ModuleSpec(module=Attention, params={"args": args}),
@@ -641,19 +635,34 @@ def get_qwen3_5_spec(args, config, vp_stage):
             transformer_layer_spec.layer_specs[layer_id] = copy.deepcopy(
                 dataclasses.replace(_spec_i, submodules=_new_subs)
             )
-        elif _ca_is_mock:
-            # [fix 2026-08-25] TE 补丁丢失时全注意力层的 core_attention 也是 MagicMock,
-            # 无法实例化。补成 MindSpeedTEDotProductAttention(mindspeed 自带实现,
-            # 支持 thd/packed,不依赖 TE),与健康路径(repatch 生效)的产物一致。
-            from mindspeed.te.pytorch.attention.dot_product_attention.dot_product_attention import (
-                MindSpeedTEDotProductAttention,
+            continue
+
+        # Full-attention implementations must come from the already-patched
+        # Megatron provider.  Do not guess a MindSpeed class here: its native
+        # mapping depends on context_parallel_algo (for example, ring CP and
+        # kv-all-gather deliberately select different implementations).
+        _self_attention = _spec_i.submodules.self_attention
+        _core_attention = getattr(_self_attention.submodules, "core_attention", None)
+        _core_type_name = type(_core_attention).__name__
+        _core_name = getattr(_core_attention, "__name__", _core_type_name)
+        _core_is_mock = "Mock" in _core_type_name or (isinstance(_core_name, str) and "Mock" in _core_name)
+        if _core_attention is None or _core_is_mock:
+            raise RuntimeError(
+                f"Full-attention layer {layer_id + offset} resolved core_attention={_core_name}. "
+                "On NPU, mindspeed.megatron_adaptor.repatch(args) must run before "
+                "Megatron model-parallel initialization and model spec construction."
             )
 
-            _new_sa = dataclasses.replace(
-                _sa,
-                submodules=dataclasses.replace(_sa.submodules, core_attention=MindSpeedTEDotProductAttention),
-            )
-            transformer_layer_spec.layer_specs[layer_id] = dataclasses.replace(
-                _spec_i, submodules=dataclasses.replace(_spec_i.submodules, self_attention=_new_sa)
+        _core_module = getattr(_core_attention, "__module__", "")
+        _qkv_format = str(getattr(args, "qkv_format", getattr(config, "qkv_format", ""))).lower()
+        _cp_size = int(getattr(config, "context_parallel_size", getattr(args, "context_parallel_size", 1)))
+        if (_qkv_format == "thd" or _cp_size > 1) and (
+            _core_module == "megatron.core.transformer.dot_product_attention"
+            and _core_name == "DotProductAttention"
+        ):
+            raise RuntimeError(
+                f"Full-attention layer {layer_id + offset} resolved to Megatron DotProductAttention, "
+                f"which is incompatible with qkv_format={_qkv_format or 'unset'} and context_parallel_size={_cp_size}. "
+                "Use the attention implementation selected by the MindSpeed repatch lifecycle."
             )
     return transformer_layer_spec

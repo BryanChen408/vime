@@ -11,6 +11,7 @@ import torch.distributed as dist
 from vime.utils.common import is_npu
 if is_npu():
     import mindspeed.megatron_adaptor
+    from mindspeed.args_utils import get_full_args
     from mindspeed.megatron_adaptor import repatch
 from megatron.core import mpu
 if is_npu():
@@ -64,36 +65,29 @@ class MegatronTrainRayActor(TrainRayActor):
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
 
+        if is_npu():
+            # Keep the same lifecycle as verl's MindSpeed engine: install the
+            # argument-dependent patches before init(args) calls
+            # mpu.initialize_model_parallel().  In particular, the MindSpeed
+            # wrapper selected for CP creates the ring process groups as part of
+            # that call and resolves the TE spec provider to the CP-aware
+            # attention implementation.
+            repatch(args)
+
+            # Before Megatron's set_args(), repatch() enriches MindSpeed's own
+            # full Namespace rather than the caller's Namespace.  Use that
+            # canonical object from here on so native MindSpeed wrappers see
+            # every registered default (for example CP and 2D-TP options).
+            args = get_full_args()
+            self.args = args
+
         init(args)
 
-        if is_npu():
-            repatch(args)
-            # [CP ring-group fix] init() above already called mpu.initialize_model_parallel,
-            # but the MindSpeed CP patches (ring DotProductAttention + the
-            # initialize_model_parallel wrapper that builds the ring-attention window groups)
-            # are only applied here, by repatch(args) — too late for that wrapper to run.
-            # Result: full_attention layers under CP>1 use the patched ring attention but the
-            # ring window process groups were never created, crashing with
-            # "Context parallel ranks for ring intra window not initialized".
-            # Finish what the wrapper would have done now that dist + the base CP group exist
-            # (each helper self-guards on context_parallel_algo / use_cp_send_recv_overlap, so
-            # this is a no-op for ulysses / non-overlap configs).
-            if args.context_parallel_size > 1:
-                from mindspeed.core.context_parallel.model_parallel_utils import (
-                    initialize_context_parallel_group_for_double_ring,
-                    initialize_context_parallel_group_for_hybrid_cp,
-                    initialize_context_parallel_group_for_send_recv_overlap,
-                )
+        _spec = getattr(args, "resource_layout_spec", None)
+        self._rollout_shares_actor_devices = role == "actor" and bool(
+            getattr(args, "colocate", False) or getattr(_spec, "rollout_has_share", False)
+        )
 
-                _cp_grp_args = (
-                    args.tensor_model_parallel_size,
-                    args.pipeline_model_parallel_size,
-                    args.context_parallel_size,
-                    {},
-                )
-                initialize_context_parallel_group_for_send_recv_overlap(*_cp_grp_args)
-                initialize_context_parallel_group_for_hybrid_cp(*_cp_grp_args)
-                initialize_context_parallel_group_for_double_ring(*_cp_grp_args)
         if is_megatron_main_rank():
             init_tracking(args, primary=False, role=role)
 
@@ -110,14 +104,22 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if args.offload_train:
             if is_npu():
-                # NPUWeightOffloader now builds the verl-style storage-resize release/restore
-                # in (offload: grad_data/param_data storage().resize_(0); onload: resize back +
-                # zero grad / copy param from pinned-CPU backup, tensor identity preserved so
-                # main_grad views auto-revive). No external storage_resize_hook / PYTHONPATH
-                # injection needed. B-mode (param+grad) via env VIME_OFFLOAD_PARAM_BUFFER=1
-                # (required for colocate / actor+critic time-share so params are freed too).
-                self._weight_offloader = NPUWeightOffloader()
-                logger.info("NPU weight offloader initialised for rollout-stage actor offload")
+                # Shared actor/rollout devices need the verl-style full
+                # param+grad flat-buffer release. The actor already keeps a
+                # pinned CPU model for weight sync, so reuse it on wake-up
+                # instead of allocating a second model-sized CPU backup.
+                release_param_buffer = True if self._rollout_shares_actor_devices else None
+                param_restorer = (lambda: self._switch_model("actor")) if role == "actor" else None
+                self._weight_offloader = NPUWeightOffloader(
+                    release_param_buffer=release_param_buffer,
+                    param_restorer=param_restorer,
+                )
+                logger.info(
+                    "NPU weight offloader initialised (role=%s, shared_rollout=%s, release_param_buffer=%s)",
+                    role,
+                    self._rollout_shares_actor_devices,
+                    self._weight_offloader.release_param_buffer,
+                )
             else:
                 if (x := args.train_memory_margin_bytes) > 0:
                     logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
@@ -188,8 +190,7 @@ class MegatronTrainRayActor(TrainRayActor):
         # 混合(share)布局也用 UpdateWeightFromTensor:其内置混合分发会让共卡段引擎
         # 走 NPU IPC(不进 HCCL 域,规避"同域两 rank 同卡"的 RanktableDetect 拒绝),
         # 专用段引擎走 HCCL 广播(域 = trainer + 远程引擎,与异步 PD 同构)。
-        _spec = getattr(self.args, "resource_layout_spec", None)
-        if self.args.colocate or getattr(_spec, "rollout_has_share", False):
+        if self._rollout_shares_actor_devices:
             update_weight_cls = UpdateWeightFromTensor
         else:
             update_weight_cls = UpdateWeightFromDistributed
@@ -230,7 +231,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if (
             self.role == "actor"
             and self.args.use_critic
-            and not self.args.colocate
+            and not self._rollout_shares_actor_devices
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
@@ -249,14 +250,20 @@ class MegatronTrainRayActor(TrainRayActor):
         print_memory("before wake_up model")
 
         if is_npu():
+            # TensorBackuper's global-name iterator queries Megatron parallel
+            # groups while restoring the actor tag. Recreate those groups before
+            # NPUWeightOffloader invokes its external parameter restorer.
+            clear_memory()
+            reload_process_groups()
             self._weight_offloader.onload(self.model)
         else:
             torch_memory_saver.resume()
-
-        clear_memory()
-        reload_process_groups()
-        if self.role == "actor":
-            self._switch_model("actor")
+            clear_memory()
+            reload_process_groups()
+            if self.role == "actor":
+                # CUDA TMS only restores allocator state, so it still needs the
+                # explicit model-tag switch after process-group reconstruction.
+                self._switch_model("actor")
         print_memory("after wake_up model")
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
@@ -675,7 +682,11 @@ class MegatronTrainRayActor(TrainRayActor):
             list(engine_gpu_counts),
         )
 
-        reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
+        reconnect_rollout_engines = (
+            self.args.offload_train
+            and self.args.use_critic
+            and not self._rollout_shares_actor_devices
+        )
 
         if reconnect_rollout_engines:
             self.wake_up()
@@ -718,10 +729,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
                     # First copy rollout_actor to old_actor
                     self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
-                    # Then copy current actor to rollout_actor
-                    self.weights_backuper.backup("rollout_actor")
+                    # The live Megatron param storage may be offloaded here;
+                    # copy from the already-refreshed CPU actor tag instead.
+                    self.weights_backuper.copy(src_tag="actor", dst_tag="rollout_actor")
                 else:
-                    self.weights_backuper.backup("old_actor")
+                    self.weights_backuper.copy(src_tag="actor", dst_tag="old_actor")
 
         if reconnect_rollout_engines:
             self.sleep()
