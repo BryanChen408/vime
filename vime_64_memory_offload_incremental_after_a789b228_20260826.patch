@@ -1,0 +1,555 @@
+diff --git a/tests/test_npu_weight_offloader.py b/tests/test_npu_weight_offloader.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1fc7af93f17844eaf5654c3e12fbb5786877f77
+--- /dev/null
++++ b/tests/test_npu_weight_offloader.py
+@@ -0,0 +1,166 @@
++"""CPU regressions for Megatron NPU flat-buffer offload lifecycle."""
++
++from __future__ import annotations
++
++import types
++from unittest import mock
++
++import pytest
++import torch
++
++from vime.utils.npu_weight_offloader import NPUWeightOffloader
++
++NUM_GPUS = 0
++
++
++class _FlatBuffer:
++    def __init__(self) -> None:
++        self.param_data = torch.arange(1, 9, dtype=torch.float32)
++        self.grad_data = torch.arange(11, 19, dtype=torch.float32)
++
++
++def _model_with_buffer():
++    buffer = _FlatBuffer()
++    model = types.SimpleNamespace(buffers=[buffer], expert_parallel_buffers=[])
++    return model, buffer
++
++
++@pytest.fixture(autouse=True)
++def _disable_real_npu_cache(monkeypatch):
++    npu = getattr(torch, "npu", None)
++    if npu is None:
++        npu = types.SimpleNamespace()
++        monkeypatch.setattr(torch, "npu", npu, raising=False)
++    monkeypatch.setattr(npu, "empty_cache", lambda: None, raising=False)
++
++
++def test_external_actor_backup_releases_param_and_grad_without_private_cpu_copy(monkeypatch):
++    """Shared actor path reuses TensorBackuper instead of duplicating host weights."""
++    monkeypatch.setenv("VIME_OFFLOAD_PARAM_BUFFER", "0")
++    model, buffer = _model_with_buffer()
++    expected_param = buffer.param_data.clone()
++    param_view = buffer.param_data[:4]
++    param_tensor_id = id(buffer.param_data)
++    view_tensor_id = id(param_view)
++    restore_calls = 0
++
++    def restore_actor() -> None:
++        nonlocal restore_calls
++        restore_calls += 1
++        buffer.param_data.copy_(expected_param)
++
++    offloader = NPUWeightOffloader(
++        release_param_buffer=True,
++        param_restorer=restore_actor,
++    )
++
++    released = offloader.offload(model, verbose=False)
++
++    assert released == expected_param.untyped_storage().nbytes() * 2
++    assert buffer.param_data.untyped_storage().size() == 0
++    assert buffer.grad_data.untyped_storage().size() == 0
++    assert offloader.stats["param_backup_source"] == "external"
++    assert all(backup is None for _, backup in offloader._saved.values())
++    assert restore_calls == 0
++
++    restored = offloader.onload(model, verbose=False)
++
++    assert restored == released
++    assert restore_calls == 1
++    assert id(buffer.param_data) == param_tensor_id
++    assert id(param_view) == view_tensor_id
++    assert torch.equal(buffer.param_data, expected_param)
++    assert torch.equal(param_view, expected_param[:4])
++    assert torch.count_nonzero(buffer.grad_data) == 0
++    assert not offloader.is_offloaded
++
++
++def test_default_mode_keeps_params_and_only_releases_grad(monkeypatch):
++    """Unset legacy switch preserves the asynchronous PD grad-only path."""
++    monkeypatch.delenv("VIME_OFFLOAD_PARAM_BUFFER", raising=False)
++    model, buffer = _model_with_buffer()
++    expected_param = buffer.param_data.clone()
++    original_param_storage_size = buffer.param_data.untyped_storage().size()
++    restore_calls = 0
++
++    def restore_actor() -> None:
++        nonlocal restore_calls
++        restore_calls += 1
++        buffer.param_data.copy_(expected_param)
++
++    offloader = NPUWeightOffloader(param_restorer=restore_actor)
++    offloader.offload(model, verbose=False)
++
++    assert not offloader.release_param_buffer
++    assert buffer.param_data.untyped_storage().size() == original_param_storage_size
++    assert buffer.grad_data.untyped_storage().size() == 0
++
++    offloader.onload(model, verbose=False)
++
++    assert restore_calls == 1
++    assert torch.equal(buffer.param_data, expected_param)
++    assert torch.count_nonzero(buffer.grad_data) == 0
++
++
++def test_explicit_full_release_overrides_legacy_environment(monkeypatch):
++    """Hybrid topology policy wins even if an inherited environment says A mode."""
++    monkeypatch.setenv("VIME_OFFLOAD_PARAM_BUFFER", "0")
++    model, buffer = _model_with_buffer()
++    expected_param = buffer.param_data.clone()
++    offloader = NPUWeightOffloader(
++        release_param_buffer=True,
++        param_restorer=lambda: buffer.param_data.copy_(expected_param),
++    )
++
++    offloader.offload(model, verbose=False)
++
++    assert offloader.release_param_buffer
++    assert buffer.param_data.untyped_storage().size() == 0
++    offloader.onload(model, verbose=False)
++    assert torch.equal(buffer.param_data, expected_param)
++
++
++def test_legacy_full_release_keeps_private_backup_for_callers_without_backuper(monkeypatch):
++    """Existing VIME_OFFLOAD_PARAM_BUFFER=1 callers remain self-contained."""
++    monkeypatch.setenv("VIME_OFFLOAD_PARAM_BUFFER", "1")
++    model, buffer = _model_with_buffer()
++    expected_param = buffer.param_data.clone()
++
++    real_empty_like = torch.empty_like
++
++    def cpu_empty_like(tensor, *, device=None, pin_memory=False, **kwargs):
++        # CPU-only CI may not have a pin-memory allocator. Preserve the copy
++        # semantics while recording that production requested pinned memory.
++        assert device == "cpu"
++        assert pin_memory is True
++        return real_empty_like(tensor, device=device, **kwargs)
++
++    with mock.patch.object(torch, "empty_like", side_effect=cpu_empty_like):
++        offloader = NPUWeightOffloader()
++        offloader.offload(model, verbose=False)
++
++    private_backup = offloader._saved[(id(buffer), "param_data")][1]
++    assert private_backup is not None
++    assert private_backup.device.type == "cpu"
++    assert torch.equal(private_backup, expected_param)
++
++    offloader.onload(model, verbose=False)
++    assert torch.equal(buffer.param_data, expected_param)
++    assert torch.count_nonzero(buffer.grad_data) == 0
++
++
++def test_onload_fails_loudly_if_ddp_buffer_identity_changed(monkeypatch):
++    monkeypatch.setenv("VIME_OFFLOAD_PARAM_BUFFER", "0")
++    model, _ = _model_with_buffer()
++    offloader = NPUWeightOffloader(release_param_buffer=True, param_restorer=lambda: None)
++    offloader.offload(model, verbose=False)
++    model.buffers = [_FlatBuffer()]
++
++    with pytest.raises(RuntimeError, match="model rebuilt"):
++        offloader.onload(model, verbose=False)
++
++    assert offloader.is_offloaded
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__]))
+diff --git a/vime/backends/megatron_utils/actor.py b/vime/backends/megatron_utils/actor.py
+index a789b22810d3bb31f3d2cdfac33dcfc6e32c6c66..01421b112feece36532b7911e68d5951cf0b5764 100644
+--- a/vime/backends/megatron_utils/actor.py
++++ b/vime/backends/megatron_utils/actor.py
+@@ -83,6 +83,11 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+         init(args)
+ 
++        _spec = getattr(args, "resource_layout_spec", None)
++        self._rollout_shares_actor_devices = role == "actor" and bool(
++            getattr(args, "colocate", False) or getattr(_spec, "rollout_has_share", False)
++        )
++
+         if is_megatron_main_rank():
+             init_tracking(args, primary=False, role=role)
+ 
+@@ -99,14 +104,22 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+         if args.offload_train:
+             if is_npu():
+-                # NPUWeightOffloader now builds the verl-style storage-resize release/restore
+-                # in (offload: grad_data/param_data storage().resize_(0); onload: resize back +
+-                # zero grad / copy param from pinned-CPU backup, tensor identity preserved so
+-                # main_grad views auto-revive). No external storage_resize_hook / PYTHONPATH
+-                # injection needed. B-mode (param+grad) via env VIME_OFFLOAD_PARAM_BUFFER=1
+-                # (required for colocate / actor+critic time-share so params are freed too).
+-                self._weight_offloader = NPUWeightOffloader()
+-                logger.info("NPU weight offloader initialised for rollout-stage actor offload")
++                # Shared actor/rollout devices need the verl-style full
++                # param+grad flat-buffer release. The actor already keeps a
++                # pinned CPU model for weight sync, so reuse it on wake-up
++                # instead of allocating a second model-sized CPU backup.
++                release_param_buffer = True if self._rollout_shares_actor_devices else None
++                param_restorer = (lambda: self._switch_model("actor")) if role == "actor" else None
++                self._weight_offloader = NPUWeightOffloader(
++                    release_param_buffer=release_param_buffer,
++                    param_restorer=param_restorer,
++                )
++                logger.info(
++                    "NPU weight offloader initialised (role=%s, shared_rollout=%s, release_param_buffer=%s)",
++                    role,
++                    self._rollout_shares_actor_devices,
++                    self._weight_offloader.release_param_buffer,
++                )
+             else:
+                 if (x := args.train_memory_margin_bytes) > 0:
+                     logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
+@@ -177,8 +190,7 @@ class MegatronTrainRayActor(TrainRayActor):
+         # 混合(share)布局也用 UpdateWeightFromTensor:其内置混合分发会让共卡段引擎
+         # 走 NPU IPC(不进 HCCL 域,规避"同域两 rank 同卡"的 RanktableDetect 拒绝),
+         # 专用段引擎走 HCCL 广播(域 = trainer + 远程引擎,与异步 PD 同构)。
+-        _spec = getattr(self.args, "resource_layout_spec", None)
+-        if self.args.colocate or getattr(_spec, "rollout_has_share", False):
++        if self._rollout_shares_actor_devices:
+             update_weight_cls = UpdateWeightFromTensor
+         else:
+             update_weight_cls = UpdateWeightFromDistributed
+@@ -219,7 +231,7 @@ class MegatronTrainRayActor(TrainRayActor):
+         if (
+             self.role == "actor"
+             and self.args.use_critic
+-            and not self.args.colocate
++            and not self._rollout_shares_actor_devices
+             and hasattr(self.weight_updater, "disconnect_rollout_engines")
+         ):
+             self.weight_updater.disconnect_rollout_engines()
+@@ -238,14 +250,20 @@ class MegatronTrainRayActor(TrainRayActor):
+         print_memory("before wake_up model")
+ 
+         if is_npu():
++            # TensorBackuper's global-name iterator queries Megatron parallel
++            # groups while restoring the actor tag. Recreate those groups before
++            # NPUWeightOffloader invokes its external parameter restorer.
++            clear_memory()
++            reload_process_groups()
+             self._weight_offloader.onload(self.model)
+         else:
+             torch_memory_saver.resume()
+-
+-        clear_memory()
+-        reload_process_groups()
+-        if self.role == "actor":
+-            self._switch_model("actor")
++            clear_memory()
++            reload_process_groups()
++            if self.role == "actor":
++                # CUDA TMS only restores allocator state, so it still needs the
++                # explicit model-tag switch after process-group reconstruction.
++                self._switch_model("actor")
+         print_memory("after wake_up model")
+ 
+     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
+@@ -664,7 +682,11 @@ class MegatronTrainRayActor(TrainRayActor):
+             list(engine_gpu_counts),
+         )
+ 
+-        reconnect_rollout_engines = self.args.offload_train and self.args.use_critic and not self.args.colocate
++        reconnect_rollout_engines = (
++            self.args.offload_train
++            and self.args.use_critic
++            and not self._rollout_shares_actor_devices
++        )
+ 
+         if reconnect_rollout_engines:
+             self.wake_up()
+@@ -707,10 +729,11 @@ class MegatronTrainRayActor(TrainRayActor):
+                     # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
+                     # First copy rollout_actor to old_actor
+                     self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
+-                    # Then copy current actor to rollout_actor
+-                    self.weights_backuper.backup("rollout_actor")
++                    # The live Megatron param storage may be offloaded here;
++                    # copy from the already-refreshed CPU actor tag instead.
++                    self.weights_backuper.copy(src_tag="actor", dst_tag="rollout_actor")
+                 else:
+-                    self.weights_backuper.backup("old_actor")
++                    self.weights_backuper.copy(src_tag="actor", dst_tag="old_actor")
+ 
+         if reconnect_rollout_engines:
+             self.sleep()
+diff --git a/vime/utils/npu_weight_offloader.py b/vime/utils/npu_weight_offloader.py
+index 0781547ab4e7fd1cf4b460bb2d7f9a77fac69bc8..1432ff44d7b12151f70011f8eb1f688902c26f9e 100644
+--- a/vime/utils/npu_weight_offloader.py
++++ b/vime/utils/npu_weight_offloader.py
+@@ -14,18 +14,18 @@ Why storage-resize (design history):
+   shrinks the one storage all views share — every view invalidated at once,
+   tensor object identity preserved (optimizer/main_grad references stay valid),
+   physical pages returned after ``empty_cache()``. ``onload()`` resizes the
+-  storage back, copies ``param_data`` from its pinned-CPU backup and zeroes
+-  ``grad_data`` (contents are disposable; backward refills them). Validated on
+-  mynpu2 as the runtime patch in scripts/npu_mem_offload (run
+-  qwen35_9b_8card_20260630_061951); now built in — no PYTHONPATH injection.
++  storage back and zeroes ``grad_data`` (contents are disposable; backward
++  refills them). ``param_data`` can be restored either from the actor's existing
++  ``TensorBackuper`` or, for legacy callers without one, from a private pinned
++  CPU backup.
+ 
+-A/B modes (env ``VIME_OFFLOAD_PARAM_BUFFER``, read at each offload call):
++A/B modes (env ``VIME_OFFLOAD_PARAM_BUFFER``, retained for compatibility):
+   "0" (default, A): release ``grad_data`` only (fp32, ~9GB/rank @ 9B/TP4);
+       ``param_data`` stays on NPU for direct IPC export.
+-  "1" (B): release ``param_data`` + ``grad_data``; params backed up to pinned
+-      CPU. Rollout-stage training residue ≈ 0 — required for colocate, where
+-      vLLM's KV cache needs the whole card. Safe because vLLM ``load_weights``
+-      copies (the engine never aliases actor storage).
++  "1" (B): release ``param_data`` + ``grad_data``. Rollout-stage training
++      residue ≈ 0 — required when rollout shares the actor's devices. Actor
++      callers reuse their already-present CPU weights, so this mode does not
++      allocate a second model-sized host backup.
+ 
+ Measured (Qwen3.5-0.8B, 4×910B3, colocate): v1 left 4.5GB allocated during
+ rollout with 0 physically freed; A leaves 1.4GB; B leaves 0.0GB with training
+@@ -33,10 +33,10 @@ metrics identical to A.
+ 
+ Usage::
+ 
+-    offloader = NPUWeightOffloader()
++    offloader = NPUWeightOffloader(release_param_buffer=True, param_restorer=restore_actor)
+     offloader.offload(model)   # flat buffers resized to 0, HBM freed
+     # ... vLLM rollout (actor NPU memory available) ...
+-    offloader.onload(model)    # storage restored, params copied back, grads zeroed
++    offloader.onload(model)    # storage restored, actor params restored, grads zeroed
+ """
+ 
+ from __future__ import annotations
+@@ -44,6 +44,7 @@ from __future__ import annotations
+ import logging
+ import os
+ import time
++from collections.abc import Callable, Sequence
+ from typing import Any
+ 
+ import torch
+@@ -65,9 +66,29 @@ class NPUWeightOffloader:
+     pointer surgery.
+     """
+ 
+-    def __init__(self) -> None:
++    def __init__(
++        self,
++        release_param_buffer: bool | None = None,
++        param_restorer: Callable[[], None] | None = None,
++    ) -> None:
++        """Create a Megatron flat-buffer offloader.
++
++        Args:
++            release_param_buffer: Whether to release ``param_data`` in addition
++                to ``grad_data``. ``None`` preserves the legacy
++                ``VIME_OFFLOAD_PARAM_BUFFER`` switch, evaluated at each offload.
++                An explicit value takes precedence over the environment.
++            param_restorer: Existing owner of a CPU parameter backup. When set,
++                ``onload`` calls it after recreating the flat storages instead
++                of allocating another model-sized pinned CPU copy. Actor workers
++                pass their ``TensorBackuper`` restore operation; callers without
++                such a backup retain the legacy private-backup behavior.
++        """
++        self._release_param_buffer = release_param_buffer
++        self._param_restorer = param_restorer
+         self._saved: dict[tuple[int, str], _SavedEntry] = {}
+         self._offloaded_bytes: int = 0
++        self._offloaded_param_buffer: bool = False
+         self._offload_time: float = 0.0
+         self._onload_time: float = 0.0
+ 
+@@ -75,12 +96,18 @@ class NPUWeightOffloader:
+     # Public API
+     # ------------------------------------------------------------------
+ 
+-    def offload(self, model: torch.nn.Module, verbose: bool = True) -> int:
++    def offload(
++        self,
++        model: torch.nn.Module | Sequence[torch.nn.Module],
++        verbose: bool = True,
++    ) -> int:
+         """Resize the DDP flat-buffer storages to 0 and return bytes released.
+ 
+         ``grad_data`` is always released without backup (backward refills it).
+-        ``param_data`` is additionally released — after a pinned-CPU backup —
+-        when ``VIME_OFFLOAD_PARAM_BUFFER=1`` (B mode).
++        ``param_data`` is additionally released when explicitly requested or
++        when ``VIME_OFFLOAD_PARAM_BUFFER=1`` in legacy mode. If
++        ``param_restorer`` was supplied, its existing CPU backup is reused;
++        otherwise a private pinned backup is retained for compatibility.
+         """
+         if self._saved:
+             logger.warning(
+@@ -90,7 +117,7 @@ class NPUWeightOffloader:
+             return self._offloaded_bytes
+ 
+         t0 = time.perf_counter()
+-        offload_param = os.environ.get("VIME_OFFLOAD_PARAM_BUFFER", "0") == "1"
++        offload_param = self.release_param_buffer
+         attrs = ("grad_data", "param_data") if offload_param else ("grad_data",)
+ 
+         total_bytes = 0
+@@ -105,8 +132,14 @@ class NPUWeightOffloader:
+                 if size == 0:
+                     continue
+                 if attr == "param_data":
+-                    # Weights must survive: back up to pinned CPU before release.
+-                    backup = flat.detach().to("cpu", copy=True).pin_memory()
++                    # Actor workers already own a persistent pinned CPU copy in
++                    # TensorBackuper. Only legacy callers without that owner need
++                    # a private flat-buffer backup here.
++                    if self._param_restorer is None:
++                        backup = torch.empty_like(flat, device="cpu", pin_memory=True)
++                        backup.copy_(flat.detach(), non_blocking=False)
++                    else:
++                        backup = None
+                 else:
+                     # Gradients are disposable.
+                     backup = None
+@@ -118,53 +151,70 @@ class NPUWeightOffloader:
+         torch.npu.empty_cache()
+ 
+         self._offloaded_bytes = total_bytes
++        self._offloaded_param_buffer = offload_param
+         self._offload_time = time.perf_counter() - t0
+         if verbose:
++            mode = "param+grad" if offload_param else "grad-only"
++            if offload_param:
++                mode += ", existing CPU backup" if self._param_restorer is not None else ", private CPU backup"
+             logger.info(
+                 "NPU flat-buffer offload (%s): %d buffers, %.1f MiB released in %.2fs",
+-                "param+grad" if offload_param else "grad-only",
++                mode,
+                 count,
+                 total_bytes / (1024 * 1024),
+                 self._offload_time,
+             )
+         return total_bytes
+ 
+-    def onload(self, model: torch.nn.Module, verbose: bool = True) -> int:
+-        """Resize storages back, restore params from CPU backup, zero grads."""
++    def onload(
++        self,
++        model: torch.nn.Module | Sequence[torch.nn.Module],
++        verbose: bool = True,
++    ) -> int:
++        """Resize storages back, restore parameters, and zero gradients."""
+         if not self._saved:
+             logger.warning("onload() called but nothing offloaded — skipping")
+             return 0
+ 
+         t0 = time.perf_counter()
+-        total_bytes = 0
+-        restored = 0
++        current: dict[tuple[int, str], torch.Tensor] = {}
+         for buf in _iter_ddp_buffers(model):
+             for attr in ("grad_data", "param_data"):
+                 flat = getattr(buf, attr, None)
+-                if flat is None:
+-                    continue
+-                entry = self._saved.pop((id(buf), attr), None)
+-                if entry is None:
+-                    continue
+-                size, backup = entry
+-                flat.untyped_storage().resize_(size)
+-                if backup is not None:
+-                    flat.copy_(backup)
+-                else:
+-                    # Fresh physical pages hold garbage; zero so params without a
+-                    # gradient contribution this step don't feed junk to the optimizer.
+-                    flat.zero_()
+-                total_bytes += size
+-                restored += 1
+-
+-        if self._saved:
+-            # Buffer objects changed between offload and onload (model rebuilt?) —
+-            # the leftover storages can no longer be restored through this handle.
+-            logger.warning(
+-                "onload(): %d saved buffers had no matching DDP buffer and were dropped",
+-                len(self._saved),
++                key = (id(buf), attr)
++                if key in self._saved and isinstance(flat, torch.Tensor):
++                    current[key] = flat
++
++        missing = self._saved.keys() - current.keys()
++        if missing:
++            # Silently dropping entries leaves parameter views backed by a
++            # zero-sized storage. Fail before mutating any storage so a rebuilt
++            # model cannot continue with partially restored weights.
++            raise RuntimeError(
++                "NPU flat-buffer onload could not match "
++                f"{len(missing)} saved buffers; was the model rebuilt between offload and onload?"
+             )
+-            self._saved.clear()
++
++        total_bytes = sum(size for size, _ in self._saved.values())
++        for key, (size, backup) in self._saved.items():
++            flat = current[key]
++            flat.untyped_storage().resize_(size)
++            if backup is not None:
++                flat.copy_(backup)
++            else:
++                # Gradients are disposable. In external-restore mode this also
++                # initializes DDP padding not covered by named parameters.
++                flat.zero_()
++
++        # Actor TensorBackuper.restore() refills all revived parameter views.
++        # It is intentionally called even in grad-only mode: actor wake_up has
++        # always switched back to the latest CPU "actor" tag at this point.
++        if self._param_restorer is not None:
++            self._param_restorer()
++
++        restored = len(self._saved)
++        self._saved.clear()
++        self._offloaded_param_buffer = False
+ 
+         self._onload_time = time.perf_counter() - t0
+         if verbose:
+@@ -184,6 +234,13 @@ class NPUWeightOffloader:
+     def is_offloaded(self) -> bool:
+         return bool(self._saved)
+ 
++    @property
++    def release_param_buffer(self) -> bool:
++        """Resolve the explicit policy or the legacy environment switch."""
++        if self._release_param_buffer is not None:
++            return self._release_param_buffer
++        return os.environ.get("VIME_OFFLOAD_PARAM_BUFFER", "0") == "1"
++
+     @property
+     def stats(self) -> dict[str, Any]:
+         return {
+@@ -191,6 +248,8 @@ class NPUWeightOffloader:
+             "offload_time_s": round(self._offload_time, 2),
+             "onload_time_s": round(self._onload_time, 2),
+             "num_buffers": len(self._saved) or -1,
++            "param_buffer_offloaded": self._offloaded_param_buffer,
++            "param_backup_source": "external" if self._param_restorer is not None else "private",
+         }
+ 
+ 
+@@ -198,7 +257,7 @@ class NPUWeightOffloader:
+ # Helpers
+ # ------------------------------------------------------------------
+ 
+-def _iter_ddp_buffers(model):
++def _iter_ddp_buffers(model: torch.nn.Module | Sequence[torch.nn.Module]):
+     """Yield Megatron ``_ParamAndGradBuffer`` objects from *model*.
+ 
+     *model* may be a single DDP-wrapped module or a list of DDP-wrapped chunks

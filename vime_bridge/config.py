@@ -34,6 +34,7 @@ class PolarSlimeConfig:
     eval_dataset_name: str
     scheduler_mode: str
     max_active_sessions: int
+    max_owned_groups: int | None
     session_pool_pause_policy: str
     operator_tasks_dir: str | None = None
     session_pool_release_on_postrun: bool = False
@@ -79,6 +80,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     if scheduler_mode not in {"group", "session_pool"}:
         raise ValueError("rollout_scheduler_mode must be 'group' or 'session_pool'")
     max_active_sessions = _resolve_max_active_sessions(args, default=max_session_concurrency)
+    max_owned_groups = _resolve_max_owned_groups(args)
     session_pool_pause_policy = str(
         _first_configured(
             args,
@@ -172,6 +174,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         eval_dataset_name=str(getattr(args, "polar_eval_dataset_name", "polar_eval")),
         scheduler_mode=scheduler_mode,
         max_active_sessions=max_active_sessions,
+        max_owned_groups=max_owned_groups,
         session_pool_pause_policy=session_pool_pause_policy,
         session_pool_release_on_postrun=session_pool_release_on_postrun,
     )
@@ -194,6 +197,20 @@ def _resolve_max_active_sessions(args: Any, *, default: int) -> int:
     value = int(configured)
     if value <= 0:
         raise ValueError("rollout_max_active_sessions must be greater than 0")
+    return value
+
+
+def _resolve_max_owned_groups(args: Any) -> int | None:
+    configured = _first_configured(
+        args,
+        "rollout_max_owned_groups",
+        "polar_max_owned_groups",
+    )
+    if configured in (None, ""):
+        return None
+    value = int(configured)
+    if value <= 0:
+        raise ValueError("rollout_max_owned_groups must be greater than 0")
     return value
 
 

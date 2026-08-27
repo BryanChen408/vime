@@ -34,6 +34,7 @@ def _polar_args(start_rollout_id=0, max_async_level=2, update_weights_interval=1
         polar_task_id_template="{args.polar_run_id}-op-{rollout_id}-{sample.group_index}",
         operator_tasks_dir="/tmp/op_tasks", polar_tasks_dir=None,
         rollout_scheduler_mode=scheduler_mode, rollout_max_active_sessions=16,
+        rollout_max_owned_groups=4,
         rollout_release_on_postrun=True, rollout_min_complete_accept_fraction=0.6,
         rollout_max_async_level=max_async_level, rollout_request_timeout=4000,
         rollout_batch_size=2, n_samples_per_prompt=8,
@@ -141,9 +142,44 @@ def test_session_pool_config_resolution():
                                   _DummyDataSource()).config
     assert cfg.scheduler_mode == "session_pool"
     assert cfg.max_active_sessions == 16
+    assert cfg.max_owned_groups == 4
     assert cfg.session_pool_release_on_postrun is True
     assert abs(cfg.min_complete_accept_fraction - 0.6) < 1e-9
     assert cfg.max_off_policy_steps == 3
+
+
+def test_session_pool_owned_group_limit_preserves_postrun_release():
+    worker = AsyncPolarRolloutWorker(_polar_args(scheduler_mode="session_pool"),
+                                     _DummyDataSource())
+    active = {}
+    run_pending = set()
+
+    # Three ready groups leave room for one new group under the configured limit 4.
+    worker._ready_group_count = 3
+    assert worker._can_admit_session_pool_unit(active, run_pending, {}) is True
+
+    # Four scheduler-owned groups stop a new group even though RUN admission is empty.
+    worker._ready_group_count = 4
+    assert worker._can_admit_session_pool_unit(active, run_pending, {}) is False
+
+    # A partial group is allowed to finish so an 8-sample GRPO group is never split.
+    worker._ready_group_count = 3
+    partial = SimpleNamespace(group_id=9, rejected_reason=None, partial=True)
+    open_groups = {9: partial}
+    assert worker._can_admit_session_pool_unit(active, run_pending, open_groups) is True
+
+    # The owned-group exception never bypasses the existing RUN concurrency cap.
+    run_pending = {f"task-{index}" for index in range(worker.config.max_active_sessions)}
+    assert worker._can_admit_session_pool_unit(active, run_pending, open_groups) is False
+
+
+def test_session_pool_owned_group_limit_is_optional():
+    args = _polar_args(scheduler_mode="session_pool")
+    args.rollout_max_owned_groups = None
+    worker = AsyncPolarRolloutWorker(args, _DummyDataSource())
+    worker._ready_group_count = 100
+    assert worker.config.max_owned_groups is None
+    assert worker._can_admit_session_pool_unit({}, set(), {}) is True
 
 
 def test_session_pool_drain_primitives():

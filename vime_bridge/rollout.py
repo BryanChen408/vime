@@ -1080,6 +1080,7 @@ class AsyncPolarRolloutWorker:
         self._policy_update_drain_complete = threading.Event()
         self._policy_update_drain_complete.set()
         self._session_pool_open_groups = 0
+        self._session_pool_owned_groups = 0
         self._session_pool_partial_open_groups = 0
         self._session_pool_pending_sessions = 0
         # Per-task callback plumbing: event fires when the rollout server POSTs
@@ -1221,6 +1222,11 @@ class AsyncPolarRolloutWorker:
             if self.config.scheduler_mode == "session_pool":
                 out["polar/session_pool/active_sessions"] = float(self._active_sessions)
                 out["polar/session_pool/open_groups"] = float(self._session_pool_open_groups)
+                out["polar/session_pool/owned_groups"] = float(self._session_pool_owned_groups)
+                if self.config.max_owned_groups is not None:
+                    out["polar/session_pool/max_owned_groups"] = float(
+                        self.config.max_owned_groups
+                    )
                 out["polar/session_pool/partial_open_groups"] = float(self._session_pool_partial_open_groups)
                 out["polar/session_pool/pending_sessions"] = float(self._session_pool_pending_sessions)
                 out.setdefault("polar/session_pool/submitted_sessions", 0.0)
@@ -1400,6 +1406,7 @@ class AsyncPolarRolloutWorker:
                     while self._running and self._can_admit_session_pool_unit(
                         active,
                         run_pending,
+                        open_groups,
                     ):
                         accumulator = self._current_partial_group(open_groups)
                         if accumulator is None:
@@ -1729,6 +1736,7 @@ class AsyncPolarRolloutWorker:
         self,
         active: dict[asyncio.Task[TaskResult], _PendingSessionUnit],
         run_pending: set[str],
+        open_groups: dict[int, _SessionGroupAccumulator],
     ) -> bool:
         with self._state_lock:
             admission_paused = self._admission_paused
@@ -1737,6 +1745,18 @@ class AsyncPolarRolloutWorker:
         if (
             self._session_pool_admission_count(active, run_pending)
             >= self.config.max_active_sessions
+        ):
+            return False
+        # release-on-postrun intentionally removes sessions from run_pending early so
+        # Polar can refill RUN workers. It must not, however, make the total number of
+        # groups owned by VIME unbounded. Finish the current partial group for group
+        # atomicity, but do not open another group once the independent owned limit is
+        # reached.
+        if (
+            self.config.max_owned_groups is not None
+            and self._current_partial_group(open_groups) is None
+            and self._session_pool_owned_group_count(open_groups)
+            >= self.config.max_owned_groups
         ):
             return False
         return True
@@ -1749,6 +1769,14 @@ class AsyncPolarRolloutWorker:
         if self.config.session_pool_release_on_postrun:
             return len(run_pending)
         return len(active)
+
+    def _session_pool_owned_group_count(
+        self,
+        open_groups: dict[int, _SessionGroupAccumulator],
+    ) -> int:
+        with self._state_lock:
+            ready_group_count = self._ready_group_count
+        return len(open_groups) + ready_group_count
 
     def _session_pool_draining(self) -> bool:
         with self._state_lock:
@@ -1801,6 +1829,7 @@ class AsyncPolarRolloutWorker:
             self._active_groups = len(open_groups)
             self._active_sessions = self._session_pool_admission_count(active, run_pending)
             self._session_pool_open_groups = len(open_groups)
+            self._session_pool_owned_groups = len(open_groups) + self._ready_group_count
             self._session_pool_partial_open_groups = partial_open_groups
             self._session_pool_pending_sessions = pending_sessions
             self._metrics["polar/session_pool/run_pending_sessions"] = float(len(run_pending))

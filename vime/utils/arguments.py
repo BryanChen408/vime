@@ -692,6 +692,17 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--polar-scheduler-mode", type=str, default=None)
             parser.add_argument("--rollout-max-active-sessions", type=int, default=None)
             parser.add_argument("--polar-max-active-sessions", type=int, default=None)
+            parser.add_argument(
+                "--rollout-max-owned-groups",
+                type=int,
+                default=None,
+                help=(
+                    "session_pool 中 VIME 已拥有但尚未越过训练边界的 group 总上限；"
+                    "统计未完成 open groups 与待消费 ready groups。与 "
+                    "--rollout-release-on-postrun 独立，用于保留 RUN 补位加速同时限制后台积压。"
+                ),
+            )
+            parser.add_argument("--polar-max-owned-groups", type=int, default=None)
             # 轨迹内逐 trace PG 权重 floor(slime 2540e19 移植;消费方
             # vime_bridge.pg_floor + ray/rollout.py 的分母折算)。此前启动脚本一直传
             # 这个 flag 但未定义 —— 解析 ignore_unknown_args=True 会静默吞掉,这里补上。
