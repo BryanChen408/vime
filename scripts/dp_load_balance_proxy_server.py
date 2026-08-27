@@ -102,7 +102,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from vllm.logger import init_logger
 
@@ -142,6 +142,13 @@ _SESSION_TTL = float(os.environ.get("VIME_LB_SESSION_TTL", "7200"))
 _SESSION_PRUNE_INTERVAL = 60.0
 
 
+@dataclass
+class SessionBinding:
+    server_idx: int
+    last_seen: float
+    estimated_kv_tokens: float
+
+
 class ServerState:
     def __init__(self, host, port):
         self.host = host
@@ -153,15 +160,21 @@ class ServerState:
             limits=httpx.Limits(max_connections=100000, max_keepalive_connections=100000),
         )
         self.active_tokens = 0
+        self.active_requests = 0
+        # ``/server_info`` 在 vLLM engine ready 后回填 num_gpu_blocks 和
+        # block_size。两者的乘积不是混合注意力模型的绝对 token 容量，但同一
+        # 模型各 DP 引擎间与实际 KV 容量成比例，足够用于归一化负载。
+        self.kv_capacity_units = 1.0
         # [2026-08-17] 钉在本引擎的活跃 session 数。active_tokens 只反映"此刻在飞的请求",
         #   而 polar 的 session 是 40+ 轮 / 54 分钟的长驻体、轮次之间有大段空档(编译/跑测试),
         #   那时 active_tokens 归零但 session 仍会回来。给新 session 选引擎要看这个。
         self.active_sessions = 0
+        self.estimated_session_kv_tokens = 0.0
         self.aborted_requests = set()  # Track aborted requests
 
 
 class ProxyState:
-    def __init__(self, server_instances):
+    def __init__(self, server_instances, capacity_units: list[float] | None = None):
         self.dp_servers: list[ServerState] = [ServerState(h, p) for h, p in server_instances]
         self.req_id_lock = asyncio.Lock()
         # Removed selection locks - no longer needed for synchronous methods
@@ -173,13 +186,62 @@ class ProxyState:
         heapq.heapify(self.lb_heap)
         # session_id -> (server_idx, last_seen_monotonic)。首次出现时按负载选引擎并钉住,
         #   之后同 session 恒定复用 → 前缀 KV 命中(实测 87-95%)靠它。
-        self.session_map: dict[str, tuple[int, float]] = {}
+        self.session_map: dict[str, SessionBinding] = {}
         self._last_prune = time.monotonic()
+        if capacity_units is not None:
+            self.set_capacity_units(capacity_units)
+
+    def set_capacity_units(self, capacity_units: list[float]) -> None:
+        if len(capacity_units) != len(self.dp_servers):
+            raise ValueError(
+                f"capacity count ({len(capacity_units)}) does not match server count ({len(self.dp_servers)})"
+            )
+        if any(not isinstance(value, (int, float)) or value <= 0 for value in capacity_units):
+            raise ValueError(f"all KV capacity units must be positive: {capacity_units!r}")
+        for server, capacity in zip(self.dp_servers, capacity_units, strict=True):
+            server.kv_capacity_units = float(capacity)
+        self.lb_heap = [
+            (server.active_tokens / server.kv_capacity_units, i, server)
+            for i, server in enumerate(self.dp_servers)
+        ]
+        heapq.heapify(self.lb_heap)
+
+    async def discover_kv_capacities(self) -> bool:
+        """Read initialized KV capacity from vLLM's existing ``/server_info``.
+
+        Capacity discovery is deliberately all-or-nothing. Mixing a real block count
+        from one backend with the default value from another would create a much worse
+        imbalance than equal weighting, so any missing/unhealthy response falls back to
+        equal capacity for every backend.
+        """
+
+        async def _read(server: ServerState) -> float:
+            url = f"http://{server.host}:{server.port}/server_info"
+            response = await server.client.get(url, params={"config_format": "json"}, timeout=30.0)
+            response.raise_for_status()
+            return _kv_capacity_units_from_server_info(response.json())
+
+        results = await asyncio.gather(*(_read(server) for server in self.dp_servers), return_exceptions=True)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            self.set_capacity_units([1.0] * len(self.dp_servers))
+            logger.warning(
+                "KV capacity discovery failed for %d/%d backends; falling back to equal weights: %s",
+                len(failures),
+                len(self.dp_servers),
+                failures,
+            )
+            return False
+
+        capacities = [float(result) for result in results]
+        self.set_capacity_units(capacities)
+        logger.info("Discovered backend KV capacity units: %s", capacities)
+        return True
 
     def _update_server_priority(self, server_idx: int):
         """Update the priority of a decoder server in the heap."""
         server = self.dp_servers[server_idx]
-        priority = server.active_tokens
+        priority = server.active_tokens / server.kv_capacity_units
         # Remove old entry and add new one
         self.lb_heap = [(p, i, s) for p, i, s in self.lb_heap if i != server_idx]
         heapq.heappush(self.lb_heap, (priority, server_idx, server))  # type: ignore
@@ -197,6 +259,7 @@ class ProxyState:
 
         # Update the chosen server atomically
         self.dp_servers[chosen].active_tokens += token_count
+        self.dp_servers[chosen].active_requests += 1
 
         # Update priority and re-add to heap
         self._update_server_priority(chosen)
@@ -209,11 +272,16 @@ class ProxyState:
         if now - self._last_prune < _SESSION_PRUNE_INTERVAL:
             return
         self._last_prune = now
-        stale = [sid for sid, (_, ts) in self.session_map.items() if now - ts > _SESSION_TTL]
+        stale = [sid for sid, binding in self.session_map.items() if now - binding.last_seen > _SESSION_TTL]
         for sid in stale:
-            idx, _ = self.session_map.pop(sid)
-            if self.dp_servers[idx].active_sessions > 0:
-                self.dp_servers[idx].active_sessions -= 1
+            binding = self.session_map.pop(sid)
+            server = self.dp_servers[binding.server_idx]
+            if server.active_sessions > 0:
+                server.active_sessions -= 1
+            server.estimated_session_kv_tokens = max(
+                0.0,
+                server.estimated_session_kv_tokens - binding.estimated_kv_tokens,
+            )
         if stale:
             logger.debug("Pruned %d stale session mappings", len(stale))
 
@@ -233,32 +301,110 @@ class ProxyState:
         self._maybe_prune_sessions(now)
         entry = self.session_map.get(session_id)
         if entry is not None:
-            idx = entry[0]
+            idx = entry.server_idx
+            # 每轮请求携带完整增长后的上下文。用本 session 见过的最大请求估算
+            # 其可复用 KV footprint；上下文偶尔截断时不立即低估仍留在缓存中的旧块。
+            estimated_kv_tokens = max(entry.estimated_kv_tokens, float(token_count))
+            server = self.dp_servers[idx]
+            server.estimated_session_kv_tokens += estimated_kv_tokens - entry.estimated_kv_tokens
         else:
             if _SESSION_POLICY == "hash":
                 idx = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % len(self.dp_servers)
             else:
-                # 主序:钉在该引擎的活跃 session 数;次序:此刻在飞的 token 数
+                # 主序:预计常驻 session KV / 本引擎实际 KV 容量；次序:实时在飞
+                # token / 容量。这样容量相差 2x 的引擎会自然承接约 2x 的上下文，
+                # 而不是被 raw session count 强行平均。
                 idx = min(
                     range(len(self.dp_servers)),
-                    key=lambda i: (self.dp_servers[i].active_sessions, self.dp_servers[i].active_tokens),
+                    key=lambda i: (
+                        (
+                            self.dp_servers[i].estimated_session_kv_tokens + token_count
+                        )
+                        / self.dp_servers[i].kv_capacity_units,
+                        (self.dp_servers[i].active_tokens + token_count)
+                        / self.dp_servers[i].kv_capacity_units,
+                        self.dp_servers[i].active_sessions,
+                        i,
+                    ),
                 )
-            self.dp_servers[idx].active_sessions += 1
+            server = self.dp_servers[idx]
+            estimated_kv_tokens = float(token_count)
+            server.active_sessions += 1
+            server.estimated_session_kv_tokens += estimated_kv_tokens
             logger.debug(
-                "New session %s -> server %d (policy=%s, sessions=%s)",
+                "New session %s -> server %d (policy=%s, sessions=%s, kv_pressure=%s)",
                 session_id, idx, _SESSION_POLICY,
                 [sv.active_sessions for sv in self.dp_servers],
+                [round(sv.estimated_session_kv_tokens / sv.kv_capacity_units, 4) for sv in self.dp_servers],
             )
-        self.session_map[session_id] = (idx, now)
+        self.session_map[session_id] = SessionBinding(idx, now, estimated_kv_tokens)
         self.dp_servers[idx].active_tokens += token_count
+        self.dp_servers[idx].active_requests += 1
         self._update_server_priority(idx)
         return idx
 
     def release_server(self, idx: int, token_count):  # Changed to synchronous
-        # No lock needed - atomic operation
-        self.dp_servers[idx].active_tokens -= token_count
+        # No lock needed - atomic operation. Clamp defensively so cancellation/error
+        # races cannot poison all future load-balancing decisions with a negative load.
+        server = self.dp_servers[idx]
+        server.active_tokens = max(0.0, server.active_tokens - token_count)
+        server.active_requests = max(0, server.active_requests - 1)
         # Update priority queue after releasing
         self._update_server_priority(idx)
+
+    def clear_sticky_cache(self) -> dict[str, Any]:
+        """Clear only proxy routing bookkeeping at a drained policy boundary."""
+        busy = [i for i, server in enumerate(self.dp_servers) if server.active_requests]
+        if busy:
+            raise RuntimeError(f"cannot clear sticky routing while backends still have active requests: {busy}")
+
+        cleared = len(self.session_map)
+        self.session_map.clear()
+        for server in self.dp_servers:
+            server.active_sessions = 0
+            server.estimated_session_kv_tokens = 0.0
+        self._last_prune = time.monotonic()
+        return {"status": "ok", "cleared_sessions": cleared}
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "sessions": len(self.session_map),
+            "servers": [
+                {
+                    "host": server.host,
+                    "port": server.port,
+                    "kv_capacity_units": server.kv_capacity_units,
+                    "active_sessions": server.active_sessions,
+                    "estimated_session_kv_tokens": server.estimated_session_kv_tokens,
+                    "active_requests": server.active_requests,
+                    "active_tokens": server.active_tokens,
+                }
+                for server in self.dp_servers
+            ],
+        }
+
+    @staticmethod
+    def estimate_prompt_tokens(req_data: Any, request_length: int) -> int:
+        """Use token-id payloads when available, with a byte-size fallback."""
+
+        def _count_token_ids(value: Any) -> int | None:
+            if not isinstance(value, list):
+                return None
+            if all(isinstance(item, int) for item in value):
+                return len(value)
+            nested = [_count_token_ids(item) for item in value]
+            if nested and all(count is not None for count in nested):
+                return sum(int(count) for count in nested)
+            return None
+
+        if isinstance(req_data, dict):
+            for key in ("prompt_token_ids", "token_ids", "prompt"):
+                count = _count_token_ids(req_data.get(key))
+                if count is not None:
+                    return max(1, count)
+        # The proxy intentionally owns no tokenizer. Four UTF-8/JSON bytes per token
+        # is only a fallback estimate; payloads carrying token ids take the exact path.
+        return max(1, request_length // 4)
 
     def calculate_request_score(self, request_length: int, max_tokens: int = 16, ignore_eos: bool = False) -> float:
         if ignore_eos:
@@ -270,6 +416,20 @@ class ProxyState:
 
 
 proxy_state = None
+
+
+def _kv_capacity_units_from_server_info(payload: Any) -> float:
+    try:
+        cache_config = payload["vllm_config"]["cache_config"]
+        num_gpu_blocks = int(cache_config["num_gpu_blocks"])
+        block_size = int(cache_config["block_size"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("/server_info is missing initialized cache_config capacity") from exc
+    if num_gpu_blocks <= 0 or block_size <= 0:
+        raise ValueError(
+            f"/server_info returned invalid KV capacity: num_gpu_blocks={num_gpu_blocks}, block_size={block_size}"
+        )
+    return float(num_gpu_blocks * block_size)
 
 
 def parse_args():
@@ -293,6 +453,8 @@ def parse_args():
 async def lifespan(app: FastAPI):
     global proxy_state
     proxy_state = ProxyState(global_args.server_instances)
+    if _SESSION_POLICY != "hash":
+        await proxy_state.discover_kv_capacities()
     print(f"Initialized {len(proxy_state.dp_servers)} dp server clients.")
     yield
     for p in proxy_state.dp_servers:
@@ -383,12 +545,29 @@ async def _forward_upstream_with_retry(
 
 async def _select_instance(api: str, req_data: Any, request_length: int, session_id: str | None = None):
     # refer to vLLM sampling_params: max_token default value
-    max_tokens = req_data.get("max_tokens", 16)
-    ignore_eos = req_data.get("ignore_eos", False)
-    priority_score = proxy_state.calculate_request_score(request_length, max_tokens=max_tokens, ignore_eos=ignore_eos)
+    req_dict = req_data if isinstance(req_data, dict) else {}
+    sampling_params = req_dict.get("sampling_params", {})
+    if not isinstance(sampling_params, dict):
+        sampling_params = {}
+    max_tokens = req_dict.get("max_tokens", req_dict.get("max_completion_tokens"))
+    if max_tokens is None:
+        max_tokens = sampling_params.get("max_tokens", sampling_params.get("max_new_tokens"))
+    try:
+        max_tokens = int(max_tokens) if max_tokens is not None else 16
+    except (TypeError, ValueError):
+        max_tokens = 16
+    ignore_eos = req_dict.get("ignore_eos", sampling_params.get("ignore_eos", False))
+    prompt_tokens = proxy_state.estimate_prompt_tokens(req_data, request_length)
+    priority_score = proxy_state.calculate_request_score(
+        prompt_tokens,
+        max_tokens=max_tokens,
+        ignore_eos=ignore_eos,
+    )
     logger.debug(
-        "Request length: %s, max tokens: %s, ignore_eos: %s, session: %s, Priority score: %s",
+        "Request bytes: %s, estimated prompt tokens: %s, max tokens: %s, ignore_eos: %s, "
+        "session: %s, Priority score: %s",
         request_length,
+        prompt_tokens,
         max_tokens,
         ignore_eos,
         session_id,
@@ -417,6 +596,9 @@ class InstanceInfo:
 
 
 async def _handle_completions(api: str, request: Request):
+    instance_info = None
+    response = None
+    release_in_handler = True
     try:
         req_data = await request.json()
         req_body = await request.body()
@@ -440,7 +622,6 @@ async def _handle_completions(api: str, request: Request):
             # 上游最终非 2xx: 原样回传真实 status + 错误体,绝不吞成 200+空 body(见
             # _forward_upstream_with_retry)。令 operator gateway 走 UpstreamError → session
             # 秒级 errored → drop-and-continue,而不是 resp.json() 崩 JSONDecodeError → hang。
-            proxy_state.release_server(instance_info.server_idx, instance_info.priority_score)
             status_code, body = error
             return Response(content=body, status_code=status_code, media_type="application/json")
 
@@ -461,7 +642,10 @@ async def _handle_completions(api: str, request: Request):
                 # After streaming done, release tokens
                 proxy_state.release_server(instance_info.server_idx, instance_info.priority_score)
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        streaming_response = StreamingResponse(generate_stream(), media_type="application/json")
+        # From here the stream generator owns response close + load release.
+        release_in_handler = False
+        return streaming_response
     except Exception as e:
         import traceback
 
@@ -470,6 +654,13 @@ async def _handle_completions(api: str, request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+    finally:
+        # The client can disconnect while we are still connecting/waiting for upstream
+        # headers. The original handler leaked active_tokens in that path forever.
+        if release_in_handler and instance_info is not None:
+            if response is not None:
+                await response.aclose()
+            proxy_state.release_server(instance_info.server_idx, instance_info.priority_score)
 
 
 @app.post("/v1/completions")
@@ -498,6 +689,28 @@ async def health():
     # /healthcheck,单机直连无碍,接 polar 必须补 /health 返 200,否则端点被判 down → 不发生成请求 →
     # rollout 饿死(与 PD proxy 同一坑,见 pd_mooncake_proxy_server.py 的 /health)。
     return {"status": "ok", "dp_instances": len(proxy_state.dp_servers)}
+
+
+@app.get("/vime/lb_state")
+async def lb_state():
+    """Expose routing state for load-distribution diagnostics."""
+    return proxy_state.snapshot()
+
+
+@app.post("/vime/clear_sticky_cache")
+async def clear_sticky_cache(policy_version: int | None = None):
+    """Clear stale session affinity after the serving policy has advanced."""
+    try:
+        result = proxy_state.clear_sticky_cache()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    result["policy_version"] = policy_version
+    logger.info(
+        "Cleared %d sticky sessions at policy_version=%s",
+        result["cleared_sessions"],
+        policy_version,
+    )
+    return result
 
 
 if __name__ == "__main__":

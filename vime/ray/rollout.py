@@ -283,6 +283,7 @@ class RolloutServer:
     prometheus_port: int | None = None
     model_name: str = "default"
     update_weights: bool = True
+    uses_lb_proxy: bool = False
 
     @property
     def engines(self):
@@ -406,6 +407,37 @@ class RolloutServer:
         for g in self.server_groups:
             handles.extend(g.onload(tags=[GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH]))
         return ray.get(handles) if handles else []
+
+    def clear_lb_proxy_sticky_cache(self, policy_version: int) -> dict | None:
+        """Release stale session affinity at a drained policy boundary.
+
+        The serving engines have already reset their prefix caches as part of weight
+        update, so keeping the old session-to-engine map cannot produce a cache hit.
+        The proxy rejects this request if any forwarded request is still active; that
+        keeps the Polar admission/drain contract fail-closed.
+        """
+        if not self.uses_lb_proxy:
+            return None
+        if self.router_ip is None or self.router_port is None:
+            raise RuntimeError(f"LB proxy address is missing for model {self.model_name!r}")
+
+        import httpx
+
+        host = _wrap_ipv6(str(self.router_ip).strip("[]"))
+        url = f"http://{host}:{self.router_port}/vime/clear_sticky_cache"
+        with httpx.Client(timeout=30.0, trust_env=False) as client:
+            response = client.post(url, params={"policy_version": policy_version})
+            response.raise_for_status()
+            payload = response.json()
+        if not isinstance(payload, dict) or payload.get("status") != "ok":
+            raise RuntimeError(f"LB proxy returned an invalid sticky-cache response: {payload!r}")
+        logger.info(
+            "Cleared LB proxy session affinity for model=%s policy_version=%s: %s",
+            self.model_name,
+            policy_version,
+            payload,
+        )
+        return payload
 
 
 @ray.remote
@@ -631,7 +663,16 @@ class RolloutManager:
         )
 
     def finish_policy_update(self, policy_version: int):
-        """Notify a custom rollout function after serving weights advance."""
+        """Clear stale affinity, then reopen the custom rollout function.
+
+        ``prepare_policy_update`` has already paused Polar and proved the request
+        boundary; the caller invokes this only after weight sync, prefix-cache reset,
+        and (for colocated serving) KV restoration. Clear routing before the rollout
+        hook resumes admission so a new-policy request cannot observe old accounting.
+        """
+        for srv in self.servers.values():
+            if srv.update_weights:
+                srv.clear_lb_proxy_sticky_cache(policy_version)
         self._call_rollout_function_hook(
             "finish_policy_update",
             policy_version,
@@ -1581,6 +1622,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             model_name=model_cfg.name,
             update_weights=model_cfg.update_weights,
             prometheus_port=prom_port,
+            uses_lb_proxy=use_lb_proxy,
         )
 
     # Expose per-model router info for custom rollout functions.
