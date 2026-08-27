@@ -53,6 +53,7 @@ DECODE_RE = re.compile(
 PREFILL_RE = re.compile(
     r"Prefill batch, #new-seq: (\d+), #new-token: (\d+), #cached-token: (\d+)")
 TS_RE = re.compile(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)")
+TRAIN_PROCESS_PATTERN = r"(^|[ /])train(_async)?\.py( |$)"
 # named phase timers: "Timer <name> start" / "Timer <name> end (elapsed: Ns)"
 TIMER_RE = re.compile(
     r"timer\.py:\d+ - Timer (\w+) (start|end)(?:.*?elapsed:\s*([\d.]+))?")
@@ -120,17 +121,23 @@ def latest_polar_run():
     return max(dirs, key=os.path.getmtime) if dirs else None
 
 
-def train_alive():
+def _training_pids():
     try:
-        out = subprocess.run(["pgrep", "-f", "train_async.py"],
+        out = subprocess.run(["pgrep", "-f", TRAIN_PROCESS_PATTERN],
                              capture_output=True, text=True, timeout=3)
-        return out.returncode == 0 and out.stdout.strip() != ""
+        if out.returncode != 0:
+            return []
+        return [pid for pid in out.stdout.split() if pid.isdigit()]
     except Exception:
-        return False
+        return []
+
+
+def train_alive():
+    return bool(_training_pids())
 
 
 def train_uptime():
-    """Seconds since the train_async.py process started (script run duration).
+    """Seconds since the active train.py/train_async.py process started.
 
     Uses the process elapsed time (ps etimes) so it reflects the *currently
     running* script, not a log timestamp. When several matches exist (ray
@@ -138,9 +145,7 @@ def train_uptime():
     Returns None when nothing is running.
     """
     try:
-        out = subprocess.run(["pgrep", "-f", "train_async.py"],
-                             capture_output=True, text=True, timeout=3)
-        pids = out.stdout.split()
+        pids = _training_pids()
         if not pids:
             return None
         best = None
