@@ -522,6 +522,36 @@ def update_weights_from_distributed(
         for engine in rollout_engines
     ]
 
+    # [WSYNC-DIAG 2026-08-21] 混合首跑 .64 校验失败定位:按 env 导出 trainer 实际发送的
+    # 每个 tensor 的 (name, shape, dtype, sum, norm),用于与 checkpoint 期望值离线对账。
+    # 只在前 N 个 chunk 生效,事后随诊断一起回滚。
+    import os as _os
+
+    _dump_dir = _os.environ.get("VIME_WSYNC_DUMP_DIR")
+    if _dump_dir:
+        try:
+            import json as _json
+
+            _os.makedirs(_dump_dir, exist_ok=True)
+            _stats_file = _os.path.join(_dump_dir, f"wsync_chunk_stats_wv{weight_version}.jsonl")
+            with open(_stats_file, "a") as _f:
+                for _name, _param in converted_named_tensors:
+                    _t = _param.data if hasattr(_param, "data") else _param
+                    _f.write(
+                        _json.dumps(
+                            {
+                                "name": _name,
+                                "shape": list(_t.shape),
+                                "dtype": str(_t.dtype),
+                                "sum": float(_t.float().sum().item()),
+                                "norm": float(_t.float().norm().item()),
+                            }
+                        )
+                        + "\n"
+                    )
+        except Exception as _e:  # 诊断绝不影响主流程
+            logger.warning("[WSYNC-DIAG] dump failed (non-fatal): %r", _e)
+
     named_gpu_iter = (
         (name, (param.data if hasattr(param, "data") else param).contiguous())
         for name, param in converted_named_tensors
