@@ -219,8 +219,8 @@ mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
 
 # ─── 参数分组 ───
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}
-   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B_fused_torch_dist}
+   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}
+   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
    --save-interval 100
    --no-save-optim

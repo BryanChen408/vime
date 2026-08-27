@@ -29,8 +29,8 @@ HCCL_BUFFSIZE=512 \
 ROLLOUT_BATCH_SIZE=8  N_SAMPLES_PER_PROMPT=4  GLOBAL_BATCH_SIZE=32  NUM_ROLLOUT=100 \
 FEAT_DP_EXTERNAL_LB=0 FEAT_BALANCE_SCHED=0 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=0 \
 FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=0 FEAT_HCCL_AIV=1 \
-OPERATOR_DATA_ROOT=/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189 \
-OPERATOR_TASK_JSONL=/home/docker/polar_can/ProRL-Agent-Server/datasets/op_tasks/op_assets_cudallm_filtered189/operator_tasks.ascendc.jsonl \
+OPERATOR_DATA_ROOT=/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189 \
+OPERATOR_TASK_JSONL=/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189/operator_tasks.16.jsonl \
 PROFILE_TRAIN=0 \
 PROFILE_TARGET=train_overall \
 PROFILE_STEP_START=1 PROFILE_STEP_END=2 \

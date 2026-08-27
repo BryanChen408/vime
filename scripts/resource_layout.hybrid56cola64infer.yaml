@@ -17,9 +17,9 @@ roles:
   rollout:
     - {node: 80.48.5.56, devices: "0-7", share: actor}     # 4 台共卡引擎(HCCS 域 A)
     - {node: 80.48.5.56, devices: "8-15", share: actor}    # 4 台共卡引擎(HCCS 域 B)
-    - {node: 80.48.5.64, devices: "4-15"}                  # 6 台专用引擎,常驻
+    - {node: 80.48.5.64, devices: "8-15"}                  # 6 台专用引擎,常驻
   polar_reserved:
-    - {node: 80.48.5.64, devices: "0-3"}
+    - {node: 80.48.5.64, devices: "0-7"}
 rollout:
   num_gpus_per_engine: 2                 # 14 个 TP2 引擎(8 共卡驻留 8×70G=560G + 6 专用)
   # vllm_dp_size: 14                   # 仅 FEAT_DP_EXTERNAL_LB=1 时需要 == 引擎数
