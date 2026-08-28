@@ -32,6 +32,7 @@ from vime.utils.misc import Box, group_by, load_function
 from vime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
+from .engine_roles import resolve_engine_roles
 from .rollout_validation import validate_server_group_gpu_indices
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from vime.utils.common import is_npu
@@ -40,6 +41,24 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _colocation_by_gpu_slot(args) -> dict[int, bool]:
+    """``{gpu_slot: colocated}`` from the single source of truth, memoised on args.
+
+    Keyed by GPU slot rather than engine index so it stays correct when engines
+    are created across several groups (PD's prefill/decode) whose rank offsets
+    and GPU offsets advance independently.
+    """
+    cached = getattr(args, "_colocation_by_gpu_slot_cache", None)
+    if cached is None:
+        cached = {role.gpu_slot: role.colocated for role in resolve_engine_roles(args)}
+        try:
+            args._colocation_by_gpu_slot_cache = cached
+        except Exception:  # pragma: no cover - frozen namespaces stay uncached
+            pass
+    return cached
+
 
 # [ITEM 1 / DP #4 B+] 存活的 Python LB proxy 子进程句柄(随 run 生命周期,避免被 GC)。
 _LB_PROXY_PROCS: list = []
@@ -125,6 +144,12 @@ class ServerGroup:
             gpu_index = self.gpu_offset + i * num_gpu_per_engine
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
+            # 共卡判定的唯一来源(resolve_engine_roles)。按 **gpu_slot** 查表而不是按
+            # 引擎序号 —— PD 的多 group(prefill/decode)下 rank_offset 与 gpu_offset
+            # 不同步,用序号反推槽位会错位。查不到(位置式路径槽位对不上)时传 None,
+            # 引擎侧退回 --colocate 标志,行为与改动前一致。
+            engine_colocated = _colocation_by_gpu_slot(self.args).get(gpu_index)
+
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg,
                 placement_group_capture_child_tasks=True,
@@ -146,6 +171,7 @@ class ServerGroup:
                 base_gpu_id=base_gpu_id,
                 vllm_overrides=self.vllm_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
+                colocated=engine_colocated,
             )
 
             rollout_engines.append((global_rank, rollout_engine))

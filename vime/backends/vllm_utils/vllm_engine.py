@@ -559,15 +559,27 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     #      update_weights_from_distributed; the vLLM engine still needs
     #      init_weight_transfer_engine to succeed (with NCCL the caller must supply
     #      master_address, master_port, rank_offset, and world_size separately).
-    #    - 混合(share)布局:按节点分叉 —— 与 actor 同节点的共卡引擎走 IPC,
-    #      其余(专用/远程)引擎走 NCCL/HCCL。共卡引擎不进 HCCL 域,规避
-    #      "同域两 rank 同卡" 的 RanktableDetect 拒绝。
+    #    - 混合(share)布局:由 resolve_engine_roles 判定 —— 与 actor 共卡的引擎走 IPC,
+    #      专用引擎走 NCCL/HCCL。共卡引擎不进 HCCL 域,规避 "同域两 rank 同卡" 的
+    #      RanktableDetect 拒绝。
+    #      [2026-08-28] 这里**不能**按节点判(`host in actor_nodes`)。那个判据隐含
+    #      「专用段一定在别的节点」,单机异构下专用引擎与 actor 同节点 → 误判成共卡 →
+    #      起成 npu_ipc,而 trainer 按槽位正确判为远程、发带 master_address 的 init
+    #      info → NPUIPCWeightTransferInitInfo 不认该 kwarg → 500。见
+    #      docs/design/colocate_topology_robustness_plan.md。
     #    Users who pass ``--vllm-weight-transfer-config`` explicitly are honored.
-    _colocated_engine = getattr(args, "colocate", False)
-    _spec = getattr(args, "resource_layout_spec", None)
-    if not _colocated_engine and _spec is not None and getattr(_spec, "rollout_has_share", False):
-        _actor_nodes = {item.node for item in _spec.actor}
-        _colocated_engine = host_for_subprocess in _actor_nodes
+    _colocated_engine = server_args.get("colocated")
+    if _colocated_engine is None:
+        # 调用方未传 role(旧调用点 / 单元测试):退回 --colocate 标志。layout 路径下
+        # 必须由调用方传入,否则混合布局无法区分共卡与专用引擎。
+        _colocated_engine = getattr(args, "colocate", False)
+        _spec = getattr(args, "resource_layout_spec", None)
+        if _spec is not None and getattr(_spec, "rollout_has_share", False):
+            raise ValueError(
+                "hybrid (share) resource layout requires the engine's colocation role to be "
+                "passed explicitly; deriving it here would repeat the node-based guess that "
+                "breaks single-node heterogeneous layouts"
+            )
     if _user_overrode(args, "vllm_weight_transfer_config"):
         cmd += [
             "--weight-transfer-config",
@@ -714,9 +726,12 @@ class VLLMEngine(RayActor):
         model_path: str | None = None,
         vllm_overrides: dict | None = None,
         num_gpus_per_engine: int | None = None,
+        colocated: bool | None = None,
     ):
         self.args = args
         self.rank = rank
+        # 由 RolloutManager 从 resolve_engine_roles 传入 —— 引擎侧不再自己猜是否共卡。
+        self.colocated = colocated
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
         self.model_path = model_path or args.hf_checkpoint
@@ -761,6 +776,7 @@ class VLLMEngine(RayActor):
             base_gpu_id=self.base_gpu_id,
             vllm_overrides=self.vllm_overrides,
             num_gpus_per_engine=gpus_per_engine,
+            colocated=self.colocated,
             disaggregation_bootstrap_port=disaggregation_bootstrap_port,
             data_parallel_size=data_parallel_size,
             data_parallel_rank=data_parallel_rank,
@@ -1310,6 +1326,7 @@ def _compute_server_args(
     base_gpu_id: int | None = None,
     vllm_overrides: dict | None = None,
     num_gpus_per_engine: int | None = None,
+    colocated: bool | None = None,
     disaggregation_bootstrap_port: int | None = None,
     data_parallel_size: int | None = None,
     data_parallel_rank: int | None = None,
@@ -1351,6 +1368,7 @@ def _compute_server_args(
     server_args = {
         "args": args,
         "rank": rank,
+        "colocated": colocated,
         "worker_type": worker_type,
         "model_path": args.hf_checkpoint,
         "host": _format_v6_uri(host),

@@ -11,6 +11,7 @@
 """
 
 import os
+import tempfile
 import types
 import unittest.mock as mock
 from contextlib import nullcontext
@@ -357,8 +358,57 @@ def test_ipc_borrowed_tensor_without_clone_is_corrupted():
 
 
 # ─── 6. serve 名固定别名 + 按引擎 util 分叉(20260824 两颗实锤雷) ─────────────
-def _minimal_server_args(host: str, model_path: str = "/models/Qwen-x-bf16", hybrid: bool = True):
-    """build_vllm_cmd_and_env 的最小输入:hybrid share 布局,actor 在 .56。"""
+def test_dedicated_engine_on_actor_node_is_not_treated_as_colocated():
+    """单机异构的回归:专用引擎与 actor 同节点,不得被判成共卡。
+
+    引擎侧曾按节点判(`host in actor_nodes`),该判据隐含「专用段一定在别的节点」。
+    单机异构(actor 4-11 / 专用 12-15,同一台)下专用引擎被误判成共卡 → 起成
+    npu_ipc,而 trainer 按槽位正确判为远程、发带 master_address 的 init info →
+    NPUIPCWeightTransferInitInfo.__init__() got an unexpected keyword argument
+    'master_address' → 500。见 docs/design/colocate_topology_robustness_plan.md。
+    """
+    from vime.ray.engine_roles import resolve_engine_roles
+    from vime.ray.resource_layout import load_resource_layout
+
+    layout = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    layout.write(
+        'roles:\n'
+        '  actor: [{node: n1, devices: "4-11"}]\n'
+        '  rollout:\n'
+        '    - {node: n1, devices: "4-7", share: actor}\n'
+        '    - {node: n1, devices: "8-11", share: actor}\n'
+        '    - {node: n1, devices: "12-15"}\n'
+        'rollout: {num_gpus_per_engine: 2}\n'
+    )
+    layout.close()
+    spec = load_resource_layout(layout.name)
+    args = types.SimpleNamespace(resource_layout_spec=spec, rollout_num_gpus_per_engine=2)
+
+    roles = resolve_engine_roles(args)
+    verdicts = [r.colocated for r in roles]
+    # 6 台引擎:前 4 台共卡(4-11),后 2 台专用(12-15) —— 全部同一节点。
+    assert verdicts == [True, True, True, True, False, False], verdicts
+
+
+def test_hybrid_layout_refuses_to_guess_colocation():
+    """带 share 的布局下未传 role 必须 raise,而不是退回按节点猜。"""
+    from vime.backends.vllm_utils.vllm_engine import build_vllm_cmd_and_env
+
+    payload = _minimal_server_args("80.48.5.56")
+    payload.pop("colocated")
+    with pytest.raises(ValueError, match="colocation role to be passed explicitly"):
+        build_vllm_cmd_and_env(payload)
+
+
+def _minimal_server_args(
+    host: str, model_path: str = "/models/Qwen-x-bf16", hybrid: bool = True, colocated: bool | None = None
+):
+    """build_vllm_cmd_and_env 的最小输入:hybrid share 布局,actor 在 .56。
+
+    ``colocated`` 必须显式给 —— 引擎侧不再按节点猜是否共卡(那个判据在单机异构下
+    会把专用引擎误判成共卡,起成 npu_ipc 而 trainer 按 HCCL 发 init info)。
+    未给且布局带 share 时 build_vllm_cmd_and_env 会直接 raise。
+    """
     from vime.backends.vllm_utils.vllm_engine import VllmEngineTopology
 
     spec = None
@@ -375,6 +425,7 @@ def _minimal_server_args(host: str, model_path: str = "/models/Qwen-x-bf16", hyb
     )
     return {
         "args": args,
+        "colocated": colocated if colocated is not None else (host == "80.48.5.56"),
         "topology": VllmEngineTopology(
             nnodes=1, node_rank=0, local_num_gpus=2, tensor_parallel_size=2, pipeline_parallel_size=1
         ),
