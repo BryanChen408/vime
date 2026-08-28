@@ -12,35 +12,37 @@
 # IPC/HCCL 分叉,也测不到 _offload_engine_indices 的部分 sleep。异构才是这批
 # 改动的真实覆盖面。
 #
-# ⚠ 训练卡数从 .56 的 16 卡砍到 8 卡,**每 rank 承担的参数翻倍**。35B-A3B 在 8 卡上
-#   能否放下未经验证 —— 先按下面「阶段 1」用 --debug-train-only 单独确认训练侧,
-#   再跑本脚本。若放不下,优先降 SEQ_LENGTH,其次换小模型,不要靠调低
-#   VLLM_GPU_MEM_UTIL 硬凑(那只会把问题挪到 KV 唤醒时爆)。
+# ⚠ 训练卡数从 .56 的 16 砍到 8,**每 rank 承担的参数翻倍**。若首训步 OOM,优先降
+#   SEQ_LENGTH(已预置 32K,可再降),其次动并行度或换小模型 —— 不要靠调低
+#   VLLM_GPU_MEM_UTIL 硬凑:训练窗口里共卡引擎全在睡,调它对训练侧毫无帮助,
+#   只会把爆点挪到后面 KV 唤醒时。
 #
-# ── 阶段 1:训练侧可行性(不占推理卡,不用 layout)──────────────────────────
-#   --resource-layout 与 --debug-train-only 互斥(arguments.py 直接 raise),
-#   所以可行性探测必须**清空 layout** 再从 VIME_EXTRA_ARGS 传进去:
-#     ASCEND_RT_VISIBLE_DEVICES=4,5,6,7,8,9,10,11 NPUS_PER_NODE=8 \
-#     ACTOR_NUM_GPUS_PER_NODE=8 ACTOR_NUM_NODES=1 NNODES=1 \
-#     CURRENT_IP=80.48.5.52 MASTER_ADDR=80.48.5.52 \
-#     RESOURCE_LAYOUT="" TRAIN_ENTRY=train.py \
-#     VIME_EXTRA_ARGS="--debug-train-only" \
-#     SEQ_LENGTH=32768 NUM_ROLLOUT=1 \
-#     bash scripts/run-qwen36-35b-polar-multi-pd.sh
-#   看它能不能走完首个 train step。走不完就先解决这个,别急着上全链路。
+# 训练并行度:TP2 × PP1 × CP4 = 8 rank,恰好占满 actor 的 4-11 八卡(EP8 在 8 rank 上切专家)。
+#   runner 默认 CP8(为 .56 的 16 卡准备),8 卡必须改 CP4,否则乘积对不上卡数。
+#   注:这个切分来自 vime_polar_sync_colocate_design.md §1.2,但**仓内无脚本先例**
+#   (grep CP=4 只命中本文件),Megatron 侧是否接受 CP4+EP8 的组合首跑才知道。
 #
-# ── 阶段 2:全链路(本脚本)──────────────────────────────────────────────
-#   NUM_ROLLOUT=2 bash scripts/start_sync_hybrid_single52.sh
+# 端口与 polar 侧 profile.sing52.yaml 严格对齐(不匹配就是全量 404 / 连不上):
+#   POLAR_ROLLOUT_URL=:8080   ← profile 的 service.rollout_url
+#   VLLM_ROUTER_PORT=8001     ← profile 的 service.sglang_router_url(LB proxy 端口)
 #
-# 前置(polar 侧,手工):
-#   1) profile 的 npu_lease.pool 改成 "0,1,2,3" —— 必须落在训练卡之外,否则 judge 抢卡;
-#   2) 推理端点指向 http://80.48.5.52:${VLLM_ROUTER_PORT};
-#   3) 模型名保持 /home/docker/Qwen3.6-35B-A3B(靠 VLLM_SERVED_MODEL_NAME 别名解耦,
-#      换模型目录不用动 polar)。
+# ── 启动 ────────────────────────────────────────────────────────────────
+#   1) polar 侧(宿主机):
+#        POLAR_PROFILE=deploy/ascend_operator/profile.sing52.yaml \
+#        POLAR_RUN_ID=polar_$(date +%Y%m%d_%H%M%S) \
+#        bash deploy/ascend_operator/restart_polar_host.sh
+#      该 profile 无需改动:npu_lease.pool 已是 [0,1,2,3]、inference_engine 已是 vllm、
+#      model_served 已是 /home/docker/Qwen3.6-35B-A3B。
+#   2) 本脚本:
+#        NUM_ROLLOUT=2 bash scripts/start_sync_hybrid_single52.sh
+#
+# ⚠ judge 池是瓶颈:ROLLOUT_BATCH_SIZE×N_SAMPLES_PER_PROMPT = 16 个 session,判题却只有
+#   4 张卡(npu_lease.pool)。16 个 session 同时完成时会在 NPU lease 上排队,这会**放大
+#   polar/sync/tail_ratio**。别把这个尾巴误读成"需要超订+abort" —— 它是判题池串行化,
+#   不是生成长尾。要区分:看 group_seconds_min 是否也被拖长(是→池contention)。
 #
 # 验收看两处日志:
-#   * polar/sync/accepted_groups == ROLLOUT_BATCH_SIZE,且 tail_ratio 记下来
-#     (>1 明显说明尾部空转,超订+abort 才值得做);
+#   * polar/sync/accepted_groups == ROLLOUT_BATCH_SIZE(=4);
 #   * handoff:rollout 0 after train offload 的 non_torch 占比 —— 决定 util 天花板
 #     和 Phase C(TMS)值不值得做。
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,11 +69,13 @@ VIME_MEM_PROBE=1 \
 RAY_memory_usage_threshold=0.95 \
 no_proxy=127.0.0.1,localhost,80.48.5.52,.huawei.com,local,.local \
 NO_PROXY=127.0.0.1,localhost,80.48.5.52,.huawei.com,local,.local \
-TP=1 \
-PP=2 \
+TP=2 \
+PP=1 \
+CP=4 \
+EP=8 \
 POLAR_TRAJECTORY_PG_FLOOR=0.05 \
-POLAR_ROLLOUT_URL=http://80.48.5.52:8180 \
-VLLM_ROUTER_PORT=8011 \
+POLAR_ROLLOUT_URL=http://80.48.5.52:8080 \
+VLLM_ROUTER_PORT=8001 \
 FEAT_TRAIN_EXPANDABLE=1 \
 VIME_EMPTY_CACHE_PER_STEP=1 \
 TRANSFORMERS_VERBOSITY=error \
