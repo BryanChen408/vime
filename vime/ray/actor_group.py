@@ -6,6 +6,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from vime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 from vime.utils.common import is_npu
+from vime.utils.memory_utils import mem_probe_enabled
 
 
 class RayTrainGroup:
@@ -181,6 +182,17 @@ class RayTrainGroup:
 
     def clear_memory(self):
         return ray.get([actor.clear_memory.remote() for actor in self._actor_handlers])
+
+    def probe_memory(self, tag):
+        """Read every rank's memory at a colocate hand-off. No-op when off.
+
+        Gated here as well as inside the actor so that a disabled probe costs
+        no Ray round-trip at all — ``train.py`` calls this at seven points per
+        rollout, and the default path must stay free.
+        """
+        if not mem_probe_enabled():
+            return None
+        return ray.get([actor.probe_memory.remote(tag) for actor in self._actor_handlers])
 
     def set_rollout_manager(self, rollout_manager):
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])

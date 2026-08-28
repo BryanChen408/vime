@@ -182,6 +182,17 @@ def cpu_tensor_breakdown():
     }
 
 
+def mem_probe_enabled() -> bool:
+    """Whether ``VIME_MEM_PROBE`` asks for the memory probes.
+
+    Strictly ``"1"``, matching what the probes themselves have always checked.
+    A looser parse would let ``VIME_MEM_PROBE=true`` turn the hand-off probes on
+    while leaving the train-step ones silent, which is worse than not having the
+    helper at all.
+    """
+    return os.environ.get("VIME_MEM_PROBE", "0") == "1"
+
+
 def _log_npu_mem(tag: str, step_id: int = -1) -> None:
     """[MEM PROBE] 实时 NPU 显存打印(env VIME_MEM_PROBE=1 开,默认关=零开销)。
 
@@ -191,7 +202,7 @@ def _log_npu_mem(tag: str, step_id: int = -1) -> None:
     若 non_torch 很大 → 真·非-torch 占用(随 seq 长涨);若 device_used ≈ torch_reserved 却 OOM →
     是设备级碎片(torch 要不到连续块),而非池外占用。用 mem_get_info() 拿设备级 free/total。
     """
-    if os.environ.get("VIME_MEM_PROBE", "0") != "1":
+    if not mem_probe_enabled():
         return
     npu = getattr(torch, "npu", None)
     if npu is None or not npu.is_available():
@@ -224,7 +235,7 @@ def _log_npu_expandable(tag: str, step_id: int = -1) -> None:
           剩余是卡在半用段里的碎片(expandable 下仍可按页 unmap,但保守下界看 fully_free)。
     默认关(VIME_MEM_PROBE=1 开);snapshot 有开销,仅探针开时调用。
     """
-    if os.environ.get("VIME_MEM_PROBE", "0") != "1":
+    if not mem_probe_enabled():
         return
     npu = getattr(torch, "npu", None)
     if npu is None or not npu.is_available():

@@ -13,9 +13,12 @@ from vime.ray.ray_actor import RayActor
 from vime.utils.distributed_utils import init_gloo_group
 from vime.utils.logging_utils import configure_logger
 from vime.utils.memory_utils import (
+    _log_npu_expandable,
+    _log_npu_mem,
     aggressive_empty_cache,
     clear_memory,
     expandable_segments_enabled,
+    mem_probe_enabled,
     print_memory,
     set_expandable_segments,
 )
@@ -110,6 +113,31 @@ class TrainRayActor(RayActor):
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
+
+    def probe_memory(self, tag: str):
+        """Record this rank's memory at a colocate hand-off point.
+
+        The train driver holds no device, so a probe placed in the ``train.py``
+        loop has to run here to see the HBM that training and the rollout
+        engines take turns on. Reports both halves of the account the residue
+        question needs: ``_log_npu_mem`` splits device-used into torch's pool
+        versus everything else (CANN/HCCL/AscendC workspace — which no
+        offloader can reach), and ``_log_npu_expandable`` says how much of
+        torch's own cache is still returnable. ``print_memory`` adds the host
+        side, where the pinned parameter backups live.
+
+        Gated on ``VIME_MEM_PROBE`` and never raises: a diagnostic must not be
+        the thing that ends a run.
+        """
+        if not mem_probe_enabled():
+            return None
+        try:
+            _log_npu_mem(f"handoff:{tag}")
+            _log_npu_expandable(f"handoff:{tag}")
+            return print_memory(f"handoff:{tag}")
+        except Exception as e:  # pragma: no cover - diagnostics must not break training
+            logger.warning("probe_memory(%s) failed: %s", tag, e)
+            return None
 
     def prepare_memory_handoff(self) -> None:
         """Prepare a colocated NPU actor allocator before rollout weights wake."""
