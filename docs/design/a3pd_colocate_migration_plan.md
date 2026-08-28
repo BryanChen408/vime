@@ -156,6 +156,19 @@ D1 → D2             需真机对拍
 
 **真机 run 由用户自己起，本方案不代跑。**
 
+### 3.1 跑 CPU 测试的正确姿势
+
+`megatron` 不在 site-packages 里，靠启动脚本配 PYTHONPATH（`run-qwen36-35b-polar-multi-pd.sh:127`）。不配的话 `test_weight_sync_hybrid.py` 等会以 `ModuleNotFoundError: No module named 'megatron'` 假失败：
+
+```bash
+cd /workspace/vime
+export PYTHONPATH="/usr/local/lib/python3.11/site-packages:/workspace/Megatron-LM:$PWD:${PYTHONPATH:-}"
+python -m pytest tests/test_weight_sync_hybrid.py -q      # 18 passed
+python -m pytest tests/test_colocate_memory_probe.py -q   # 14 passed
+```
+
+**必须单文件执行**（与仓库 CLAUDE.md 一致）。整目录 `pytest tests/` 收集会挂，两个原因都是既有的、与本方案无关：文件名带点（`test_qwen2.5_*.py`）破坏 pytest 模块命名；整目录模式下 `vime/ray` 会遮蔽真正的 `ray` 包（`No module named 'ray.util'; 'ray' is not a package`）。基线 `b892640d` 同样是 19 个收集错误。
+
 ---
 
 ## 4. 回滚
