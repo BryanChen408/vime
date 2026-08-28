@@ -717,6 +717,20 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--polar-min-complete-accept-fraction", type=float, default=None)
             parser.add_argument("--rollout-session-pool-pause-policy", type=str, default=None)
             parser.add_argument("--polar-session-pool-pause-policy", type=str, default=None)
+            parser.add_argument(
+                "--rollout-sync-oversubscribe-factor",
+                type=float,
+                default=1.0,
+                help=(
+                    "Only read by the synchronous rollout path "
+                    "(vime_bridge.rollout.generate_rollout_polar_sync). Submit "
+                    "ceil(rollout_batch_size * factor) groups per step and keep the first "
+                    "rollout_batch_size that are accepted. 1.0 means strict synchronous: "
+                    "submit exactly what is needed and wait for all of it, so nothing is "
+                    "still generating when the call returns and the engine can sleep. "
+                    "Values above 1.0 need in-flight abort, which is not implemented yet."
+                ),
+            )
             parser.add_argument("--polar-allow-weight-update-overlap", action=argparse.BooleanOptionalAction, default=None)
             # task_request submit mode (e.g. SWE-Gym coding-agent): path to an OmegaConf
             # YAML/JSON task template (runtime + agent + evaluator). Presence auto-selects

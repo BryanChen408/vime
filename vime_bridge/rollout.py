@@ -46,6 +46,8 @@ _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback pa
 _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbacks
 _SESSION_POOL_RUN_RELEASE_POLL_SECONDS = 2.0
 _SESSION_POOL_RUN_RELEASE_POLL_TIMEOUT_SECONDS = 1.0
+# Synchronous path: per-rollout ceiling on group resubmissions before giving up.
+_SYNC_MAX_SUBMIT_MULTIPLIER = 4
 _LONGEST_TRACE_ARTIFACT_INTERVAL = 5  # dump longest trace every N rollouts
 _SESSION_POOL_RUN_RELEASE_STATUSES = frozenset({
     str(SessionStatus.POST_RUN),
@@ -2628,6 +2630,269 @@ def _build_metrics(
 
 
 # ---------------------------------------------------------------------------
+# Synchronous one-shot training rollout (colocated train/infer)
+# ---------------------------------------------------------------------------
+@dataclass(slots=True)
+class _SyncGroupOutcome:
+    """Result of running one sample group to a terminal Polar task state."""
+
+    group: list[Any]
+    accepted: bool
+    samples: list[Any] | None = None
+    task_result: TaskResult | None = None
+    rejection_reason: str | None = None
+
+
+@dataclass(slots=True)
+class _AbortStats:
+    aborted_groups: int = 0
+    aborted_sessions: int = 0
+    requeued_groups: int = 0
+
+
+async def _abort_inflight(
+    pending: set[asyncio.Task],
+    args: Any,
+    *,
+    data_source: Any,
+) -> _AbortStats:
+    """Terminate groups still generating once the batch is full.
+
+    SEAM for the future "saturated pool + abort" mode. With
+    ``--rollout-sync-oversubscribe-factor 1.0`` the collection loop only exits
+    once every submitted group reached a terminal state, so ``pending`` is
+    always empty here and this is a no-op.
+
+    Implementing oversubscription means filling this in with:
+      1. ``GET /tasks/{task_id}/sessions``  -> session ids (rollout server :8080)
+      2. ``DELETE /sessions/{sid}``         -> gateway :8100; cancels the agent
+         *and* the upstream vLLM generation (polar/gateway/inflight.py:95-108),
+         which is what makes a subsequent engine sleep safe
+      3. ``data_source.add_samples([group])`` -> requeue. RolloutDataSourceWithBuffer
+         drains its buffer before the epoch iterator, so a requeued group is
+         submitted first in the next window.
+
+    Aborted trajectories must NOT be scored or trained on -- metrics only.
+    Blocked on ``--polar-gateway-url``, which vime does not register today.
+    """
+    del args, data_source
+    if pending:
+        raise NotImplementedError(
+            f"{len(pending)} groups still in flight; aborting them is not implemented yet. "
+            "Only --rollout-sync-oversubscribe-factor 1.0 is supported."
+        )
+    return _AbortStats()
+
+
+async def _run_sync_train_group(
+    *,
+    client: httpx.AsyncClient,
+    args: Any,
+    config: PolarSlimeConfig,
+    rollout_id: int,
+    group: list[Any],
+    group_id: int,
+) -> _SyncGroupOutcome:
+    """Submit one group and wait for its terminal TaskResult.
+
+    Applies the same acceptance checks the async worker uses, but reports a
+    rejection instead of raising so the caller can top up and keep going.
+    """
+    payload = _build_submission_payload(
+        args=args,
+        config=config,
+        group=group,
+        rollout_id=rollout_id,
+        task_position=group_id,
+    )
+    payload["task_id"] = str(payload["task_id"])
+    # Synchronous: the policy version is always the current step, so accepted
+    # groups carry staleness 0 by construction.
+    _attach_scheduler_metadata(
+        payload,
+        group_id=group_id,
+        policy_version=rollout_id,
+        rollout_step=rollout_id,
+    )
+
+    async def submit_one(chunk: dict[str, Any]) -> TaskResult:
+        submit_path = (
+            "/rollout/operator_samples/submit"
+            if config.submit_mode == "operator_samples"
+            else "/rollout/task/submit"
+        )
+        return await _submit_and_wait_for_task(
+            client,
+            config.rollout_server_url,
+            chunk,
+            submit_path=submit_path,
+        )
+
+    task_result = await _submit_payload_in_chunks(
+        payload,
+        max_sessions_per_task=config.max_sessions_per_task,
+        submit_one=submit_one,
+    )
+
+    def _reject(reason: str) -> _SyncGroupOutcome:
+        return _SyncGroupOutcome(
+            group=group, accepted=False, task_result=task_result, rejection_reason=reason
+        )
+
+    reason = _task_rejection_reason(task_result, group)
+    if reason is not None:
+        return _reject(reason)
+
+    samples = _convert_task_result_to_samples(
+        config, task_result, group, max_tokens=_resolve_max_tokens(args)
+    )
+    if not samples:
+        return _reject("converted to zero samples")
+    if not _has_trainable_tokens(samples):
+        return _reject("zero trainable tokens")
+    reason = _low_complete_accept_fraction_rejection_reason(config, task_result, samples)
+    if reason is not None:
+        return _reject(reason)
+
+    return _SyncGroupOutcome(
+        group=group, accepted=True, samples=samples, task_result=task_result
+    )
+
+
+async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) -> Any:
+    """Collect exactly ``rollout_batch_size`` accepted groups, then return.
+
+    Nothing survives the call: every submitted group has reached a terminal
+    state by the time this returns, so no Polar session is still generating and
+    the rollout engine can be put to sleep safely.
+    """
+    config = resolve_polar_slime_config(args)
+    need = int(getattr(args, "rollout_batch_size", 1) or 1)
+    if need <= 0:
+        raise ValueError("rollout_batch_size must be greater than 0")
+
+    factor = float(getattr(args, "rollout_sync_oversubscribe_factor", 1.0) or 1.0)
+    if factor < 1.0:
+        raise ValueError("--rollout-sync-oversubscribe-factor must be >= 1.0")
+    if factor > 1.0:
+        # Guard rather than silently leaking in-flight sessions into an engine sleep.
+        raise NotImplementedError(
+            "--rollout-sync-oversubscribe-factor > 1.0 needs _abort_inflight, which is "
+            "blocked on --polar-gateway-url; see vime_polar_sync_colocate_design.md §7."
+        )
+    submit_n = math.ceil(need * factor)
+    # Ceiling on resubmissions within one rollout. A systematically failing group
+    # (malformed payload, polar misconfiguration) would otherwise spin here forever,
+    # pulling the data source dry one group at a time.
+    max_submissions = max(_SYNC_MAX_SUBMIT_MULTIPLIER * need, need + 8)
+
+    timeout = None if config.request_timeout is None else httpx.Timeout(config.request_timeout)
+    accepted: list[_SyncGroupOutcome] = []
+    rejected = 0
+    surplus = 0
+    topup_rounds = 0
+    group_counter = 0
+    started = time.monotonic()
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        pending: set[asyncio.Task[_SyncGroupOutcome]] = set()
+
+        def _spawn(groups: list[list[Any]]) -> None:
+            nonlocal group_counter
+            for group in groups:
+                pending.add(
+                    asyncio.create_task(
+                        _run_sync_train_group(
+                            client=client,
+                            args=args,
+                            config=config,
+                            rollout_id=rollout_id,
+                            group=group,
+                            group_id=group_counter,
+                        ),
+                        name=f"polar-sync-group-{rollout_id}-{group_counter}",
+                    )
+                )
+                group_counter += 1
+
+        _spawn(_pull_sample_groups(data_source, submit_n))
+
+        while len(accepted) < need:
+            if not pending:
+                # Every submitted group was rejected or failed; pull replacements.
+                # Without this the call would return an undersized batch.
+                if group_counter >= max_submissions:
+                    raise PolarRolloutSchedulerError(
+                        f"Polar sync rollout {rollout_id}: submitted {group_counter} groups but "
+                        f"only {len(accepted)}/{need} were accepted ({rejected} rejected); "
+                        "giving up rather than resubmitting indefinitely. A systematic "
+                        "rejection (bad task payload, polar misconfiguration) looks like this."
+                    )
+                topup_rounds += 1
+                topup = _pull_sample_groups(data_source, need - len(accepted))
+                if not topup:
+                    raise PolarRolloutSchedulerError(
+                        f"Polar sync rollout {rollout_id}: data source exhausted with "
+                        f"{len(accepted)}/{need} groups accepted"
+                    )
+                _spawn(topup)
+
+            done, still_pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            pending = set(still_pending)
+
+            for task in done:
+                exc = task.exception()
+                if exc is not None:
+                    rejected += 1
+                    logger.warning(
+                        "Polar sync group failed, will top up: %s", exc, exc_info=exc
+                    )
+                    continue
+                outcome = task.result()
+                if not outcome.accepted:
+                    rejected += 1
+                    logger.warning(
+                        "Polar sync group rejected, will top up: %s", outcome.rejection_reason
+                    )
+                elif len(accepted) < need:
+                    accepted.append(outcome)
+                else:
+                    surplus += 1
+
+        abort_stats = await _abort_inflight(pending, args, data_source=data_source)
+
+    elapsed = time.monotonic() - started
+    logger.info(
+        "Polar sync rollout %d collected %d/%d groups in %.1fs "
+        "(submitted=%d rejected=%d topups=%d)",
+        rollout_id, len(accepted), need, elapsed, group_counter, rejected, topup_rounds,
+    )
+
+    data = [outcome.samples for outcome in accepted]
+    flat = [sample for group in data for sample in group]
+    rewards = [_extract_sample_reward(s, config.reward_key) for s in flat]
+
+    metrics: dict[str, Any] = {}
+    metrics.update(_polar_extra_metrics(flat, rewards, config.reward_key))
+    metrics.update({
+        "polar/sync/submitted_groups": float(group_counter),
+        "polar/sync/accepted_groups": float(len(accepted)),
+        "polar/sync/rejected_groups": float(rejected),
+        "polar/sync/surplus_groups": float(surplus),
+        "polar/sync/topup_rounds": float(topup_rounds),
+        "polar/sync/aborted_groups": float(abort_stats.aborted_groups),
+        "polar/sync/aborted_sessions": float(abort_stats.aborted_sessions),
+        "polar/sync/requeued_groups": float(abort_stats.requeued_groups),
+        "polar/sync/elapsed_seconds": elapsed,
+    })
+
+    RolloutFnTrainOutput = _load_rollout_train_output_type()
+    return RolloutFnTrainOutput(samples=data, metrics=metrics)
+
+
+# ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
 def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, evaluation: bool = False) -> Any:
@@ -2683,6 +2948,29 @@ def generate_rollout_polar_async(args: Any, rollout_id: int, data_source: Any, e
     metrics: dict[str, Any] = {}
     metrics.update(_polar_extra_metrics(flat, rewards, async_worker.config.reward_key))
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
+
+
+def generate_rollout_polar_sync(args: Any, rollout_id: int, data_source: Any, evaluation: bool = False) -> Any:
+    """Synchronous rollout entrypoint for colocated train/infer.
+
+    Contract: when this returns, no Polar session is still generating, so the
+    caller may put the rollout engine to sleep. Nothing is buffered across
+    rollout steps, so every accepted trajectory was produced under the current
+    weights (staleness 0) and no off-policy correction (``--use-tis``) is needed.
+
+    Deliberately shares no state with ``AsyncPolarRolloutWorker``: no background
+    thread, no ready-group buffer, no policy-version bookkeeping. That worker
+    speculatively opens groups whenever admission quota frees up, so at least
+    one group is always still generating when generate() returns -- which is
+    exactly what must not happen before an engine sleeps.
+
+    Pair it with ``train.py`` (not ``train_async.py``) and a colocated layout.
+    Evaluation is delegated to the existing one-shot eval batch, which already
+    has these properties.
+    """
+    if evaluation:
+        return asyncio.run(_run_eval_rollout(args, rollout_id, data_source))
+    return asyncio.run(_run_sync_train_rollout(args, rollout_id, data_source))
 
 
 def _maybe_dump_longest_trace_artifact(
