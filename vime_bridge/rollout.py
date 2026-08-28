@@ -981,6 +981,21 @@ def _has_trainable_tokens(samples: list[Any]) -> bool:
     return any(_trainable_token_count(sample) > 0 for sample in samples)
 
 
+def _task_rejection_reason(task_result: TaskResult, group: list[Any]) -> str | None:
+    """Structural checks a task result must pass before its samples are usable.
+
+    Shared by the async session-pool worker and the synchronous one-shot path;
+    it depends on nothing but the result and the group it was submitted for.
+    """
+    if task_result.status != "completed":
+        return f"task status={task_result.status}"
+    if not task_result.results:
+        return "empty task results"
+    if len(task_result.results) != len(group):
+        return f"session count {len(task_result.results)} != expected {len(group)}"
+    return None
+
+
 def _low_complete_accept_fraction_rejection_reason(
     config: PolarSlimeConfig,
     task_result: TaskResult,
@@ -2177,13 +2192,7 @@ class AsyncPolarRolloutWorker:
         return len(active) < (self._batch_size * self.config.max_async_level)
 
     def _task_rejection_reason(self, task_result: TaskResult, group: list[Any]) -> str | None:
-        if task_result.status != "completed":
-            return f"task status={task_result.status}"
-        if not task_result.results:
-            return "empty task results"
-        if len(task_result.results) != len(group):
-            return f"session count {len(task_result.results)} != expected {len(group)}"
-        return None
+        return _task_rejection_reason(task_result, group)
 
     def _rollout_context(self) -> tuple[int, int]:
         with self._state_lock:
