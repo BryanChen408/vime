@@ -3,16 +3,15 @@ during the weight-sync pause.
 
 The gateway stamps each rollout turn with this version and rejects a session continuation
 whose next turn would cross a weight update (mixed-weight = v_N prefix + v_{N+1} suffix).
-Complements dev_09 (which catches *aborted* turns): this catches sessions that were in a
-pure external tool-wait at sync time -- no in-flight request to abort -- yet resume under
-new weights.  See polar-side prefix_merging cross-version fallback + gateway entry
-interception (docs/design/polar_version_span_exclusion.md).
+Complements cancellation and abort fencing as a defense in depth.  See polar-side
+prefix_merging cross-version fallback + gateway entry interception
+(docs/design/polar_version_span_exclusion.md).
 
 Hard constraint: MUST be pushed DURING the pause, BEFORE resume -- otherwise a turn can be
 generated with new weights but stamped with the old version, and the span goes undetected.
 
-Best-effort: a gateway that lacks the endpoint or is unreachable must NEVER block the weight
-update.  On failure the run degrades to dev_09-only exclusion (no crash, no hang).
+The caller treats False as a fatal, fail-closed boundary error.  A partial gateway update
+must never be accepted because it would stamp the same rollout fleet with different versions.
 """
 from __future__ import annotations
 
@@ -36,9 +35,7 @@ def _resolve_push_url(args: Any) -> str | None:
 
 
 def push_policy_version_to_gateway(args: Any, version: int) -> bool:
-    """POST the new weight ``version`` to the polar gateway.  Returns True on success, False
-    on any failure -- never raises, so it can sit inside the weight-update critical section.
-    """
+    """POST ``version`` and require an explicit acknowledgement from every gateway."""
     url = _resolve_push_url(args)
     if not url:
         return False
@@ -49,12 +46,33 @@ def push_policy_version_to_gateway(args: Any, version: int) -> bool:
         with httpx.Client(timeout=max(timeout, 5.0)) as client:
             response = client.post(url, params={"version": int(version)})
             response.raise_for_status()
+            payload = response.json()
+        rollout_url = getattr(args, "polar_url", None) or getattr(
+            args, "polar_rollout_url", None
+        )
+        if rollout_url:
+            acknowledged = (
+                isinstance(payload, dict)
+                and payload.get("all_updated") is True
+                and payload.get("policy_version") == int(version)
+            )
+        else:
+            acknowledged = (
+                isinstance(payload, dict)
+                and payload.get("policy_version") == int(version)
+            )
+        if not acknowledged:
+            logger.error(
+                "version-span: gateway did not acknowledge policy_version=%s: %r",
+                version,
+                payload,
+            )
+            return False
         logger.info("version-span: pushed policy_version=%s to gateway (%s)", version, url)
         return True
     except Exception:
         logger.warning(
-            "version-span: failed to push policy_version=%s to gateway (non-fatal, "
-            "degrades to dev_09-only exclusion)",
+            "version-span: failed to push policy_version=%s to every gateway",
             version,
             exc_info=True,
         )

@@ -222,9 +222,9 @@ def prepare_policy_update(args: Any, policy_version: int) -> dict[str, Any]:
         #   * Synchronous (colocate) training has no overlap window at all: the engines sleep
         #     for the entire training step, so waiting for sessions only stalls training.
         #     --no-polar-weight-update-drain-sessions skips the wait. After the serving-engine
-        #     abort is confirmed, commit_policy_update_boundary explicitly detaches every
-        #     old-policy task from the local scheduler; Polar's version-span guard remains the
-        #     remote backstop for a continuation that reaches the gateway after the update.
+        #     abort is confirmed, commit_policy_update_boundary always cancels every remaining
+        #     old-policy task remotely and detaches it locally; the version-span guard is a
+        #     final defense in depth rather than the primary cutoff mechanism.
         if bool(getattr(args, "polar_weight_update_drain_sessions", True)):
             timeout_seconds = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
             try:
@@ -232,7 +232,7 @@ def prepare_policy_update(args: Any, policy_version: int) -> dict[str, Any]:
             except PolarRolloutSchedulerError:
                 logger.warning(
                     "Polar session drain did not finish within %.0fs; proceeding with the "
-                    "weight update anyway and leaving the stragglers to the version-span guard.",
+                    "boundary and cancelling all remaining old-policy tasks.",
                     timeout_seconds,
                 )
         else:
@@ -245,25 +245,28 @@ def prepare_policy_update(args: Any, policy_version: int) -> dict[str, Any]:
 
 
 def commit_policy_update_boundary(args: Any, policy_version: int) -> dict[str, Any]:
-    """Confirm engine abort propagation, then publish the next policy version.
+    """Cancel surplus sessions, confirm engine abort propagation, then publish version.
 
     Called only after VIME's rollout-engine ``/pause?mode=abort`` fanout succeeds.
     Failure is fatal and leaves both Polar and the local scheduler closed.
     """
     timeout_seconds = float(getattr(args, "polar_gateway_control_timeout", 30.0))
+    # A synchronous weight boundary never carries scheduler-owned old-policy work
+    # across the training window.  The drain flag only controls whether prepare()
+    # first gives sessions a chance to finish naturally; whatever remains here is
+    # cancelled in every mode before the gateway version can advance.
+    with _worker_lock:
+        worker = _global_async_worker
+    if worker is not None and worker.config.scheduler_mode == "session_pool":
+        worker.abandon_policy_versions_before(
+            policy_version,
+            timeout=timeout_seconds,
+        )
     status = _pause_gateway_generation(
         args,
         timeout_seconds=timeout_seconds,
         require_drained=True,
     )
-    if not bool(getattr(args, "polar_weight_update_drain_sessions", True)):
-        with _worker_lock:
-            worker = _global_async_worker
-        if worker is not None and worker.config.scheduler_mode == "session_pool":
-            worker.abandon_policy_versions_before(
-                policy_version,
-                timeout=timeout_seconds,
-            )
     if not push_policy_version_to_gateway(args, policy_version):
         raise PolarRolloutSchedulerError(
             f"Failed to publish Polar policy_version={policy_version} while admission "
@@ -355,8 +358,18 @@ def _pause_gateway_generation(
         payload = _control_post_json(
             url,
             action="rollout gateway pause",
-            timeout=max(effective_timeout + 15.0, 20.0),
-            params={"timeout_seconds": effective_timeout},
+            timeout=(
+                max(effective_timeout + 15.0, 20.0)
+                if require_drained
+                else max(
+                    float(getattr(args, "polar_gateway_control_timeout", 30.0)),
+                    5.0,
+                )
+            ),
+            params={
+                "timeout_seconds": effective_timeout,
+                "wait_for_drain": require_drained,
+            },
         )
         all_paused = payload.get("all_paused") is True
         all_drained = payload.get("all_drained") is True
@@ -373,8 +386,18 @@ def _pause_gateway_generation(
         payload = _control_post_json(
             url,
             action="gateway pause",
-            timeout=max(effective_timeout + 5.0, 10.0),
-            params={"timeout_seconds": effective_timeout},
+            timeout=(
+                max(effective_timeout + 5.0, 10.0)
+                if require_drained
+                else max(
+                    float(getattr(args, "polar_gateway_control_timeout", 30.0)),
+                    5.0,
+                )
+            ),
+            params={
+                "timeout_seconds": effective_timeout,
+                "wait_for_drain": require_drained,
+            },
         )
         all_paused = payload.get("paused") is True
         all_drained = payload.get("drained") is True
@@ -414,6 +437,10 @@ def _resume_gateway_generation(args: Any) -> None:
             action="rollout gateway resume",
             timeout=max(request_timeout, 5.0),
         )
+        if payload.get("all_resumed") is not True:
+            raise PolarRolloutSchedulerError(
+                f"Polar rollout server did not resume every gateway: {payload!r}"
+            )
         logger.info("Resumed Polar gateway generation via rollout server: %s", payload)
         return
 
@@ -427,6 +454,10 @@ def _resume_gateway_generation(args: Any) -> None:
         action="gateway resume",
         timeout=max(request_timeout, 5.0),
     )
+    if payload.get("paused") is not False:
+        raise PolarRolloutSchedulerError(
+            f"Polar gateway did not confirm generation resume: {payload!r}"
+        )
     logger.info("Resumed Polar gateway generation after inference weight update: %s", payload)
 
 
@@ -860,7 +891,7 @@ async def _submit_and_wait_for_task(
             logger.warning("Polling Polar task %s failed; continuing: %s", task_id, exc)
             continue
         status = TaskStatus.model_validate(status_resp.json())
-        if status.status in ("completed", "failed"):
+        if status.status in ("completed", "failed", "cancelled"):
             break
 
     return TaskResult(
@@ -1555,6 +1586,27 @@ class AsyncPolarRolloutWorker:
             return
 
         cancelled_tasks: list[asyncio.Task[TaskResult]] = []
+        remote_task_ids = sorted(
+            {
+                unit.task_id
+                for unit in active.values()
+                if unit.policy_version < target
+            }
+        )
+        try:
+            await self._cancel_remote_policy_tasks(
+                remote_task_ids,
+                policy_version=target,
+            )
+        except Exception as exc:
+            error = PolarRolloutSchedulerError(
+                f"Failed to cancel old Polar tasks before policy_version={target}: {exc}"
+            )
+            self._set_fatal(error)
+            with self._state_lock:
+                self._policy_cutoff_complete.set()
+            raise error from None
+
         abandoned_group_ids = {
             group_id
             for group_id, accumulator in open_groups.items()
@@ -1616,13 +1668,63 @@ class AsyncPolarRolloutWorker:
 
         logger.info(
             "Applied local Polar policy cutoff < %d: groups=%d sessions=%d "
-            "cancelled_polls=%d remaining_open=%d remaining_ready=%d",
+            "cancelled_remote_tasks=%d cancelled_polls=%d remaining_open=%d "
+            "remaining_ready=%d",
             target,
             abandoned_groups,
             abandoned_sessions,
+            len(remote_task_ids),
             len(cancelled_tasks),
             len(open_groups),
             self._ready_group_count,
+        )
+
+    async def _cancel_remote_policy_tasks(
+        self,
+        task_ids: list[str],
+        *,
+        policy_version: int,
+    ) -> None:
+        if not task_ids:
+            return
+        base_url = self.config.rollout_server_url
+        timeout_seconds = float(
+            getattr(self.args, "polar_gateway_control_timeout", 30.0)
+        )
+        try:
+            async with httpx.AsyncClient(timeout=max(timeout_seconds, 5.0)) as client:
+                response = await client.post(
+                    f"{base_url}/rollout/admin/tasks/cancel",
+                    json={
+                        "task_ids": task_ids,
+                        "reason": "policy_cutoff",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None)
+            detail = response.text if response is not None else str(exc)
+            raise PolarRolloutSchedulerError(
+                f"Polar task cutoff HTTP failure: status={status} detail={detail}"
+            ) from None
+        except (TypeError, ValueError) as exc:
+            raise PolarRolloutSchedulerError(
+                f"Polar task cutoff returned invalid JSON: {exc}"
+            ) from None
+
+        if not isinstance(payload, dict) or payload.get("all_acknowledged") is not True:
+            raise PolarRolloutSchedulerError(
+                f"Polar task cutoff was not acknowledged: {payload!r}"
+            )
+        self._inc_metric("polar/session_pool/policy_cutoff_remote_tasks", len(task_ids))
+        logger.info(
+            "Polar remote task cutoff acknowledged before policy_version=%d: "
+            "tasks=%d sessions=%s",
+            policy_version,
+            len(task_ids),
+            payload.get("sessions_cancel_requested"),
         )
 
     async def _start_callback_listener(self) -> tuple[uvicorn.Server, asyncio.Task[None]]:
@@ -2197,7 +2299,7 @@ class AsyncPolarRolloutWorker:
                 status_resp = await client.get(f"{base_url}/rollout/task/{task_id}")
                 status_resp.raise_for_status()
                 status = TaskStatus.model_validate(status_resp.json())
-                if status.status in ("completed", "failed"):
+                if status.status in ("completed", "failed", "cancelled"):
                     return TaskResult(
                         task_id=task_id, status=status.status,
                         results=status.results, result_paths=status.result_paths,

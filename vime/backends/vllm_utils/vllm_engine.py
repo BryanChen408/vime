@@ -29,6 +29,8 @@ from vime.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
+_MEMORY_CONTROL_TIMEOUT_SECONDS = 120
+
 _spawn_ctx = multiprocessing.get_context("spawn")
 
 # Fields checked against external ``GET /server_info``.
@@ -992,7 +994,11 @@ class VLLMEngine(RayActor):
         if self.node_rank != 0:
             return
         params = {"reset_running_requests": False}
-        requests.post(f"{self._http_base()}/reset_prefix_cache", params=params).raise_for_status()
+        requests.post(
+            f"{self._http_base()}/reset_prefix_cache",
+            params=params,
+            timeout=_MEMORY_CONTROL_TIMEOUT_SECONDS,
+        ).raise_for_status()
 
     def get_url(self):
         """Worker HTTP base URL, or ``None`` when ``node_rank != 0``."""
@@ -1071,6 +1077,7 @@ class VLLMEngine(RayActor):
         response = requests.post(
             f"{self._http_base()}/sleep",
             params={"level": level},
+            timeout=_MEMORY_CONTROL_TIMEOUT_SECONDS,
         )
         return _response_json(response)
 
