@@ -16,16 +16,19 @@
 #   或换小模型 —— 不要靠调低 VLLM_GPU_MEM_UTIL 硬凑:训练窗口里共卡引擎全在睡,调它
 #   对训练侧毫无帮助,只会把爆点挪到后面 KV 唤醒时。
 #
-# ⚠ **上下文长度有硬下限,不能当省显存的旋钮**。20260828 首跑把这三个值压到 32768,
-#   结果 64/64 个 session 在第 0 轮就被引擎打回 400:
+# ⚠ **长度是能力参数,不是显存旋钮;要压显存请压 batch**。
+#   长度三件套按 MAX_TOKENS_PER_GPU × CP 拉齐 = 32768 × 4 = **131072**(CP4 比生产 .56 的
+#   CP8 少一半,所以是 131072 而非 262144 —— 这个上界来自 vime_bridge 的
+#   _resolve_max_tokens:超过它的轨迹会被 batcher 丢弃,配更大无意义,配更小是白扔能力)。
+#   冒烟靠的是 batch 降到生产的 1/4:
+#     ROLLOUT_BATCH_SIZE 8→4, N_SAMPLES_PER_PROMPT 8→4, GLOBAL_BATCH_SIZE 64→16。
+#   20260828 首跑违反了这条:把三件套压到 32768 想省显存,结果 64/64 个 session 在第 0 轮
+#   就被引擎打回 400 —— agent 的第 0 轮 prompt 已 20481 token,polar profile 的
+#   max_output_tokens=12288,相加 32769,比 32768 多 1:
 #     "maximum context length is 32768 ... requested 12288 output tokens and your
 #      prompt contains at least 20481 input tokens, for a total of at least 32769"
-#   agent 的第 0 轮 prompt(system + skills + 算子任务)已 20481 token,polar profile 的
-#   max_output_tokens=12288,两者相加 32769 —— 比 32768 多 1。零 completion → 零可训
-#   token → 同步路径把每个组都拒掉并无限 top up。50 轮累积远不止这个数,所以取 runner
-#   默认 131072(生产 .56 用 262144)。
-#   上界由训练侧决定:vime_bridge 的 _resolve_max_tokens = MAX_TOKENS_PER_GPU × CP
-#   = 32768 × 4 = 131072,超过它的轨迹会被 batcher 丢弃,所以配更大没有意义。
+#   零 completion → 零可训 token → 同步路径把每个组全拒掉并无限 top up,一个训练步都没
+#   进去。**长度存在硬下限,压它不是"少跑一点",而是直接让 agent 发不出第一个请求。**
 #
 # 训练并行度:TP2 × PP1 × CP4 = 8 rank,恰好占满 actor 的 4-11 八卡(EP8 在 8 rank 上切专家)。
 #   runner 默认 CP8(为 .56 的 16 卡准备),8 卡必须改 CP4,否则乘积对不上卡数。

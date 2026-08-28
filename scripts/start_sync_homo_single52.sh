@@ -6,13 +6,18 @@
 #   0-15   actor 训练(16 卡)
 #   4-15   6 台 TP2 引擎,全部共卡,训练窗口 sleep,权重走 NPU IPC
 #
-# 为什么先跑同构:单机**异构**目前会崩 —— 三处共卡判据(引擎侧 backend 按节点 /
-#   权重通道按总 actor 卡 / offload 按 share 卡)在「专用段与 actor 同节点」时分叉,
-#   引擎起成 npu_ipc 而 trainer 发 HCCL init info →
-#   NPUIPCWeightTransferInitInfo.__init__() got an unexpected keyword argument
-#   'master_address' → 500。同构下三处天然一致,不触发。
+# 为什么先跑同构:**变量最少**。TP2×PP1×CP8=16 与 .56 生产配置逐位相同,长度也对齐
+#   262144,唯一的差异只有 batch(生产 1/4)。用它先把「训练步能不能跑通」和「显存残留
+#   到底多少」这两个未验证项拿下来,再回异构。
+#
+#   注:单机异构曾崩在三处共卡判据分叉(引擎侧 backend 按节点 / 权重通道按总 actor 卡 /
+#   offload 按 share 卡),「专用段与 actor 同节点」时引擎起成 npu_ipc 而 trainer 发 HCCL
+#   init info → NPUIPCWeightTransferInitInfo.__init__() got an unexpected keyword
+#   argument 'master_address' → 500。已由 1448b630 归一到 vime/ray/engine_roles.py,并在
+#   20260828 真机跑中验证(权重同步 /finish_weight_update 200,全日志无该异常;
+#   Sleep mode 只出现在 4 台共卡引擎上,专用 2 台常驻,offload 判据也正确)。
+#   所以异构现在**可跑**,先同构只是为了少变量,不是因为异构还坏着。
 #   详见 docs/design/colocate_topology_robustness_plan.md。
-#   已用真实代码离线验证:三处判据均为 CCCCCC,TP2 配对无跨 HCCS 域。
 #
 # 并行度 TP2 × PP1 × CP8 = 16,占满 actor 全部 16 卡 —— **与 .56 生产配置逐位相同**,
 #   不引入 CP4 那个仓内无先例的变量。
@@ -29,12 +34,16 @@
 #   2) 本脚本:
 #        NUM_ROLLOUT=2 bash scripts/start_sync_homo_single52.sh
 #
-# ⚠ **上下文长度有硬下限,不能当省显存的旋钮**。20260828 异构首跑把 SEQ_LENGTH /
-#   ROLLOUT_MAX_CONTEXT_LEN / VLLM_MAX_MODEL_LEN 压到 32768,64/64 个 session 在第 0 轮
-#   就被引擎打回 400:agent 的第 0 轮 prompt 已 20481 token,polar profile 的
-#   max_output_tokens=12288,相加 32769 —— 比 32768 多 1。零 completion → 零可训 token
-#   → 同步路径把每个组全拒掉并无限 top up。故取 runner 默认 131072(生产 .56 用 262144)。
-#   上界 = _resolve_max_tokens = MAX_TOKENS_PER_GPU × CP = 32768 × 8 = 262144,131072 在内。
+# ⚠ **长度是能力参数,不是显存旋钮;要压显存请压 batch**。
+#   长度三件套按 MAX_TOKENS_PER_GPU × CP 拉齐 = 32768 × 8 = **262144**,与生产 .56 逐位相同
+#   (这个上界来自 vime_bridge 的 _resolve_max_tokens:超过它的轨迹会被 batcher 丢弃,
+#    所以配更大无意义,配更小则是白扔能力)。冒烟靠的是 batch 降到生产的 1/4:
+#     ROLLOUT_BATCH_SIZE 8→4, N_SAMPLES_PER_PROMPT 8→4, GLOBAL_BATCH_SIZE 64→16。
+#   20260828 异构首跑违反了这条:把三件套压到 32768 想省显存,结果 64/64 个 session 在
+#   第 0 轮就被引擎打回 400 —— agent 的第 0 轮 prompt 已 20481 token,polar profile 的
+#   max_output_tokens=12288,相加 32769,比 32768 多 1。零 completion → 零可训 token →
+#   同步路径把每个组全拒掉并无限 top up,一个训练步都没进去。**长度存在硬下限,压它
+#   不是"少跑一点",而是直接让 agent 发不出第一个请求。**
 #
 # ⚠ judge 池是瓶颈:ROLLOUT_BATCH_SIZE×N_SAMPLES = 16 个 session 抢 4 张判题卡
 #   (npu_lease.pool)。这会**放大 polar/sync/tail_ratio**,别误读成"需要超订+abort"
@@ -81,9 +90,9 @@ FEAT_PD_DISAGG=0 \
 VLLM_SERVED_MODEL_NAME=/home/docker/Qwen3.6-35B-A3B \
 VLLM_GPU_MEM_UTIL=0.70 \
 MAX_TOKENS_PER_GPU=32768 \
-SEQ_LENGTH=131072 \
-ROLLOUT_MAX_CONTEXT_LEN=131072 \
-VLLM_MAX_MODEL_LEN=131072 \
+SEQ_LENGTH=262144 \
+ROLLOUT_MAX_CONTEXT_LEN=262144 \
+VLLM_MAX_MODEL_LEN=262144 \
 VIME_MEM_PROBE=1 \
 RAY_memory_usage_threshold=0.95 \
 no_proxy=127.0.0.1,localhost,80.48.5.52,.huawei.com,local,.local \
