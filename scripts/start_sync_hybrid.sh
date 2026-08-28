@@ -9,6 +9,14 @@
 #     HCCL 域,规避同域同卡约束);.64 引擎 HCCL 广播(world=1+12,与异步 PD 同构)。
 #   * FEAT_OFFLOAD=1:训推双侧 offload(训练窗口全部引擎 sleep;.56 引擎靠 needs_offload
 #     命中,.64 引擎不重叠不 sleep、常驻 —— 但网关被 prepare_policy_update 暂停,语义仍是同步)。
+#   * FEAT_SYNC_ROLLOUT=1:rollout 走同步一次性提交路径(generate_rollout_polar_sync)。
+#     此前这里配的是异步 worker:它的准入循环先取 partial group、取不到才检查 draining,
+#     配额一释放就投机开组,所以 generate() 返回时 polar 侧必然还有在飞 session,紧接着
+#     就 vLLM sleep —— 往睡着的引擎打请求 = 挂死 / OOM / no_completions。这是结构性的,
+#     调小 POLAR_MAX_ACTIVE_SESSIONS 消不掉,只能换路径。同步路径每组都 await 到终态,
+#     返回即零在飞;staleness ≡ 0,故 --use-tis 与 session_pool 四件套一并去掉
+#     (POLAR_MAX_ACTIVE_SESSIONS / POLAR_DRAIN_SESSIONS / POLAR_MAX_OFF_POLICY_STEPS
+#      对同步路径无意义,已从本脚本删除)。
 #
 # 前置(.64 手工):
 #   1) polar 推理端点 → http://80.48.5.56:8011;
@@ -59,12 +67,10 @@ TP=1 \
 PP=2 \
 POLAR_TRAJECTORY_PG_FLOOR=0.05 \
 POLAR_ROLLOUT_URL=http://80.48.5.64:8180 \
-POLAR_DRAIN_SESSIONS=0 \
-POLAR_MAX_OFF_POLICY_STEPS=0 \
+FEAT_SYNC_ROLLOUT=1 \
 VLLM_ROUTER_PORT=8011 \
 FEAT_TRAIN_EXPANDABLE=1 \
 VIME_EMPTY_CACHE_PER_STEP=1 \
-POLAR_MAX_ACTIVE_SESSIONS=64 \
 TRANSFORMERS_VERBOSITY=error \
 HCCL_INTER_HCCS_DISABLE=false \
 HCCL_INTRA_ROCE_ENABLE=1 \

@@ -237,9 +237,31 @@ TOPO_ARGS=(
    --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE}
 )
 
+# 训推共卡(同步)与分卡(异步)的 rollout 契约二选一。FEAT_SYNC_ROLLOUT=1 走同步
+# 一次性提交路径:每组都 await 到终态才返回,函数返回时零在飞 session,引擎才能安全
+# sleep。异步 worker 的准入循环先取 partial group、取不到才检查 draining,配额一释放
+# 就投机开组 —— 所以它返回时必然还有在飞,调小 max_active_sessions 也消不掉。
+# 同步路径 staleness ≡ 0,故 session_pool 四件套与 --use-tis 一并去掉(见下)。
+if [ "${FEAT_SYNC_ROLLOUT:-0}" = "1" ]; then
+   ROLLOUT_FN=vime_bridge.rollout.generate_rollout_polar_sync
+   # 同步路径不复用 session_pool 的准入/缓冲机制,这四个参数对它无意义。
+   SCHED_ARGS=(--rollout-sync-oversubscribe-factor "${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0}")
+   # staleness ≡ 0 由结构保证,off-policy 重要性采样校正失去用途。
+   TIS_ARGS=()
+else
+   ROLLOUT_FN=vime_bridge.rollout.generate_rollout_polar_async
+   SCHED_ARGS=(
+      --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
+      --rollout-scheduler-mode session_pool
+      --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
+      --rollout-release-on-postrun
+   )
+   TIS_ARGS=(--use-tis)
+fi
+
 ROLLOUT_ARGS=(
-   --rollout-function-path vime_bridge.rollout.generate_rollout_polar_async
-   --eval-function-path vime_bridge.rollout.generate_rollout_polar_async
+   --rollout-function-path "${ROLLOUT_FN}"
+   --eval-function-path "${ROLLOUT_FN}"
    --prompt-data "${OPERATOR_TASK_JSONL}"
    --input-key prompt
    --label-key label
@@ -288,11 +310,8 @@ POLAR_ARGS=(
    --polar-reward-key score
    --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
    --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
-   --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
    --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-9000}"
-   --rollout-scheduler-mode session_pool
-   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
-   --rollout-release-on-postrun
+   ${SCHED_ARGS[@]+"${SCHED_ARGS[@]}"}
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6}"
    ${DRAIN_ARGS[@]+"${DRAIN_ARGS[@]}"}
    ${STALENESS_ARGS[@]+"${STALENESS_ARGS[@]}"}
@@ -327,7 +346,7 @@ GRPO_ARGS=(
    #--kl-loss-type low_var_kl
    --entropy-coef 0.001
    --eps-clip 0.2
-   --use-tis
+   ${TIS_ARGS[@]+"${TIS_ARGS[@]}"}
 )
 # 共卡混合专属:同步期 trainer 与引擎同卡,512MB bucket 的 all_gather+IPC 瞬时块
 # 顶穿卡余量(20260824-142800 实锤 rank13 free 0.03G OOM),256MB 砍半。

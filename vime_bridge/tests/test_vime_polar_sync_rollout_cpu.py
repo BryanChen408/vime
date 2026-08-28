@@ -336,5 +336,64 @@ def test_async_entrypoint_still_uses_the_worker():
     assert "async_worker" in src, "the async path must still be driven by the background worker"
 
 
+# --------------------------------------------------------------------------
+# 9. launch-script contract: the runner is shared, so the switch must be gated
+# --------------------------------------------------------------------------
+REPO_ROOT = Path(R.__file__).resolve().parents[1]
+RUNNER = REPO_ROOT / "scripts" / "run-qwen36-35b-polar-multi-pd.sh"
+SYNC_START = REPO_ROOT / "scripts" / "start_sync_hybrid.sh"
+
+
+def _eval_rollout_contract(feat_sync: str) -> dict[str, str]:
+    """Evaluate the runner's FEAT_SYNC_ROLLOUT block for one setting."""
+    import subprocess
+
+    text = RUNNER.read_text(encoding="utf-8")
+    start = text.index('if [ "${FEAT_SYNC_ROLLOUT:-0}" = "1" ]; then')
+    end = text.index("\nfi\n", start) + len("\nfi\n")
+    block = text[start:end]
+    script = block + '\necho "FN=$ROLLOUT_FN"\necho "SCHED=${SCHED_ARGS[*]}"\necho "TIS=${TIS_ARGS[*]}"\n'
+    out = subprocess.run(
+        ["bash", "-c", script],
+        env={"FEAT_SYNC_ROLLOUT": feat_sync, "PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return dict(line.split("=", 1) for line in out.strip().splitlines())
+
+
+def test_runner_sync_branch_drops_the_async_only_knobs():
+    """staleness is 0 by construction, so off-policy correction must be off.
+
+    Leaving --use-tis or the session_pool knobs in place would apply an
+    importance-sampling correction against a ratio that is identically 1, and
+    would configure an admission pool the sync path never consults.
+    """
+    got = _eval_rollout_contract("1")
+    assert got["FN"] == "vime_bridge.rollout.generate_rollout_polar_sync"
+    assert got["TIS"] == "", "--use-tis has no meaning when staleness is 0"
+    assert "session_pool" not in got["SCHED"]
+    assert "--rollout-sync-oversubscribe-factor" in got["SCHED"]
+
+
+def test_runner_async_branch_is_unchanged():
+    """The runner is shared with start_pd.sh; the default must stay async."""
+    got = _eval_rollout_contract("0")
+    assert got["FN"] == "vime_bridge.rollout.generate_rollout_polar_async"
+    assert got["TIS"] == "--use-tis"
+    assert "--rollout-scheduler-mode session_pool" in got["SCHED"]
+    assert "--rollout-release-on-postrun" in got["SCHED"]
+
+
+def test_sync_hybrid_start_script_enables_the_sync_contract():
+    text = SYNC_START.read_text(encoding="utf-8")
+    assert "FEAT_SYNC_ROLLOUT=1" in text
+    # These configure the async worker's admission/staleness bookkeeping; the
+    # sync path has none, so leaving them here would misdescribe the run.
+    for stale_knob in ("POLAR_MAX_ACTIVE_SESSIONS=", "POLAR_DRAIN_SESSIONS=", "POLAR_MAX_OFF_POLICY_STEPS="):
+        assert stale_knob not in text, f"{stale_knob} is async-only and must not be set for a sync run"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-o", "addopts="]))
