@@ -15,6 +15,7 @@ if is_npu():
     from mindspeed.megatron_adaptor import repatch
 from megatron.core import mpu
 if is_npu():
+    from vime.utils.npu_training_state_offloader import NPUTrainingStateOffloader
     from vime.utils.npu_weight_offloader import NPUWeightOffloader
 else:
     from torch_memory_saver import torch_memory_saver
@@ -129,6 +130,16 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
+        # The flat-buffer offloader above releases model params/grads.  A
+        # colocated actor also needs the verl optimizer/scratch phase handoff:
+        # CPU-resident HDO state stays where it is, unique device state is
+        # preserved on CPU, and reconstructible Megatron caches are discarded.
+        # Keep disaggregated async actors on their established lifecycle.
+        self._training_state_offloader = None
+        if is_npu() and args.offload_train and self._rollout_shares_actor_devices:
+            self._training_state_offloader = NPUTrainingStateOffloader()
+            logger.info("NPU training-state offloader initialised for colocated actor")
+
         # [MEM PROBE] 模型/优化器一加载完就打 expandable 归属:重启后 ~1-2min 即可判定
         #   expandable_segments 是否**真激活**(env 进程里有但 torch_npu 可能静默回退 False)、
         #   以及是否覆盖 MindSpeed 全部分配——不必等首轮 rollout 到 train_one_step。
@@ -235,11 +246,16 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
-        destroy_process_groups()
-
         if is_npu():
+            # Move only unique device optimizer state before invalidating DDP
+            # flat-buffer storages. Reconstructible Megatron/TE caches are
+            # discarded here rather than copied to host.
+            if self._training_state_offloader is not None:
+                self._training_state_offloader.offload(self.optimizer)
+            destroy_process_groups()
             self._weight_offloader.offload(self.model)
         else:
+            destroy_process_groups()
             torch_memory_saver.pause()
 
         print_memory("after offload model")
@@ -256,6 +272,11 @@ class MegatronTrainRayActor(TrainRayActor):
             clear_memory()
             reload_process_groups()
             self._weight_offloader.onload(self.model)
+            # Model views must be valid before optimizer state is put back on
+            # its original device. Scratch buffers remain lazy and rebuild on
+            # the next Megatron forward.
+            if self._training_state_offloader is not None:
+                self._training_state_offloader.onload(self.optimizer)
         else:
             torch_memory_saver.resume()
             clear_memory()

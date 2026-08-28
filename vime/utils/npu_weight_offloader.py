@@ -22,10 +22,12 @@ Why storage-resize (design history):
 A/B modes (env ``VIME_OFFLOAD_PARAM_BUFFER``, retained for compatibility):
   "0" (default, A): release ``grad_data`` only (fp32, ~9GB/rank @ 9B/TP4);
       ``param_data`` stays on NPU for direct IPC export.
-  "1" (B): release ``param_data`` + ``grad_data``. Rollout-stage training
-      residue ≈ 0 — required when rollout shares the actor's devices. Actor
+  "1" (B): release ``param_data`` + ``grad_data``. The model flat-buffer
+      residue is ≈ 0 — required when rollout shares the actor's devices. Actor
       callers reuse their already-present CPU weights, so this mode does not
-      allocate a second model-sized host backup.
+      allocate a second model-sized host backup. Colocated actors pair it with
+      ``NPUTrainingStateOffloader`` for optimizer state and rebuildable global
+      scratch buffers created after the first real training step.
 
 Measured (Qwen3.5-0.8B, 4×910B3, colocate): v1 left 4.5GB allocated during
 rollout with 0 physically freed; A leaves 1.4GB; B leaves 0.0GB with training
