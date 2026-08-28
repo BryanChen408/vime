@@ -29,6 +29,13 @@
 #   2) 本脚本:
 #        NUM_ROLLOUT=2 bash scripts/start_sync_homo_single52.sh
 #
+# ⚠ **上下文长度有硬下限,不能当省显存的旋钮**。20260828 异构首跑把 SEQ_LENGTH /
+#   ROLLOUT_MAX_CONTEXT_LEN / VLLM_MAX_MODEL_LEN 压到 32768,64/64 个 session 在第 0 轮
+#   就被引擎打回 400:agent 的第 0 轮 prompt 已 20481 token,polar profile 的
+#   max_output_tokens=12288,相加 32769 —— 比 32768 多 1。零 completion → 零可训 token
+#   → 同步路径把每个组全拒掉并无限 top up。故取 runner 默认 131072(生产 .56 用 262144)。
+#   上界 = _resolve_max_tokens = MAX_TOKENS_PER_GPU × CP = 32768 × 8 = 262144,131072 在内。
+#
 # ⚠ judge 池是瓶颈:ROLLOUT_BATCH_SIZE×N_SAMPLES = 16 个 session 抢 4 张判题卡
 #   (npu_lease.pool)。这会**放大 polar/sync/tail_ratio**,别误读成"需要超订+abort"
 #   —— 那是判题池串行化,不是生成长尾。区分:看 group_seconds_min 是否也被拖长。
@@ -74,9 +81,9 @@ FEAT_PD_DISAGG=0 \
 VLLM_SERVED_MODEL_NAME=/home/docker/Qwen3.6-35B-A3B \
 VLLM_GPU_MEM_UTIL=0.70 \
 MAX_TOKENS_PER_GPU=32768 \
-SEQ_LENGTH=32768 \
-ROLLOUT_MAX_CONTEXT_LEN=32768 \
-VLLM_MAX_MODEL_LEN=32768 \
+SEQ_LENGTH=131072 \
+ROLLOUT_MAX_CONTEXT_LEN=131072 \
+VLLM_MAX_MODEL_LEN=131072 \
 VIME_MEM_PROBE=1 \
 RAY_memory_usage_threshold=0.95 \
 no_proxy=127.0.0.1,localhost,80.48.5.52,.huawei.com,local,.local \

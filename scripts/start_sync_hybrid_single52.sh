@@ -12,10 +12,20 @@
 # IPC/HCCL 分叉,也测不到 _offload_engine_indices 的部分 sleep。异构才是这批
 # 改动的真实覆盖面。
 #
-# ⚠ 训练卡数从 .56 的 16 砍到 8,**每 rank 承担的参数翻倍**。若首训步 OOM,优先降
-#   SEQ_LENGTH(已预置 32K,可再降),其次动并行度或换小模型 —— 不要靠调低
-#   VLLM_GPU_MEM_UTIL 硬凑:训练窗口里共卡引擎全在睡,调它对训练侧毫无帮助,
-#   只会把爆点挪到后面 KV 唤醒时。
+# ⚠ 训练卡数从 .56 的 16 砍到 8,**每 rank 承担的参数翻倍**。若首训步 OOM,先动并行度
+#   或换小模型 —— 不要靠调低 VLLM_GPU_MEM_UTIL 硬凑:训练窗口里共卡引擎全在睡,调它
+#   对训练侧毫无帮助,只会把爆点挪到后面 KV 唤醒时。
+#
+# ⚠ **上下文长度有硬下限,不能当省显存的旋钮**。20260828 首跑把这三个值压到 32768,
+#   结果 64/64 个 session 在第 0 轮就被引擎打回 400:
+#     "maximum context length is 32768 ... requested 12288 output tokens and your
+#      prompt contains at least 20481 input tokens, for a total of at least 32769"
+#   agent 的第 0 轮 prompt(system + skills + 算子任务)已 20481 token,polar profile 的
+#   max_output_tokens=12288,两者相加 32769 —— 比 32768 多 1。零 completion → 零可训
+#   token → 同步路径把每个组都拒掉并无限 top up。50 轮累积远不止这个数,所以取 runner
+#   默认 131072(生产 .56 用 262144)。
+#   上界由训练侧决定:vime_bridge 的 _resolve_max_tokens = MAX_TOKENS_PER_GPU × CP
+#   = 32768 × 4 = 131072,超过它的轨迹会被 batcher 丢弃,所以配更大没有意义。
 #
 # 训练并行度:TP2 × PP1 × CP4 = 8 rank,恰好占满 actor 的 4-11 八卡(EP8 在 8 rank 上切专家)。
 #   runner 默认 CP8(为 .56 的 16 卡准备),8 卡必须改 CP4,否则乘积对不上卡数。
@@ -78,9 +88,9 @@ VLLM_SERVED_MODEL_NAME=/home/docker/Qwen3.6-35B-A3B \
 VLLM_GPU_MEM_UTIL=0.70 \
 VLLM_GPU_MEM_UTIL_DEDICATED=0.85 \
 MAX_TOKENS_PER_GPU=32768 \
-SEQ_LENGTH=32768 \
-ROLLOUT_MAX_CONTEXT_LEN=32768 \
-VLLM_MAX_MODEL_LEN=32768 \
+SEQ_LENGTH=131072 \
+ROLLOUT_MAX_CONTEXT_LEN=131072 \
+VLLM_MAX_MODEL_LEN=131072 \
 VIME_MEM_PROBE=1 \
 RAY_memory_usage_threshold=0.95 \
 no_proxy=127.0.0.1,localhost,80.48.5.52,.huawei.com,local,.local \
