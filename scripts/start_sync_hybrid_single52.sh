@@ -46,6 +46,22 @@
 #   * handoff:rollout 0 after train offload 的 non_torch 占比 —— 决定 util 天花板
 #     和 Phase C(TMS)值不值得做。
 # ─────────────────────────────────────────────────────────────────────────────
+# 清掉上一轮崩溃残留的 LB proxy。它由 rollout.py:_start_lb_proxy 用裸
+# subprocess.Popen 起,driver 一崩就被 init 收养、继续占着端口,而 `ray stop --force`
+# 管不到它(不是 Ray actor)。注意不能用 fuser/lsof —— 本机都没装,静默无操作。
+_LB_PORT="${VLLM_ROUTER_PORT:-8001}"
+pkill -f "vime\.ray\.lb_proxy .*--port ${_LB_PORT}" 2>/dev/null || true
+pkill -f "dp_load_balance_proxy_server.*${_LB_PORT}" 2>/dev/null || true
+for _ in 1 2 3 4 5; do
+   ss -tln 2>/dev/null | grep -q ":${_LB_PORT} " || break
+   sleep 1
+done
+if ss -tln 2>/dev/null | grep -q ":${_LB_PORT} "; then
+   echo "[start_sync_hybrid][FATAL] 端口 ${_LB_PORT} 仍被占用,LB proxy 起不来:" >&2
+   ss -tlnp 2>/dev/null | grep ":${_LB_PORT} " >&2
+   exit 1
+fi
+
 ASCEND_RT_VISIBLE_DEVICES=4,5,6,7,8,9,10,11,12,13,14,15 \
 CURRENT_IP=80.48.5.52  MASTER_ADDR=80.48.5.52  NNODES=1  NPUS_PER_NODE=12  SOCKET_IFNAME=ens1f3 \
 ACTOR_NUM_NODES=1 \

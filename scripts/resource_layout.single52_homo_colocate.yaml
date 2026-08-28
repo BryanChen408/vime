@@ -1,0 +1,43 @@
+# 单机 16 卡(.52)**同构**共卡 —— 训推完全重合,同步 train.py 用。
+#
+# 与 resource_layout.single52_hybrid_colocate.yaml(异构)的取舍:
+#   同构:6 台引擎全部共卡、全走 IPC、全 sleep。三处共卡判据(引擎侧 backend /
+#        权重通道 / offload 名单)天然一致,不触发 T4 单机异构的判据分叉 bug
+#        (见 docs/design/colocate_topology_robustness_plan.md §1)。
+#   异构:多覆盖混合更新器的 IPC/HCCL 分叉与部分 sleep,但单机下当前会崩。
+#   → 先跑同构验证同步 rollout 链路,异构等 P0/P1/P2 修完再上。
+#
+# 卡位(物理卡号):
+#   0-3    polar agent + judge —— **有训练常驻、无引擎**的 4 张
+#   0-15   actor 训练(16 卡)
+#   4-15   rollout 共卡段:6 个 TP2 引擎,训练窗口 sleep,权重走 NPU IPC
+#
+# ⚠ polar 的 0-3 与 actor 重叠,**layout 里无法声明**:_validate_layout 只允许
+#   rollout 且 share=actor 的条目与 actor 重叠,polar_reserved 重叠会直接 raise。
+#   故本文件省掉 polar_reserved 角色 —— 代价是那 4 张卡**失去冲突校验**,
+#   polar profile 里 npu_lease.pool 写错(比如写成 4-7)不会有任何报错,
+#   直接和引擎抢卡。改 pool 前请回头看这段。
+#
+# 为什么 polar 必须落在 0-3 而不是别的卡:
+#   rollout 窗口里 4-15 每张都压着引擎(util 0.70 ≈ 43G)+ 训练残留,几乎没余量;
+#   0-3 只有训练残留(~10G),空闲 ~50G,judge 编译/跑算子才够用。
+#
+# polar 与训练共卡为什么安全:由**同步路径**保证 —— generate() 返回时所有 polar
+#   task 已达终态(含 judge),而 offload/训练发生在其后,judge 与训练天然不重叠。
+#   异步 worker 下投机开的组可能跨进训练窗口,那时这个卡位是不成立的。
+#
+# HCCS 域(910 单机:0-7 为域 A,8-15 为域 B):
+#   share 段拆 4-7 / 8-15 两条,保证 TP2 配对不跨域 —— 配对按列表顺序两两切分,
+#   写成一条 "4-15" 会得到 (4,5)(6,7)(8,9)... 当前也不跨域,但 num_gpus_per_engine
+#   一旦改成 4 就会出现 (6,7,8,9) 跨域。拆开是防御性的。
+#
+# 顺序约定(代码强制):共卡段(share=actor)必须写在 rollout 列表最前;
+# 共卡设备必须 ⊆ actor。本布局全是共卡段,无专用段。
+roles:
+  actor:
+    - {node: 80.48.5.52, devices: "0-15"}
+  rollout:
+    - {node: 80.48.5.52, devices: "4-7", share: actor}     # 2 台共卡引擎(HCCS 域 A)
+    - {node: 80.48.5.52, devices: "8-15", share: actor}    # 4 台共卡引擎(HCCS 域 B)
+rollout:
+  num_gpus_per_engine: 2                 # 共 6 个 TP2 引擎,全部共卡
