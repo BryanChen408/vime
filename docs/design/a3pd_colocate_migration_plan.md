@@ -95,14 +95,18 @@ A0 → A1 → A2 → A3 顺序依赖。
 
 **现状**：`start_sync_hybrid.sh` 入口是 `train.py`（同步），但 rollout 函数仍是 `generate_rollout_polar_async`（经 `run-qwen36-35b-polar-multi-pd.sh:241`），并带 `--rollout-scheduler-mode session_pool`、`--rollout-max-async-level`、`--use-tis`、`POLAR_DRAIN_SESSIONS=0`。同步循环配异步 worker ⇒ `generate()` 返回时 polar 侧仍有在飞 session，紧接着 vLLM sleep。
 
-| # | Commit | 内容 |
-|---|---|---|
-| B1 | `refactor(bridge): lift task rejection check to module scope` | `_task_rejection_reason` 提升到模块级，worker 方法改为一行委托。行为逐位相同 |
-| B2 | `feat(bridge): add synchronous one-shot polar rollout path` | `_submit_train_groups` + `generate_rollout_polar_sync` + `--rollout-sync-oversubscribe-factor`（默认 1.0）+ `_abort_inflight` no-op 占位；补数逻辑不可省 |
-| B3 | `test(bridge): cover sync rollout path and async non-regression` | 设计文档 §5.3 的 7 项，含「同步路径调用图不含 `AsyncPolarRolloutWorker`」的静态断言 |
-| B4 | `feat(scripts): give the sync hybrid run a synchronous rollout contract` | 切 `..._sync`；去 `--use-tis` / session_pool 四件套 / `max-async-level` |
+| # | Commit | 内容 | 状态 |
+|---|---|---|---|
+| B1 | `refactor(bridge): _task_rejection_reason 提升到模块级` | 函数体不使用 `self`，提升后同步路径复用同一套结构性判据；worker 方法改为一行委托，行为逐位相同 | ✅ `4e844d1f` |
+| B2 | `feat(bridge): 新增同步一次性 polar rollout 路径` | `_submit_train_groups` 等价物 `_run_sync_train_rollout` + `_run_sync_train_group` + `generate_rollout_polar_sync` + `--rollout-sync-oversubscribe-factor` + `_abort_inflight` no-op 占位 + 带上限的补数逻辑 | ✅ `a8107641` |
+| B3 | `test(bridge): 覆盖同步 rollout 路径与异步非回归` | 16 项 CPU 测试；隔离断言经注入验证非空 | ✅ `b54262cb` |
+| B4 | `feat(scripts): 混合同步 run 切到同步 rollout 契约` | `FEAT_SYNC_ROLLOUT` 门控（runner 被 4 个 start 脚本共用）+ 3 项脚本契约测试 | ✅ `d039ed14` |
 
-B1 必须先于 B2。B4 依赖 B2。
+B1 必须先于 B2；B4 依赖 B2。
+
+**移植时确认过的事**：同步路径依赖的 14 个模块级积木在 a3-pd 上全部存在且签名逐个吻合（`_build_submission_payload` / `_attach_scheduler_metadata` / `_submit_and_wait_for_task` / `_submit_payload_in_chunks` / `_convert_task_result_to_samples` / `_resolve_max_tokens` / `_has_trainable_tokens` / `_low_complete_accept_fraction_rejection_reason` / `_pull_sample_groups` / `_extract_sample_reward` / `_polar_extra_metrics` / `_load_rollout_train_output_type` / `_run_eval_rollout` / `resolve_polar_slime_config`），无需适配层。
+
+**留在异步侧未动的两项**：`POLAR_DRAIN_SESSIONS` 与 `POLAR_MAX_OFF_POLICY_STEPS` 仍由 runner 的 `DRAIN_ARGS` / `STALENESS_ARGS` 构造并传给两条路径。它们经 `resolve_polar_slime_config` 进 config，但同步路径从不查 staleness、也没有 in-flight session 可 drain，故为无害的死参数。要彻底清掉需动 runner 里与异步共用的分支，超出 B4 范围。
 
 ### Phase C — offload 后端可选
 
