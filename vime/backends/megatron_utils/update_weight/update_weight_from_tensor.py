@@ -159,6 +159,55 @@ def count_colocated_engines(
     return colocate_engine_nums
 
 
+def _resolve_colocated_engine_count(
+    args, engine_gpu_offsets: Sequence[int], engine_gpu_counts: Sequence[int]
+) -> int:
+    """共卡(IPC)引擎数,优先取自单一真源 ``resolve_engine_roles``。
+
+    ``count_colocated_engines`` 按「槽位是否 < 总 actor 卡数」判定,该判据隐含
+    「share 段覆盖 actor 全部卡」。部分共卡布局(share 8 < actor 16、专用段在另一
+    节点)下远程引擎的槽位仍小于 actor 卡数 → 被误判成共卡 → 对远程引擎尝试 IPC
+    直传。真源按 ``(node, device)`` 集合包含判定,不受此影响。
+
+    按 ``gpu_slot`` 对齐:``ServerGroup.engine_gpu_offsets`` 与真源的 ``gpu_slot``
+    用同一个公式(``gpu_offset + j * num_gpus_per_engine``),故键天然对应,且
+    placeholder 组占掉的槽位不会错位。
+
+    真源用单一 ``args.rollout_num_gpus_per_engine`` 铺槽位,而 PD 的多 group 每组
+    引擎卡数可以不同 —— 那种布局下槽位对不上,覆盖不全时退回原判据。这是安全的:
+    per-group 卡数不一致的布局都是纯分离(无 share),原判据在其上本就正确。
+    """
+    from vime.ray.engine_roles import (
+        EngineRole,
+        EngineRoleError,
+        colocated_prefix_count,
+        resolve_engine_roles,
+    )
+
+    total_actor_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    try:
+        colocation = {role.gpu_slot: role.colocated for role in resolve_engine_roles(args)}
+    except EngineRoleError as e:
+        logger.warning("resolve_engine_roles failed (%s); falling back to slot-range heuristic", e)
+        return count_colocated_engines(engine_gpu_offsets, engine_gpu_counts, total_actor_gpus)
+
+    verdicts = [colocation.get(offset) for offset in engine_gpu_offsets]
+    if any(verdict is None for verdict in verdicts):
+        missing = [o for o, v in zip(engine_gpu_offsets, verdicts, strict=True) if v is None]
+        logger.info(
+            "engine roles do not cover GPU slots %s (heterogeneous per-group engine sizes); "
+            "falling back to slot-range heuristic",
+            missing,
+        )
+        return count_colocated_engines(engine_gpu_offsets, engine_gpu_counts, total_actor_gpus)
+
+    roles = tuple(
+        EngineRole(index=i, gpu_slot=offset, placement=(), colocated=bool(verdict))
+        for i, (offset, verdict) in enumerate(zip(engine_gpu_offsets, verdicts, strict=True))
+    )
+    return colocated_prefix_count(roles)
+
+
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
@@ -232,9 +281,9 @@ class UpdateWeightFromTensor:
                 engine_gpu_offsets.append(offset)
                 offset += c
 
-        # Compute colocated engine count: engines whose GPUs fall within actor GPU range.
-        total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
-        colocate_engine_nums = count_colocated_engines(engine_gpu_offsets, engine_gpu_counts, total_actor_gpus)
+        colocate_engine_nums = _resolve_colocated_engine_count(
+            self.args, engine_gpu_offsets, engine_gpu_counts
+        )
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
 
