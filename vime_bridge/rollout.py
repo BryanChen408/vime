@@ -221,10 +221,10 @@ def prepare_policy_update(args: Any, policy_version: int) -> dict[str, Any]:
         #     unprotected exactly when there is most in-flight work to protect it from.
         #   * Synchronous (colocate) training has no overlap window at all: the engines sleep
         #     for the entire training step, so waiting for sessions only stalls training.
-        #     --no-polar-weight-update-drain-sessions skips the wait and abandons whatever is
-        #     in flight to the version-span guard (the gateway rejects a continuation whose
-        #     turn would cross the update), which comes back as an ERROR trajectory that
-        #     adapter.py excludes from training.
+        #     --no-polar-weight-update-drain-sessions skips the wait. After the serving-engine
+        #     abort is confirmed, commit_policy_update_boundary explicitly detaches every
+        #     old-policy task from the local scheduler; Polar's version-span guard remains the
+        #     remote backstop for a continuation that reaches the gateway after the update.
         if bool(getattr(args, "polar_weight_update_drain_sessions", True)):
             timeout_seconds = float(getattr(args, "polar_weight_update_pause_timeout", 300.0))
             try:
@@ -256,6 +256,14 @@ def commit_policy_update_boundary(args: Any, policy_version: int) -> dict[str, A
         timeout_seconds=timeout_seconds,
         require_drained=True,
     )
+    if not bool(getattr(args, "polar_weight_update_drain_sessions", True)):
+        with _worker_lock:
+            worker = _global_async_worker
+        if worker is not None and worker.config.scheduler_mode == "session_pool":
+            worker.abandon_policy_versions_before(
+                policy_version,
+                timeout=timeout_seconds,
+            )
     if not push_policy_version_to_gateway(args, policy_version):
         raise PolarRolloutSchedulerError(
             f"Failed to publish Polar policy_version={policy_version} while admission "
@@ -1079,6 +1087,10 @@ class AsyncPolarRolloutWorker:
         self._policy_update_drain_started_at: float | None = None
         self._policy_update_drain_complete = threading.Event()
         self._policy_update_drain_complete.set()
+        self._policy_cutoff_requested: int | None = None
+        self._policy_cutoff_applied = self._policy_version
+        self._policy_cutoff_complete = threading.Event()
+        self._policy_cutoff_complete.set()
         self._session_pool_open_groups = 0
         self._session_pool_owned_groups = 0
         self._session_pool_partial_open_groups = 0
@@ -1143,6 +1155,48 @@ class AsyncPolarRolloutWorker:
                 "Timed out waiting for Polar session_pool scheduler to drain "
                 "open groups before policy update"
             )
+
+    def abandon_policy_versions_before(
+        self,
+        policy_version: int,
+        *,
+        timeout: float | None,
+    ) -> None:
+        """Detach scheduler-owned work that cannot cross a no-drain boundary.
+
+        The session-pool dictionaries live on the worker's asyncio thread. The Ray actor
+        thread therefore only publishes a cutoff request and waits for that thread to apply
+        it. This is deliberately completed before the gateway policy version advances.
+        """
+        target = int(policy_version)
+        if not self.is_alive():
+            raise PolarRolloutSchedulerError(
+                "Cannot abandon old Polar policy work because the async rollout worker "
+                "is not running"
+            )
+        with self._state_lock:
+            if target <= self._policy_cutoff_applied:
+                return
+            if not self._policy_update_draining:
+                raise PolarRolloutSchedulerError(
+                    "Cannot abandon old Polar policy work while session-pool admission "
+                    "is open"
+                )
+            requested = self._policy_cutoff_requested
+            self._policy_cutoff_requested = target if requested is None else max(requested, target)
+            self._policy_cutoff_complete.clear()
+
+        if not self._policy_cutoff_complete.wait(timeout=timeout):
+            raise PolarRolloutSchedulerError(
+                f"Timed out waiting for local Polar scheduler policy cutoff < {target}"
+            )
+        self.raise_if_failed()
+        with self._state_lock:
+            if self._policy_cutoff_applied < target:
+                raise PolarRolloutSchedulerError(
+                    f"Local Polar scheduler cutoff stopped at {self._policy_cutoff_applied}; "
+                    f"required {target}"
+                )
 
     def finish_policy_update_drain(self) -> None:
         with self._state_lock:
@@ -1341,6 +1395,12 @@ class AsyncPolarRolloutWorker:
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 while self._running:
+                    await self._apply_pending_session_pool_policy_cutoff(
+                        active,
+                        run_pending,
+                        next_status_poll_at,
+                        open_groups,
+                    )
                     done = [t for t in active if t.done()]
                     for task in done:
                         unit = active.pop(task)
@@ -1481,6 +1541,89 @@ class AsyncPolarRolloutWorker:
             except asyncio.TimeoutError:
                 logger.warning("Callback listener did not shut down within 5s")
         logger.info("Async Polar session-pool rollout worker stopped")
+
+    async def _apply_pending_session_pool_policy_cutoff(
+        self,
+        active: dict[asyncio.Task[TaskResult], _PendingSessionUnit],
+        run_pending: set[str],
+        next_status_poll_at: dict[str, float],
+        open_groups: dict[int, _SessionGroupAccumulator],
+    ) -> None:
+        with self._state_lock:
+            target = self._policy_cutoff_requested
+        if target is None:
+            return
+
+        cancelled_tasks: list[asyncio.Task[TaskResult]] = []
+        abandoned_group_ids = {
+            group_id
+            for group_id, accumulator in open_groups.items()
+            if accumulator.policy_version < target
+        }
+        abandoned_open_sessions = sum(
+            open_groups[group_id].group_size for group_id in abandoned_group_ids
+        )
+
+        for task, unit in list(active.items()):
+            if unit.policy_version >= target:
+                continue
+            active.pop(task, None)
+            self._release_session_pool_run_pending(
+                run_pending,
+                next_status_poll_at,
+                unit.task_id,
+            )
+            task.cancel()
+            cancelled_tasks.append(task)
+
+        for group_id in abandoned_group_ids:
+            open_groups.pop(group_id, None)
+
+        abandoned_ready_groups = 0
+        removed_ready_sessions = 0
+        with self._state_lock:
+            for group_id, ready in list(self._ready_groups.items()):
+                completed = ready.completed
+                if completed is not None and completed.policy_version >= target:
+                    continue
+                self._ready_groups.pop(group_id, None)
+                if completed is not None:
+                    abandoned_ready_groups += 1
+                    removed_ready_sessions += completed.session_count
+            self._ready_group_count = len(self._ready_groups)
+
+        if cancelled_tasks:
+            await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+
+        abandoned_groups = len(abandoned_group_ids) + abandoned_ready_groups
+        abandoned_sessions = abandoned_open_sessions + removed_ready_sessions
+        self._inc_metric("polar/dropped_groups", abandoned_groups)
+        self._inc_metric("polar/dropped_sessions", abandoned_sessions)
+        self._inc_metric("polar/session_pool/policy_cutoff_groups", abandoned_groups)
+        self._inc_metric("polar/session_pool/policy_cutoff_sessions", abandoned_sessions)
+        self._inc_metric("polar/session_pool/policy_cutoff_cancelled_polls", len(cancelled_tasks))
+        self._record_session_pool_counts(active, run_pending, open_groups)
+
+        with self._state_lock:
+            self._policy_cutoff_applied = max(self._policy_cutoff_applied, target)
+            if (
+                self._policy_cutoff_requested is not None
+                and self._policy_cutoff_requested <= self._policy_cutoff_applied
+            ):
+                self._policy_cutoff_requested = None
+            if self._policy_cutoff_requested is None:
+                self._policy_cutoff_complete.set()
+
+        logger.info(
+            "Applied local Polar policy cutoff < %d: groups=%d sessions=%d "
+            "cancelled_polls=%d remaining_open=%d remaining_ready=%d",
+            target,
+            abandoned_groups,
+            abandoned_sessions,
+            len(cancelled_tasks),
+            len(open_groups),
+            self._ready_group_count,
+        )
 
     async def _start_callback_listener(self) -> tuple[uvicorn.Server, asyncio.Task[None]]:
         """Bind a FastAPI listener for TaskResult callbacks."""
