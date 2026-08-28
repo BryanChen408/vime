@@ -2641,6 +2641,10 @@ class _SyncGroupOutcome:
     samples: list[Any] | None = None
     task_result: TaskResult | None = None
     rejection_reason: str | None = None
+    # Wall-clock from submission to terminal state. Under strict synchronous
+    # collection the step lasts as long as the slowest group, so the spread of
+    # these is the direct measure of what oversubscribe+abort would buy.
+    elapsed: float = 0.0
 
 
 @dataclass(slots=True)
@@ -2698,6 +2702,7 @@ async def _run_sync_train_group(
     Applies the same acceptance checks the async worker uses, but reports a
     rejection instead of raising so the caller can top up and keep going.
     """
+    group_started = time.monotonic()
     payload = _build_submission_payload(
         args=args,
         config=config,
@@ -2736,7 +2741,11 @@ async def _run_sync_train_group(
 
     def _reject(reason: str) -> _SyncGroupOutcome:
         return _SyncGroupOutcome(
-            group=group, accepted=False, task_result=task_result, rejection_reason=reason
+            group=group,
+            accepted=False,
+            task_result=task_result,
+            rejection_reason=reason,
+            elapsed=time.monotonic() - group_started,
         )
 
     reason = _task_rejection_reason(task_result, group)
@@ -2755,8 +2764,40 @@ async def _run_sync_train_group(
         return _reject(reason)
 
     return _SyncGroupOutcome(
-        group=group, accepted=True, samples=samples, task_result=task_result
+        group=group,
+        accepted=True,
+        samples=samples,
+        task_result=task_result,
+        elapsed=time.monotonic() - group_started,
     )
+
+
+def _sync_group_latency_metrics(group_seconds: list[float]) -> dict[str, float]:
+    """Per-group latency spread — the cost side of strict synchronous collection.
+
+    A synchronous step lasts as long as its slowest group, while every group
+    that finished earlier leaves its share of the pool idle for the remainder of
+    the window. ``tail_ratio`` (max/median) is how much of the step is spent
+    waiting on stragglers, and therefore the direct measure of what the future
+    "saturated pool + abort" mode (``--rollout-sync-oversubscribe-factor`` > 1)
+    could recover. Near 1.0 means there is nothing to win and the seam can stay
+    unimplemented.
+    """
+    if not group_seconds:
+        return {}
+    ordered = sorted(group_seconds)
+    median = statistics.median(ordered)
+    slowest = ordered[-1]
+    # Nearest-rank p90; with the handful of groups a rollout step submits this
+    # is more honest than interpolating between two samples.
+    p90 = ordered[min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1)]
+    return {
+        "polar/sync/group_seconds_max": float(slowest),
+        "polar/sync/group_seconds_median": float(median),
+        "polar/sync/group_seconds_min": float(ordered[0]),
+        "polar/sync/group_seconds_p90": float(p90),
+        "polar/sync/tail_ratio": float(slowest / median) if median > 0 else 0.0,
+    }
 
 
 async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) -> Any:
@@ -2788,6 +2829,7 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
 
     timeout = None if config.request_timeout is None else httpx.Timeout(config.request_timeout)
     accepted: list[_SyncGroupOutcome] = []
+    group_seconds: list[float] = []
     rejected = 0
     surplus = 0
     topup_rounds = 0
@@ -2851,6 +2893,7 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
                     )
                     continue
                 outcome = task.result()
+                group_seconds.append(outcome.elapsed)
                 if not outcome.accepted:
                     rejected += 1
                     logger.warning(
@@ -2887,6 +2930,7 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
         "polar/sync/requeued_groups": float(abort_stats.requeued_groups),
         "polar/sync/elapsed_seconds": elapsed,
     })
+    metrics.update(_sync_group_latency_metrics(group_seconds))
 
     RolloutFnTrainOutput = _load_rollout_train_output_type()
     return RolloutFnTrainOutput(samples=data, metrics=metrics)

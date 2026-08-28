@@ -83,18 +83,28 @@ def stub_output(monkeypatch):
     monkeypatch.setattr(R, "_extract_sample_reward", lambda s, key: 1.0)
 
 
-def _script_groups(monkeypatch, script):
-    """Drive ``_run_sync_train_group`` from a list: True=accept, False=reject, 'raise'=error."""
+def _script_groups(monkeypatch, script, seconds=None):
+    """Drive ``_run_sync_train_group`` from a list: True=accept, False=reject, 'raise'=error.
+
+    ``seconds`` optionally assigns each scripted group a fake wall-clock, so the
+    latency-spread metrics can be asserted without real waiting.
+    """
     seq = iter(script)
+    durations = iter(seconds) if seconds is not None else None
 
     async def fake_group(*, client, args, config, rollout_id, group, group_id):
         verdict = next(seq)
+        elapsed = next(durations) if durations is not None else 0.0
         await asyncio.sleep(0)
         if verdict == "raise":
             raise RuntimeError("injected transport failure")
         if verdict:
-            return R._SyncGroupOutcome(group=group, accepted=True, samples=[SimpleNamespace(i=group_id)])
-        return R._SyncGroupOutcome(group=group, accepted=False, rejection_reason="injected reject")
+            return R._SyncGroupOutcome(
+                group=group, accepted=True, samples=[SimpleNamespace(i=group_id)], elapsed=elapsed
+            )
+        return R._SyncGroupOutcome(
+            group=group, accepted=False, rejection_reason="injected reject", elapsed=elapsed
+        )
 
     monkeypatch.setattr(R, "_run_sync_train_group", fake_group)
 
@@ -334,6 +344,45 @@ def test_sync_entrypoint_delegates_eval_to_the_existing_batch():
 def test_async_entrypoint_still_uses_the_worker():
     src = inspect.getsource(R.generate_rollout_polar_async)
     assert "async_worker" in src, "the async path must still be driven by the background worker"
+
+
+# --------------------------------------------------------------------------
+# 8b. latency spread: the cost side of strict synchronous collection
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("seconds", "expect_max", "expect_median", "expect_tail"),
+    [
+        ([10.0, 10.0, 10.0, 10.0], 10.0, 10.0, 1.0),  # flat: nothing to win
+        ([5.0, 5.0, 5.0, 60.0], 60.0, 5.0, 12.0),  # one straggler owns the step
+    ],
+)
+def test_group_latency_spread_is_reported(
+    monkeypatch, stub_output, seconds, expect_max, expect_median, expect_tail
+):
+    """tail_ratio is what decides whether oversubscribe+abort is worth building.
+
+    A synchronous step lasts as long as its slowest group; every group that
+    finished earlier leaves its share of the pool idle for the rest of the
+    window. Without this number, "should we implement the abort seam" stays a
+    judgement call instead of a measurement.
+    """
+    _script_groups(monkeypatch, [True] * len(seconds), seconds=seconds)
+    out = asyncio.run(R._run_sync_train_rollout(_args(rollout_batch_size=len(seconds)), 3, FakeDataSource()))
+
+    assert out.metrics["polar/sync/group_seconds_max"] == expect_max
+    assert out.metrics["polar/sync/group_seconds_median"] == expect_median
+    assert out.metrics["polar/sync/tail_ratio"] == pytest.approx(expect_tail)
+
+
+def test_rejected_groups_count_toward_the_latency_spread():
+    """A rejected group still consumed a slot for its whole duration."""
+    metrics = R._sync_group_latency_metrics([1.0, 2.0, 99.0])
+    assert metrics["polar/sync/group_seconds_max"] == 99.0
+    assert metrics["polar/sync/group_seconds_min"] == 1.0
+
+
+def test_latency_metrics_are_absent_when_no_group_completed():
+    assert R._sync_group_latency_metrics([]) == {}
 
 
 # --------------------------------------------------------------------------
