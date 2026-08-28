@@ -14,9 +14,12 @@
 #     配额一释放就投机开组,所以 generate() 返回时 polar 侧必然还有在飞 session,紧接着
 #     就 vLLM sleep —— 往睡着的引擎打请求 = 挂死 / OOM / no_completions。这是结构性的,
 #     调小 POLAR_MAX_ACTIVE_SESSIONS 消不掉,只能换路径。同步路径每组都 await 到终态,
-#     返回即零在飞;staleness ≡ 0,故 --use-tis 与 session_pool 四件套一并去掉
-#     (POLAR_MAX_ACTIVE_SESSIONS / POLAR_DRAIN_SESSIONS / POLAR_MAX_OFF_POLICY_STEPS
-#      对同步路径无意义,已从本脚本删除)。
+#     返回即零在飞;session_pool 四件套随之去掉(POLAR_MAX_ACTIVE_SESSIONS /
+#     POLAR_DRAIN_SESSIONS / POLAR_MAX_OFF_POLICY_STEPS 对同步路径无意义,已删)。
+#     ⚠ --use-tis **保持开启**:它对的是训推数值失配(引擎 logprob vs 训练重算),
+#       与 staleness 无关,同步化不构成关它的理由。要关显式设 POLAR_DISABLE_TIS=1。
+#     ⚠ 成本:一步 = 最慢一组的时延,窗口内不补位。看日志 polar/sync/tail_ratio,
+#       明显 >1 说明尾部在空转,需要超订+abort(先补 --polar-gateway-url)才能回收。
 #
 # 前置(.64 手工):
 #   1) polar 推理端点 → http://80.48.5.56:8011;

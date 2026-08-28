@@ -246,8 +246,6 @@ if [ "${FEAT_SYNC_ROLLOUT:-0}" = "1" ]; then
    ROLLOUT_FN=vime_bridge.rollout.generate_rollout_polar_sync
    # 同步路径不复用 session_pool 的准入/缓冲机制,这四个参数对它无意义。
    SCHED_ARGS=(--rollout-sync-oversubscribe-factor "${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0}")
-   # staleness ≡ 0 由结构保证,off-policy 重要性采样校正失去用途。
-   TIS_ARGS=()
 else
    ROLLOUT_FN=vime_bridge.rollout.generate_rollout_polar_async
    SCHED_ARGS=(
@@ -256,6 +254,19 @@ else
       --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
       --rollout-release-on-postrun
    )
+fi
+
+# TIS 与同步化无关,默认保持开启(含同步路径)。
+#   常见误解:"staleness ≡ 0 所以 TIS 没有对象"。不成立 —— loss.py:982 断言
+#   rollout_log_probs 必须存在,TIS 的比值是「推理引擎 logprob : 训练重算 logprob」,
+#   对的是**训推数值失配**(vLLM 与 Megatron 在 NPU 上 kernel 不同),与 staleness
+#   是两件事。两条路径共用 session_result_to_samples(adapter.py:258)产出
+#   rollout_log_probs,所以同步路径上 TIS 照常可用。
+#   要关请显式设 POLAR_DISABLE_TIS=1,并用 --get-mismatch-metrics 只观测不入 loss,
+#   先确认失配幅度可以忽略再关。
+if [ "${POLAR_DISABLE_TIS:-0}" = "1" ]; then
+   TIS_ARGS=()
+else
    TIS_ARGS=(--use-tis)
 fi
 

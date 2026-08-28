@@ -393,37 +393,45 @@ RUNNER = REPO_ROOT / "scripts" / "run-qwen36-35b-polar-multi-pd.sh"
 SYNC_START = REPO_ROOT / "scripts" / "start_sync_hybrid.sh"
 
 
-def _eval_rollout_contract(feat_sync: str) -> dict[str, str]:
-    """Evaluate the runner's FEAT_SYNC_ROLLOUT block for one setting."""
+def _eval_rollout_contract(feat_sync: str, **extra_env) -> dict[str, str]:
+    """Evaluate the runner's FEAT_SYNC_ROLLOUT / TIS blocks for one setting."""
     import subprocess
 
     text = RUNNER.read_text(encoding="utf-8")
     start = text.index('if [ "${FEAT_SYNC_ROLLOUT:-0}" = "1" ]; then')
-    end = text.index("\nfi\n", start) + len("\nfi\n")
+    end = text.index('\nfi\n', text.index('if [ "${POLAR_DISABLE_TIS:-0}" = "1" ]; then')) + len("\nfi\n")
     block = text[start:end]
     script = block + '\necho "FN=$ROLLOUT_FN"\necho "SCHED=${SCHED_ARGS[*]}"\necho "TIS=${TIS_ARGS[*]}"\n'
+    env = {"FEAT_SYNC_ROLLOUT": feat_sync, "PATH": os.environ.get("PATH", "")}
+    env.update(extra_env)
     out = subprocess.run(
-        ["bash", "-c", script],
-        env={"FEAT_SYNC_ROLLOUT": feat_sync, "PATH": os.environ.get("PATH", "")},
-        capture_output=True,
-        text=True,
-        check=True,
+        ["bash", "-c", script], env=env, capture_output=True, text=True, check=True
     ).stdout
     return dict(line.split("=", 1) for line in out.strip().splitlines())
 
 
 def test_runner_sync_branch_drops_the_async_only_knobs():
-    """staleness is 0 by construction, so off-policy correction must be off.
-
-    Leaving --use-tis or the session_pool knobs in place would apply an
-    importance-sampling correction against a ratio that is identically 1, and
-    would configure an admission pool the sync path never consults.
-    """
+    """The session_pool knobs configure an admission pool the sync path never consults."""
     got = _eval_rollout_contract("1")
     assert got["FN"] == "vime_bridge.rollout.generate_rollout_polar_sync"
-    assert got["TIS"] == "", "--use-tis has no meaning when staleness is 0"
     assert "session_pool" not in got["SCHED"]
     assert "--rollout-sync-oversubscribe-factor" in got["SCHED"]
+
+
+def test_tis_stays_on_under_sync_by_default():
+    """TIS corrects train/infer mismatch, which synchronisation does not remove.
+
+    The ratio TIS applies is engine-logprob : train-recomputed-logprob
+    (loss.py asserts rollout_log_probs is present), so it is orthogonal to
+    staleness. Turning it off with the sync switch would silently change the
+    gradient; it has to be an explicit, separate decision.
+    """
+    assert _eval_rollout_contract("1")["TIS"] == "--use-tis"
+    assert _eval_rollout_contract("0")["TIS"] == "--use-tis"
+
+
+def test_tis_can_be_disabled_explicitly():
+    assert _eval_rollout_contract("1", POLAR_DISABLE_TIS="1")["TIS"] == ""
 
 
 def test_runner_async_branch_is_unchanged():
