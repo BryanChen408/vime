@@ -1,5 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# start_sync_homo_single52.sh — 单机 16 卡(.52)**同构**共卡冒烟
+# start_sync_homo_single52.sh — 单机 16 卡(.52)**部分共卡(T5)**冒烟
+#
+# ⚠ 文件名里的 "homo" 是历史遗留,**这不是同构**。actor 占 16 卡而 rollout 只占其中
+#   12 张(4-15),是 share ⊊ actor 的部分共卡。真同构要求两者完全同一批卡,但这台机器上
+#   polar 必须占 0-3,做不出来(actor 只能 4-15 = 12 卡,TP2×PP1×CP6=12 而 EP8 除不进 12)。
+#   20260828 我把它当同构,因而漏掉「rollout 段起点不在 actor 第 0 张卡」这件事,
+#   IPC gather group 拿 rollout 槽位当 actor rank,整体错位 4 张卡 →
+#   "IPC handle not found for GPU UUID ...";已由 engine_roles 的 actor_ranks 修正,
+#   回归见 tests/test_engine_roles.py。
 #
 # layout: scripts/resource_layout.single52_homo_colocate.yaml
 #   0-3    polar agent/judge(与 actor 重叠,layout 中无法声明 —— 见该文件注释)
@@ -113,7 +121,7 @@ HCCL_INTRA_PCIE_ENABLE=0 \
 HCCL_BUFFSIZE=512 \
 HCCL_HOST_SOCKET_PORT_RANGE=60000-60255 \
 HCCL_NPU_SOCKET_PORT_RANGE=61000-61255 \
-ROLLOUT_BATCH_SIZE=4  N_SAMPLES_PER_PROMPT=4  GLOBAL_BATCH_SIZE=16  NUM_ROLLOUT=${NUM_ROLLOUT:-2} \
+ROLLOUT_BATCH_SIZE=2  N_SAMPLES_PER_PROMPT=2  GLOBAL_BATCH_SIZE=4  NUM_ROLLOUT=${NUM_ROLLOUT:-2} \
 FEAT_DP_EXTERNAL_LB=0 FEAT_BALANCE_SCHED=0 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=0 \
 FEAT_ROLLOUT_EP=0 FEAT_FLASHCOMM1=0 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=0 FEAT_HCCL_AIV=1 \
 OPERATOR_DATA_ROOT=/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189 \

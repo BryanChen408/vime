@@ -65,6 +65,23 @@ class EngineRole:
     colocated: bool
     """True when every card of this engine is also an actor card."""
 
+    actor_ranks: tuple[int, ...] = ()
+    """Actor ranks sharing this engine's cards, in ``placement`` order.
+
+    Empty for a dedicated engine (its cards belong to no actor rank). The rank
+    of a card is its index in the actor's expanded card list, which is the order
+    the launcher assigns ranks in.
+
+    This is *not* derivable from :attr:`gpu_slot`. A slot indexes the **rollout**
+    GPU sequence; a rank indexes the **actor's**. They coincide only when the
+    rollout segment starts at the actor's first card — true for the two
+    production topologies, false for any partially shared layout (e.g. actor
+    ``0-15`` with rollout ``4-15``, where slot 0 is actor rank 4). Comparing a
+    slot against ``dist.get_rank()`` there hands each engine the IPC handles of
+    a card pair four positions away, and the receiver — which correctly keys on
+    its own device UUID — reports ``IPC handle not found for GPU UUID ...``.
+    """
+
     @property
     def num_gpus(self) -> int:
         return len(self.placement)
@@ -102,7 +119,8 @@ def resolve_engine_roles(args: Any) -> tuple[EngineRole, ...]:
 
     spec = getattr(args, "resource_layout_spec", None)
     if spec is not None:
-        actor_cards = set(_expand(spec.actor))
+        actor_card_list = _expand(spec.actor)
+        actor_cards = set(actor_card_list)
         rollout_cards = _expand(spec.rollout)
     else:
         rollout_num_gpus = int(getattr(args, "rollout_num_gpus", 0) or 0)
@@ -110,6 +128,7 @@ def resolve_engine_roles(args: Any) -> tuple[EngineRole, ...]:
             # Rollout reuses the actor's cards one-for-one, so the two sequences
             # are the same cards and containment holds for every engine.
             rollout_cards = [(_IMPLICIT_NODE, i) for i in range(rollout_num_gpus)]
+            actor_card_list = list(rollout_cards)
             actor_cards = set(rollout_cards)
         else:
             # Positional: the actor owns [0, actor_gpus) and rollout starts after
@@ -117,8 +136,13 @@ def resolve_engine_roles(args: Any) -> tuple[EngineRole, ...]:
             actor_gpus = int(getattr(args, "actor_num_nodes", 1) or 1) * int(
                 getattr(args, "actor_num_gpus_per_node", 0) or 0
             )
-            actor_cards = {(_IMPLICIT_NODE, i) for i in range(actor_gpus)}
+            actor_card_list = [(_IMPLICIT_NODE, i) for i in range(actor_gpus)]
+            actor_cards = set(actor_card_list)
             rollout_cards = [(_IMPLICIT_NODE, actor_gpus + i) for i in range(rollout_num_gpus)]
+
+    # Rank of a card = its index in the actor's card sequence, which is the order
+    # the launcher assigns ranks in.
+    actor_rank_of = {card: rank for rank, card in enumerate(actor_card_list)}
 
     if len(rollout_cards) % per_engine:
         raise EngineRoleError(
@@ -130,15 +154,17 @@ def resolve_engine_roles(args: Any) -> tuple[EngineRole, ...]:
     for index in range(len(rollout_cards) // per_engine):
         slot = index * per_engine
         placement = tuple(rollout_cards[slot : slot + per_engine])
+        # Partial overlap would mean an engine straddling the boundary, which no
+        # caller can act on: it can be neither handed an IPC handle nor put to
+        # sleep independently of the trainer.
+        colocated = all(card in actor_cards for card in placement)
         roles.append(
             EngineRole(
                 index=index,
                 gpu_slot=slot,
                 placement=placement,
-                # Partial overlap would mean an engine straddling the boundary,
-                # which no caller can act on: it can be neither handed an IPC
-                # handle nor put to sleep independently of the trainer.
-                colocated=all(card in actor_cards for card in placement),
+                colocated=colocated,
+                actor_ranks=tuple(actor_rank_of[card] for card in placement) if colocated else (),
             )
         )
     return tuple(roles)

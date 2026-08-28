@@ -208,6 +208,35 @@ def _resolve_colocated_engine_count(
     return colocated_prefix_count(roles)
 
 
+def _actor_ranks_by_gpu_slot(args) -> dict[int, tuple[int, ...]]:
+    """``{gpu_slot: 与该引擎共卡的 actor rank}``,取自单一真源。
+
+    调用方原先拿 ``engine_gpu_offsets[i]``(**rollout 序列**内的槽位)直接与
+    ``dist.get_rank()``(**actor 序列**内的秩)比大小。两者只在 rollout 段从 actor
+    的第 0 张卡开始时相等 —— 生产的两个拓扑恰好如此,部分共卡布局则不然:
+    actor ``0-15`` + rollout ``4-15`` 下槽位 0 其实是 actor rank 4,于是每台引擎收到
+    的是错位 4 张卡的 IPC handle;接收端按自身 device UUID 查表(那一侧是自描述的,
+    没有错)→ ``IPC handle not found for GPU UUID ...``,而 "Available UUIDs" 恰好是
+    隔壁引擎那对连号。20260828 单机 T5 首跑即此。
+
+    映射不出来时返回空 dict,调用方退回原算术。这是安全的:无 layout 的两条路径下
+    真源给出的秩与原算术逐位相同(``--colocate`` 是 rollout 卡即 actor 卡,positional
+    无共卡引擎),真正退化只发生在 PD 多 group(每组引擎卡数不同、槽位对不上)时,
+    而那类布局全是纯分离,压根没有共卡引擎走到这里。
+    """
+    from vime.ray.engine_roles import EngineRoleError, resolve_engine_roles
+
+    try:
+        roles = resolve_engine_roles(args)
+    except EngineRoleError as e:
+        logger.warning(
+            "resolve_engine_roles failed (%s); falling back to slot-as-rank arithmetic for IPC groups",
+            e,
+        )
+        return {}
+    return {role.gpu_slot: role.actor_ranks for role in roles if role.colocated}
+
+
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
@@ -312,21 +341,34 @@ class UpdateWeightFromTensor:
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
 
+        # Actor ranks per engine. Falls back to treating the rollout slot as a
+        # rank, which is only valid when the rollout segment starts at the
+        # actor's first card — see ``_actor_ranks_by_gpu_slot``.
+        ranks_by_slot = _actor_ranks_by_gpu_slot(self.args)
+
+        def _actor_ranks_for(i: int) -> list[int]:
+            ranks = ranks_by_slot.get(colocate_gpu_offsets[i])
+            if ranks:
+                return list(ranks)
+            return list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
+
         # Create IPC Gloo gather groups (only on first call; partitioning is
         # fixed across reconnects).
         if self._ipc_gather_group is None:
             for i in range(colocate_engine_nums):
-                group_ranks = list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
+                group_ranks = _actor_ranks_for(i)
                 new_group = dist.new_group(ranks=group_ranks, backend="gloo")
                 if dist.get_rank() in group_ranks:
                     self._ipc_gather_group = new_group
-                    self._ipc_gather_src = colocate_gpu_offsets[i]
+                    # The gather source must be a member of this very group;
+                    # ``_send_to_colocated_engine`` compares it against the
+                    # global rank, so it is the group's lowest actor rank, not
+                    # the rollout slot.
+                    self._ipc_gather_src = min(group_ranks)
 
         # Map training ranks to colocated engine actors.
         for i, engine in enumerate(self.rollout_engines):
-            start = colocate_gpu_offsets[i]
-            end = start + colocate_gpu_counts[i]
-            if start <= dist.get_rank() < end:
+            if dist.get_rank() in _actor_ranks_for(i):
                 self._ipc_engine = engine
 
         # vLLM #39212: one-time IPC transfer-engine init on each colocated engine.
