@@ -251,7 +251,7 @@ class MegatronTrainRayActor(TrainRayActor):
             # flat-buffer storages. Reconstructible Megatron/TE caches are
             # discarded here rather than copied to host.
             if self._training_state_offloader is not None:
-                self._training_state_offloader.offload(self.optimizer)
+                self._training_state_offloader.offload(self.optimizer, model=self.model)
             destroy_process_groups()
             self._weight_offloader.offload(self.model)
         else:

@@ -8,8 +8,9 @@ targeted storage release and the full allocator pause used by slime:
   moving their *data* to CPU without replacing the Tensor/Parameter object;
 * leave optimizer state that is already on CPU untouched (the normal
   ``optimizer_offload_fraction=1.0`` path);
-* discard Megatron/TransformerEngine scratch caches, which carry no training
-  state and are recreated lazily on the next forward.
+* discard Megatron/TransformerEngine scratch caches and completed-forward MoE
+  dispatcher state, which carry no training state and are recreated lazily on
+  the next forward.
 
 The optimizer traversal follows verl's ``offload_megatron_optimizer`` /
 ``load_megatron_optimizer`` implementation, including ChainedOptimizer and
@@ -33,6 +34,20 @@ import torch
 
 logger = logging.getLogger(__name__)
 _NPU_DEVICE_TYPES = frozenset({"npu"})
+
+# Megatron's token dispatcher is a plain Python object rather than an nn.Module.
+# These tensors are needed through ``combine_postprocess`` in the same forward,
+# but upstream leaves the last values attached afterwards. In a continuous
+# trainer the next forward overwrites them; in a colocated trainer they pin the
+# completed autograd graph throughout rollout. Restrict cleanup to the exact
+# dispatcher and fields observed in the current all-to-all training path.
+_MOE_DISPATCHER_FORWARD_STATE = {
+    "MoEAlltoAllTokenDispatcher": (
+        "probs",
+        "routing_map",
+        "reversed_local_input_permutation_mapping",
+    ),
+}
 
 
 @dataclass
@@ -66,9 +81,12 @@ class NPUTrainingStateOffloader:
         self._optimizer_bytes = 0
         self._scratch_bytes = 0
         self._scratch_tensors = 0
+        self._model_runtime_bytes = 0
+        self._model_runtime_tensors = 0
+        self._allocated_reclaimed_bytes = 0
 
     @torch.no_grad()
-    def offload(self, optimizer: Any, verbose: bool = True) -> int:
+    def offload(self, optimizer: Any, verbose: bool = True, *, model: Any = None) -> int:
         """Move required device optimizer state to CPU and drop scratch caches.
 
         CPU-resident HDO state is deliberately skipped, so full optimizer CPU
@@ -80,6 +98,7 @@ class NPUTrainingStateOffloader:
             return self._optimizer_bytes + self._scratch_bytes
 
         t0 = time.perf_counter()
+        allocated_before = _npu_memory_allocated()
         seen: set[int] = set()
         moved: list[_SavedTensor] = []
         try:
@@ -98,8 +117,14 @@ class NPUTrainingStateOffloader:
 
             self._saved = moved
             self._optimizer_bytes = sum(item.nbytes for item in moved)
-            self._scratch_bytes, self._scratch_tensors = self._drop_reconstructible_caches()
+            (
+                self._scratch_bytes,
+                self._scratch_tensors,
+                self._model_runtime_bytes,
+                self._model_runtime_tensors,
+            ) = self._drop_reconstructible_caches(model)
             _synchronize_and_empty_npu_cache()
+            self._allocated_reclaimed_bytes = max(0, allocated_before - _npu_memory_allocated())
             self._is_offloaded = True
             self._optimizer_id = id(optimizer)
         except Exception:
@@ -113,6 +138,7 @@ class NPUTrainingStateOffloader:
             self._saved.clear()
             self._optimizer_bytes = 0
             self._optimizer_id = None
+            self._allocated_reclaimed_bytes = 0
             _synchronize_and_empty_npu_cache()
             raise
 
@@ -120,11 +146,16 @@ class NPUTrainingStateOffloader:
         if verbose:
             logger.info(
                 "NPU training-state offload: optimizer=%d tensors %.1f MiB -> CPU; "
-                "scratch=%d tensors %.1f MiB discarded in %.2fs",
+                "scratch=%d tensors %.1f MiB discarded "
+                "(model-runtime=%d tensors %.1f MiB); "
+                "allocated-reclaimed=%.1f MiB in %.2fs",
                 len(self._saved),
                 self._optimizer_bytes / (1024 * 1024),
                 self._scratch_tensors,
                 self._scratch_bytes / (1024 * 1024),
+                self._model_runtime_tensors,
+                self._model_runtime_bytes / (1024 * 1024),
+                self._allocated_reclaimed_bytes / (1024 * 1024),
                 self._offload_time,
             )
         return self._optimizer_bytes + self._scratch_bytes
@@ -165,9 +196,16 @@ class NPUTrainingStateOffloader:
             )
         return restored_bytes
 
-    def _drop_reconstructible_caches(self) -> tuple[int, int]:
-        total_bytes = 0
-        total_tensors = 0
+    def _drop_reconstructible_caches(self, model: Any) -> tuple[int, int, int, int]:
+        model_tensors = _drop_model_forward_state(model)
+        model_bytes = _unique_storage_bytes(model_tensors)
+        model_tensor_count = len({id(tensor) for tensor in model_tensors})
+        total_bytes = model_bytes
+        total_tensors = model_tensor_count
+        # Drop the accounting references before collect/empty_cache. The owner
+        # attributes are already reset, so this is the point where the pinned
+        # autograd graph can actually become unreachable.
+        del model_tensors
 
         getter = self._global_memory_buffer_getter
         if getter is None:
@@ -204,7 +242,7 @@ class NPUTrainingStateOffloader:
             pass
 
         gc.collect()
-        return total_bytes, total_tensors
+        return total_bytes, total_tensors, model_bytes, model_tensor_count
 
     @property
     def is_offloaded(self) -> bool:
@@ -217,10 +255,62 @@ class NPUTrainingStateOffloader:
             "optimizer_tensors": len(self._saved),
             "scratch_discarded_mb": self._scratch_bytes / (1024 * 1024),
             "scratch_tensors": self._scratch_tensors,
+            "model_runtime_discarded_mb": self._model_runtime_bytes / (1024 * 1024),
+            "model_runtime_tensors": self._model_runtime_tensors,
+            "allocated_reclaimed_mb": self._allocated_reclaimed_bytes / (1024 * 1024),
             "offload_time_s": round(self._offload_time, 2),
             "onload_time_s": round(self._onload_time, 2),
             "is_offloaded": self._is_offloaded,
         }
+
+
+def _drop_model_forward_state(model: Any) -> list[torch.Tensor]:
+    """Release completed-forward state through Megatron's owning objects.
+
+    This runs only at the train-to-rollout phase boundary, after backward,
+    ``optimizer.step`` and the actor CPU-weight backup have completed. Nothing
+    cleared here is optimizer/model state: dispatcher metadata is assigned by
+    ``dispatch_preprocess`` before every same-forward consumer.
+
+    Returning the tensors lets the caller account unique storage before the
+    last local references disappear. They are never copied to CPU.
+    """
+    if model is None:
+        return []
+
+    released: list[torch.Tensor] = []
+
+    seen_dispatchers: set[int] = set()
+    for module in _iter_model_modules(model):
+        dispatcher = getattr(module, "token_dispatcher", None)
+        state_names = _MOE_DISPATCHER_FORWARD_STATE.get(type(dispatcher).__name__)
+        if state_names is not None and id(dispatcher) not in seen_dispatchers:
+            seen_dispatchers.add(id(dispatcher))
+            for name in state_names:
+                released.extend(_iter_tensors(getattr(dispatcher, name, None)))
+                if hasattr(dispatcher, name):
+                    setattr(dispatcher, name, None)
+
+    return released
+
+
+def _iter_model_chunks(model: Any) -> Iterator[Any]:
+    if isinstance(model, (list, tuple)):
+        for child in model:
+            yield from _iter_model_chunks(child)
+    elif model is not None:
+        yield model
+
+
+def _iter_model_modules(model: Any) -> Iterator[torch.nn.Module]:
+    seen: set[int] = set()
+    for model_chunk in _iter_model_chunks(model):
+        if not isinstance(model_chunk, torch.nn.Module):
+            continue
+        for module in model_chunk.modules():
+            if id(module) not in seen:
+                seen.add(id(module))
+                yield module
 
 
 def _iter_megatron_optimizers(optimizer: Any) -> Iterator[Any]:
@@ -317,3 +407,10 @@ def _synchronize_and_empty_npu_cache() -> None:
         return
     npu.synchronize()
     npu.empty_cache()
+
+
+def _npu_memory_allocated() -> int:
+    npu = getattr(torch, "npu", None)
+    if npu is None or not npu.is_available():
+        return 0
+    return int(npu.memory_allocated())

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import gc
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -192,6 +194,103 @@ def test_onload_rejects_a_rebuilt_optimizer(monkeypatch):
     assert not offloader.is_offloaded
 
 
+def test_model_forward_state_is_discarded_and_releases_its_autograd_graph(monkeypatch):
+    """Repeated phase handoffs release graphs without touching useful state."""
+    _no_npu_cache(monkeypatch)
+
+    class MoEAlltoAllTokenDispatcher:
+        def dispatch_preprocess(self, source, weight):
+            # Match Megatron's lifecycle: every forward assigns all three
+            # fields before combine reads them.
+            self.probs = (source * weight).square()
+            self.routing_map = torch.ones(source.numel(), dtype=torch.bool)
+            self.reversed_local_input_permutation_mapping = torch.arange(source.numel())
+
+        def combine_postprocess(self):
+            assert self.probs is not None
+            assert self.routing_map is not None
+            assert self.reversed_local_input_permutation_mapping is not None
+            return self.probs.sum()
+
+    dispatcher = MoEAlltoAllTokenDispatcher()
+    dispatcher.sort_input_by_local_experts = torch.arange(4)
+
+    # Same-looking fields on another implementation are deliberately outside
+    # this fix; class-specific cleanup prevents accidental cache destruction.
+    class MoEAllGatherTokenDispatcher:
+        pass
+
+    untouched_dispatcher = MoEAllGatherTokenDispatcher()
+    untouched_dispatcher.routing_map = torch.ones(2, dtype=torch.bool)
+
+    class FakeGPTModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(2.0))
+            self.token_dispatcher = dispatcher
+            self.other_layer = torch.nn.Module()
+            self.other_layer.token_dispatcher = untouched_dispatcher
+
+    model = FakeGPTModel()
+    optimizer = SimpleNamespace(shard_fp32_from_float16_groups=[], optimizer=None)
+    offloader = NPUTrainingStateOffloader(
+        global_memory_buffer_getter=lambda: SimpleNamespace(buffer={}),
+    )
+    weight_id = id(model.weight)
+    weight_value = model.weight.detach().clone()
+    persistent_id = id(dispatcher.sort_input_by_local_experts)
+    untouched_id = id(untouched_dispatcher.routing_map)
+
+    # Multiple cycles cover both leak accumulation and wake-up reuse. A None
+    # dereference would fail in combine_postprocess on the next iteration.
+    for _ in range(3):
+        model.weight.grad = None
+        source = torch.randn(8, requires_grad=True)
+        dispatcher.dispatch_preprocess(source, model.weight)
+        output = dispatcher.combine_postprocess()
+        output.backward()
+        weight_grad = model.weight.grad.clone()
+        probs = dispatcher.probs
+        source_ref = weakref.ref(source)
+        probs_ref = weakref.ref(probs)
+        direct_tensors = [
+            probs,
+            dispatcher.routing_map,
+            dispatcher.reversed_local_input_permutation_mapping,
+        ]
+        expected_bytes = sum(t.untyped_storage().nbytes() for t in direct_tensors)
+        del source, probs, output, direct_tensors
+
+        offloader.offload(optimizer, verbose=False, model=[model])
+
+        assert dispatcher.probs is None
+        assert dispatcher.routing_map is None
+        assert dispatcher.reversed_local_input_permutation_mapping is None
+        assert offloader.stats["model_runtime_tensors"] == 3
+        assert offloader.stats["model_runtime_discarded_mb"] == pytest.approx(
+            expected_bytes / (1024 * 1024)
+        )
+
+        # ``probs.grad_fn`` was the Python root keeping the upstream graph
+        # alive. Clearing it must release the graph rather than accumulate one
+        # more copy on every train/rollout cycle.
+        gc.collect()
+        assert probs_ref() is None
+        assert source_ref() is None
+
+        # Parameters, gradients, persistent dispatcher configuration and
+        # unvalidated dispatcher implementations must remain byte-for-byte and
+        # object-for-object unchanged.
+        assert id(model.weight) == weight_id
+        assert torch.equal(model.weight, weight_value)
+        assert torch.equal(model.weight.grad, weight_grad)
+        assert id(dispatcher.sort_input_by_local_experts) == persistent_id
+        assert id(untouched_dispatcher.routing_map) == untouched_id
+
+        offloader.onload(optimizer, verbose=False)
+        assert dispatcher.probs is None  # next forward assigns it before use
+
+
 def _actor_method(tree, name):
     actor_class = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "MegatronTrainRayActor"
@@ -238,6 +337,16 @@ def test_actor_phase_order_and_shared_only_guard():
         < sleep_calls["destroy_process_groups"][0]
         < sleep_calls["self._weight_offloader.offload"][0]
     )
+    offload_call = next(
+        node
+        for node in ast.walk(_actor_method(tree, "sleep"))
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self._training_state_offloader.offload"
+    )
+    assert [ast.unparse(arg) for arg in offload_call.args] == ["self.optimizer"]
+    assert [(keyword.arg, ast.unparse(keyword.value)) for keyword in offload_call.keywords] == [
+        ("model", "self.model")
+    ]
     assert (
         wake_calls["self._weight_offloader.onload"][0]
         < wake_calls["self._training_state_offloader.onload"][0]
