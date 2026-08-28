@@ -1,0 +1,34 @@
+# 单机 16 卡(.52)异构共卡 —— 训推共卡段 + 专用推理段,同步 train.py 用。
+#
+# 这是在一台机器上能构造出的最小"异构"形态:rollout 与 actor **有交集但不重合**,
+# 因此同时走通两条权重通道(共卡 IPC + 专用 HCCL)和两种 offload 行为
+# (共卡段 sleep / 专用段常驻)。完全重合(同构)只会走 IPC 一条路,测不到混合更新器。
+#
+# 卡位(物理卡号,与 ASCEND_RT_VISIBLE_DEVICES 一致):
+#   0-3    polar agent + judge(npu_lease.pool,**不进 Ray**)
+#   4-11   actor 训练(8 卡)
+#   4-11   rollout 共卡段:4 个 TP2 引擎,训练窗口 sleep,权重走 NPU IPC
+#   12-15  rollout 专用段:2 个 TP2 引擎,常驻不 sleep,权重走 HCCL 广播
+#
+# HCCS 域(910 单机:0-7 为域 A,8-15 为域 B):
+#   共卡段拆 4-7 / 8-11 两条,是为了 TP2 配对不跨域 —— 配对按列表顺序两两切分,
+#   写成一条 "4-11" 会得到 (4,5)(6,7)(8,9)(10,11),看似也不跨域,但一旦
+#   num_gpus_per_engine 改成 4 就会出现 (6,7,8,9) 跨域。拆开是防御性的。
+#   专用段 12-15 全在域 B,配对 (12,13)(14,15) 不跨域。
+#
+# 权重同步域 = trainer(8 rank) + 专用引擎(4 rank),跨 HCCS 域 → 需
+# HCCL_INTER_HCCS_DISABLE=false。共卡引擎走 IPC 不进 HCCL 域,故 actor 首卡可用。
+#
+# 顺序约定(代码强制,resource_layout.py 校验):共卡段(share=actor)必须写在
+# rollout 列表最前;共卡设备必须 ⊆ actor。
+roles:
+  actor:
+    - {node: 80.48.5.52, devices: "4-11"}
+  rollout:
+    - {node: 80.48.5.52, devices: "4-7", share: actor}     # 2 台共卡引擎(HCCS 域 A)
+    - {node: 80.48.5.52, devices: "8-11", share: actor}    # 2 台共卡引擎(HCCS 域 B)
+    - {node: 80.48.5.52, devices: "12-15"}                 # 2 台专用引擎,常驻
+  polar_reserved:
+    - {node: 80.48.5.52, devices: "0-3"}
+rollout:
+  num_gpus_per_engine: 2                 # 共 6 个 TP2 引擎(4 共卡 + 2 专用)

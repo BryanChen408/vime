@@ -627,6 +627,14 @@ PY
          if [ "${FEAT_LB_PROXY:-0}" = "1" ]; then
             EXTRA_ARGS+=(--rollout-lb-proxy)
          fi
+         # 逃生口:任意附加训练参数。主要用途是可行性探测 —— --debug-train-only /
+         # --debug-rollout-only 与 --resource-layout 互斥(arguments.py 直接 raise),
+         # 想单独验证训练侧放不放得下,只能清空 RESOURCE_LAYOUT 再从这里传进去。
+         # 故意不加引号:多个 flag 靠词分割展开;带空格的单个值请改用数组或本文件直接加。
+         if [ -n "${VIME_EXTRA_ARGS:-}" ]; then
+            # shellcheck disable=SC2206
+            EXTRA_ARGS+=(${VIME_EXTRA_ARGS})
+         fi
          # ─── 启动 vLLM metrics 监控面板(旁路,失败不影响训练)───
          # 引擎由 head 的 driver 远程创建在 rollout 节点 → 发现目标必须是
          # ROLLOUT_NODE_IP(140),不是 CURRENT_IP(141 本机没有任何 engine)。
