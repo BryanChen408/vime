@@ -430,6 +430,42 @@ def _pause_gateway_generation(
     return status
 
 
+def _all_gateway_nodes_ok(payload: Any, summary_key: str, node_check) -> bool:
+    """Whether every gateway node behind the rollout server confirmed an admin call.
+
+    The rollout server fans these calls out to N gateway nodes, but it only
+    summarizes one of them: ``/rollout/admin/inference/pause`` returns
+    ``all_paused``/``all_drained``/``inflight`` alongside ``nodes``, while
+    ``/rollout/admin/inference/resume`` and ``/rollout/admin/policy_version``
+    return ``_forward_gateway_admin``'s raw ``{"nodes": [...]}``. Requiring the
+    summary from all three read a fully successful fan-out as a refusal.
+
+    So: trust the summary when the server provides one -- in both directions, or
+    a ``false`` summary could be overturned here -- and otherwise recompute it
+    from the per-node responses the way the server would have. Both branches
+    require *every* node to have been reached and to satisfy ``node_check``; a
+    partial fleet is never success.
+
+    ``version_span._acknowledged_via_rollout_server`` applies the same rule to
+    the policy-version response.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if summary_key in payload:
+        return payload[summary_key] is True
+
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return False
+    for item in nodes:
+        if not isinstance(item, dict) or item.get("status") != "ok":
+            return False
+        response = item.get("response")
+        if not isinstance(response, dict) or not node_check(response):
+            return False
+    return True
+
+
 def _resume_gateway_generation(args: Any) -> None:
     rollout_url = _resolve_rollout_url(args)
     if rollout_url:
@@ -439,7 +475,9 @@ def _resume_gateway_generation(args: Any) -> None:
             action="rollout gateway resume",
             timeout=max(request_timeout, 5.0),
         )
-        if payload.get("all_resumed") is not True:
+        if not _all_gateway_nodes_ok(
+            payload, "all_resumed", lambda response: response.get("paused") is False
+        ):
             raise PolarRolloutSchedulerError(
                 f"Polar rollout server did not resume every gateway: {payload!r}"
             )

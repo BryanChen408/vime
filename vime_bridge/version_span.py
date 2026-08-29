@@ -34,6 +34,44 @@ def _resolve_push_url(args: Any) -> str | None:
     return None
 
 
+def _acknowledged_via_rollout_server(payload: Any, version: int) -> bool:
+    """Every gateway node behind the rollout server must confirm ``version``.
+
+    Two response shapes are accepted, and both must answer for *all* nodes -- a
+    partial update stamps one fleet with two versions, which is exactly what this
+    guard exists to prevent:
+
+    * summarized -- ``{"all_updated": true, "policy_version": N, ...}``, mirroring
+      the ``all_paused`` field that ``/rollout/admin/inference/pause`` returns;
+    * raw fan-out -- ``{"nodes": [{"node_id": .., "status": "ok",
+      "response": {"policy_version": N}}, ..]}``, which is what
+      ``/rollout/admin/policy_version`` returns today: it forwards through
+      ``_forward_gateway_admin`` without adding the summary its sibling
+      pause endpoint does.
+
+    The raw branch recomputes the same predicate the server would have: every
+    node reached (``status == "ok"``) and every one of them stamped ``version``.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if "all_updated" in payload:
+        # An explicit summary is authoritative in both directions. Falling through
+        # to the raw nodes on ``all_updated: false`` would let the derivation
+        # overturn a refusal the server already computed.
+        return payload["all_updated"] is True and payload.get("policy_version") == version
+
+    nodes = payload.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return False
+    for item in nodes:
+        if not isinstance(item, dict) or item.get("status") != "ok":
+            return False
+        response = item.get("response")
+        if not isinstance(response, dict) or response.get("policy_version") != version:
+            return False
+    return True
+
+
 def push_policy_version_to_gateway(args: Any, version: int) -> bool:
     """POST ``version`` and require an explicit acknowledgement from every gateway."""
     url = _resolve_push_url(args)
@@ -51,11 +89,7 @@ def push_policy_version_to_gateway(args: Any, version: int) -> bool:
             args, "polar_rollout_url", None
         )
         if rollout_url:
-            acknowledged = (
-                isinstance(payload, dict)
-                and payload.get("all_updated") is True
-                and payload.get("policy_version") == int(version)
-            )
+            acknowledged = _acknowledged_via_rollout_server(payload, int(version))
         else:
             acknowledged = (
                 isinstance(payload, dict)
