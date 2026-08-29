@@ -145,7 +145,7 @@ export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/cust
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export HYDRA_FULL_ERROR=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export TASK_QUEUE_ENABLE=0                     # 必须 0:=1 会让 GDN/ring-attn 训练出 NaN
+export TASK_QUEUE_ENABLE=1                     # 必须 0:=1 会让 GDN/ring-attn 训练出 NaN
 export TORCHDYNAMO_DISABLE=1                   # 昇腾 inductor get_gpu_type() 断言 → 走 eager
 export CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1}   # NPU 邻近 NUMA 绑核,降延迟抖动
 export QWEN36_CP_MODE=ulysses

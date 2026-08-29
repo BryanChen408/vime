@@ -76,8 +76,8 @@ TASK_QUEUE_ENABLE=1 \
 ROLLOUT_BATCH_SIZE=8  N_SAMPLES_PER_PROMPT=8  GLOBAL_BATCH_SIZE=64  NUM_ROLLOUT=100 \
 FEAT_DP_EXTERNAL_LB=0 FEAT_BALANCE_SCHED=0 FEAT_LB_PROXY=1 FEAT_CROSS_DP_EP=0 \
 FEAT_ROLLOUT_EP=1 FEAT_FLASHCOMM1=1 FEAT_PREFIX_CACHE=1 FEAT_MULTISTREAM_SHARED_EXPERT=1 FEAT_STATIC_KERNEL=0 FEAT_HCCL_AIV=1 \
-OPERATOR_DATA_ROOT=/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189 \
-OPERATOR_TASK_JSONL=/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189/operator_tasks.16.jsonl \
+OPERATOR_DATA_ROOT=/home/docker/datasets/ascendc-rl-datasets/NPUKernelBench \
+OPERATOR_TASK_JSONL=/home/docker/datasets/ascendc-rl-datasets/NPUKernelBench/operator_tasks.npukernelbench.jsonl \
 PROFILE_TRAIN=0 \
 PROFILE_TARGET=train_overall \
 PROFILE_STEP_START=1 PROFILE_STEP_END=2 \

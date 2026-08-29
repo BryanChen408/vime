@@ -366,6 +366,31 @@ class ProxyState:
         self._last_prune = time.monotonic()
         return {"status": "ok", "cleared_sessions": cleared}
 
+    def release_sticky_session(self, session_id: str) -> dict[str, Any]:
+        """Forget one terminal session without disturbing other affinities.
+
+        Polar calls this only after the session has entered its terminal cleanup
+        path and all future generation for the ID has been closed.  The operation
+        is deliberately idempotent so callback retries and policy-boundary cleanup
+        can race safely.
+        """
+        binding = self.session_map.pop(session_id, None)
+        if binding is None:
+            return {"status": "ok", "released": False, "session_id": session_id}
+
+        server = self.dp_servers[binding.server_idx]
+        server.active_sessions = max(0, server.active_sessions - 1)
+        server.estimated_session_kv_tokens = max(
+            0.0,
+            server.estimated_session_kv_tokens - binding.estimated_kv_tokens,
+        )
+        return {
+            "status": "ok",
+            "released": True,
+            "session_id": session_id,
+            "server_idx": binding.server_idx,
+        }
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "sessions": len(self.session_map),
@@ -695,6 +720,30 @@ async def health():
 async def lb_state():
     """Expose routing state for load-distribution diagnostics."""
     return proxy_state.snapshot()
+
+
+@app.post("/vime/release_sticky_session")
+async def release_sticky_session(request: Request):
+    """Release one Polar session's sticky bookkeeping after terminal cleanup."""
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="request body must be valid JSON") from exc
+    session_id = payload.get("session_id") if isinstance(payload, dict) else None
+    if not isinstance(session_id, str) or not session_id.strip():
+        raise HTTPException(status_code=400, detail="session_id must be a non-empty string")
+    session_id = session_id.strip()
+    if len(session_id) > 4096:
+        raise HTTPException(status_code=400, detail="session_id is too long")
+
+    result = proxy_state.release_sticky_session(session_id)
+    logger.info(
+        "Released terminal sticky session %s: released=%s server_idx=%s",
+        session_id,
+        result["released"],
+        result.get("server_idx"),
+    )
+    return result
 
 
 @app.post("/vime/clear_sticky_cache")

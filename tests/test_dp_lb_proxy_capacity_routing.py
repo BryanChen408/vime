@@ -116,6 +116,30 @@ def test_policy_boundary_clear_is_fail_closed_until_requests_are_drained(proxy_s
     assert all(server.estimated_session_kv_tokens == 0 for server in proxy_state.dp_servers)
 
 
+def test_terminal_session_release_is_targeted_and_idempotent(proxy_state):
+    first_idx = _assign_and_finish(proxy_state, "finished-session", token_count=35.0)
+    other_idx = _assign_and_finish(proxy_state, "live-session", token_count=15.0)
+
+    first = proxy_state.release_sticky_session("finished-session")
+    duplicate = proxy_state.release_sticky_session("finished-session")
+
+    assert first == {
+        "status": "ok",
+        "released": True,
+        "session_id": "finished-session",
+        "server_idx": first_idx,
+    }
+    assert duplicate == {
+        "status": "ok",
+        "released": False,
+        "session_id": "finished-session",
+    }
+    assert "finished-session" not in proxy_state.session_map
+    assert proxy_state.session_map["live-session"].server_idx == other_idx
+    assert sum(server.active_sessions for server in proxy_state.dp_servers) == 1
+    assert sum(server.estimated_session_kv_tokens for server in proxy_state.dp_servers) == 15.0
+
+
 def test_server_info_capacity_and_token_id_estimation_use_existing_fields(proxy_state):
     capacity = LB._kv_capacity_units_from_server_info(
         {
