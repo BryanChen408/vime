@@ -1,8 +1,8 @@
 # Qwen3.6 MTP 在线 draft 权重同步修复方案
 
-> 状态：待实现与真机验证  
-> 更新时间：2026-08-31  
-> 基线：`a18cac5e` (`dev/mtp`)  
+> 状态：代码已实现，待真机验证
+> 更新时间：2026-08-31
+> 基线：`a18cac5e` (`dev/mtp`)
 > 证据日志：`/workspace/vime/logs/sync_factor1p5.log`
 
 ## 1. 结论
@@ -51,6 +51,11 @@ embedding same_storage=true
 lm_head same_storage=false
 draft lm_head.weight abs_sum=0.0
 ```
+
+同一日志还显示 `enable_mtp_training=False`、`mtp_num_layers=None`：该次 trainer 权重流本来
+就不含 `mtp.*`，这与 `received_mtp=0` 一致。随后用于重启的配置已经改成
+`--mtp-num-layers 1 --enable-mtp-training` 并换用含 MTP 的 torch-dist。本文两阶段方案针对
+这个新配置；若训练侧不构建 MTP block，不能靠重放 target-only 权重流恢复 draft block。
 
 Qwen3.5/3.6 MTP proposer 共享 target embedding，但不共享 `lm_head`。target 更新只能透传
 共享 embedding；draft 独立的 `lm_head` 和 MTP block 仍是未加载/旧值。
@@ -132,6 +137,9 @@ sync_mtp_draft =
     args.enable_mtp_training
     and args.vllm_speculative_config.method == "mtp"
 ```
+
+真机启动参数必须同时看到 `enable_mtp_training=True` 和 `mtp_num_layers=1`；否则第二阶段
+不会启动，并应把该 run 判为配置错误而不是 MTP 修复验证。
 
 覆盖两类更新器：
 

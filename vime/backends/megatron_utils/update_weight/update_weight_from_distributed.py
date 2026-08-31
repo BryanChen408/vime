@@ -52,11 +52,28 @@ def _begin_vllm_weight_update_session(rollout_engines: Sequence[ActorHandle]) ->
     dist.barrier(group=get_gloo_group())
 
 
+def _begin_vllm_draft_weight_update_session(rollout_engines: Sequence[ActorHandle]) -> None:
+    """Enter a checkpoint-format update session targeting each engine's MTP draft."""
+    if dist.get_rank() == 0:
+        logger.info("vLLM draft weight update: start_draft_weight_update")
+        ray.get([engine.start_draft_weight_update.remote() for engine in rollout_engines])
+    dist.barrier(group=get_gloo_group())
+
+
 def _end_vllm_weight_update_session(rollout_engines: Sequence[ActorHandle]) -> None:
     if dist.get_rank() == 0:
         logger.info("vLLM weight update: finish_weight_update")
         ray.get([engine.finish_weight_update.remote() for engine in rollout_engines])
     dist.barrier(group=get_gloo_group())
+
+
+def _sync_mtp_draft_enabled(args: Namespace) -> bool:
+    speculative_config = getattr(args, "vllm_speculative_config", None) or {}
+    if hasattr(speculative_config, "get"):
+        method = speculative_config.get("method")
+    else:
+        method = getattr(speculative_config, "method", None)
+    return bool(getattr(args, "enable_mtp_training", False) and method == "mtp")
 
 
 class UpdateWeightFromDistributed:
@@ -171,6 +188,15 @@ class UpdateWeightFromDistributed:
                 torch.cuda.synchronize()
         finally:
             _end_vllm_weight_update_session(self.rollout_engines)
+
+        if _sync_mtp_draft_enabled(self.args):
+            _begin_vllm_draft_weight_update_session(self.rollout_engines)
+            try:
+                self._send_weights(pbar)
+                if self._is_pp_src_rank:
+                    torch.cuda.synchronize()
+            finally:
+                _end_vllm_weight_update_session(self.rollout_engines)
 
         dist.barrier(group=get_gloo_group())
         _rk = dist.get_rank()

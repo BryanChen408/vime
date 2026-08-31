@@ -32,8 +32,10 @@ from vime.utils.distributed_utils import get_gloo_group
 
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
+    _begin_vllm_draft_weight_update_session,
     _begin_vllm_weight_update_session,
     _end_vllm_weight_update_session,
+    _sync_mtp_draft_enabled,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     post_process_weights,
@@ -412,35 +414,10 @@ class UpdateWeightFromTensor:
                 )
         dist.barrier(group=get_gloo_group())
 
-        # vLLM #39212: enter weight-update mode on each slot leader.
-        if self._ipc_engine is not None and rank == self._ipc_gather_src:
-            ray.get(self._ipc_engine.start_weight_update.remote(is_checkpoint_format=True))
-        if self.use_distribute and self.distributed_rollout_engines:
-            _begin_vllm_weight_update_session(self.distributed_rollout_engines)
-        dist.barrier(group=get_gloo_group())
-
         megatron_local_weights = self.weights_getter()
-
-        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-            ray.get(refs)
-            # Free GPU tensors so the caching allocator can reuse the blocks,
-            # then release CUDA IPC cache entries whose consumers (vLLM engines)
-            # have already closed their IPC handles.
-            del long_lived_tensors, hf_named_tensors
-            _device_module().ipc_collect()
-
-        dist.barrier(group=get_gloo_group())
-        # After the barrier all engines have returned, so every rank's last-chunk
-        # IPC handles are now released by the consumers.  Clean them up.
-        _device_module().ipc_collect()
-
-        # vLLM #39212: exit weight-update mode.
-        if self.use_distribute and self.distributed_rollout_engines:
-            _end_vllm_weight_update_session(self.distributed_rollout_engines)
-        if self._ipc_engine is not None and rank == self._ipc_gather_src:
-            ray.get(self._ipc_engine.finish_weight_update.remote())
-        dist.barrier(group=get_gloo_group())
+        self._sync_weight_update_phase(megatron_local_weights, draft=False)
+        if _sync_mtp_draft_enabled(self.args):
+            self._sync_weight_update_phase(megatron_local_weights, draft=True)
 
         # int4/fp4 post_process
         if rank == 0:
@@ -452,6 +429,56 @@ class UpdateWeightFromTensor:
                 )
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
+
+    def _sync_weight_update_phase(self, megatron_local_weights: Mapping[str, torch.Tensor], *, draft: bool) -> None:
+        rank = dist.get_rank()
+        role = "draft" if draft else "target"
+        if rank == 0:
+            logger.info(
+                "[MTP-WEIGHT-SYNC] phase=%s event=start version=%d ipc_engines=%d distributed_engines=%d",
+                role,
+                self.weight_version,
+                len(self.rollout_engines),
+                len(self.distributed_rollout_engines),
+            )
+        ipc_started = False
+        distributed_started = False
+        try:
+            if self._ipc_engine is not None and rank == self._ipc_gather_src:
+                if draft:
+                    ray.get(self._ipc_engine.start_draft_weight_update.remote())
+                else:
+                    ray.get(self._ipc_engine.start_weight_update.remote(is_checkpoint_format=True))
+                ipc_started = True
+
+            if self.use_distribute and self.distributed_rollout_engines:
+                begin_session = (
+                    _begin_vllm_draft_weight_update_session if draft else _begin_vllm_weight_update_session
+                )
+                begin_session(self.distributed_rollout_engines)
+                distributed_started = True
+            dist.barrier(group=get_gloo_group())
+
+            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+                ray.get(refs)
+                del long_lived_tensors, hf_named_tensors
+                _device_module().ipc_collect()
+
+            dist.barrier(group=get_gloo_group())
+            _device_module().ipc_collect()
+            if rank == 0:
+                logger.info(
+                    "[MTP-WEIGHT-SYNC] phase=%s event=complete version=%d",
+                    role,
+                    self.weight_version,
+                )
+        finally:
+            if distributed_started:
+                _end_vllm_weight_update_session(self.distributed_rollout_engines)
+            if ipc_started:
+                ray.get(self._ipc_engine.finish_weight_update.remote())
+            dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
