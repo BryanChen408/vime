@@ -16,6 +16,7 @@ import logging
 import os
 from argparse import Namespace
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -548,8 +549,9 @@ class _VLLMHijack:
             from vllm_ascend.worker.worker import NPUWorker
         except Exception:
             NPUWorker = None
-        if NPUWorker is not None and not getattr(NPUWorker, "_vime_start_patched", False):
+        if NPUWorker is not None and not getattr(NPUWorker, "_vime_weight_update_patched", False):
             _orig_start = NPUWorker.start_weight_update
+            _orig_finish = NPUWorker.finish_weight_update
 
             def _vime_start_weight_update(self, is_checkpoint_format: bool = True, _orig=_orig_start):
                 model = self.model_runner.model
@@ -561,10 +563,96 @@ class _VLLMHijack:
                         len(patched),
                         ", ".join(sorted(patched)[:10]),
                     )
-                return _orig(self, is_checkpoint_format)
+                result = _orig(self, is_checkpoint_format)
+                _set_vllm_weight_update_target(self, model, self.model_config, role="target")
+                return result
+
+            def _vime_update_weights(self, update_info: dict):
+                self._check_weight_transfer_engine()
+                if not self._weight_update_active:
+                    raise RuntimeError("start_weight_update must be called before update_weights.")
+
+                typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
+                model = _selected_vllm_weight_update_model(self)
+                with torch.device(self.device):
+                    if self._is_checkpoint_format:
+                        self.weight_transfer_engine.receive_weights(
+                            typed_update_info,
+                            load_weights=lambda weights: model.load_weights(weights=iter(weights)),
+                        )
+                    else:
+                        def load_weights_direct(weights):
+                            with torch.no_grad():
+                                for name, weight in weights:
+                                    model.get_parameter(name).copy_(weight)
+
+                        self.weight_transfer_engine.receive_weights(
+                            typed_update_info,
+                            load_weights=load_weights_direct,
+                        )
+                _device_module().synchronize()
+
+            def _vime_finish_weight_update(self, _orig=_orig_finish):
+                try:
+                    with _use_selected_vllm_weight_update_target(self):
+                        return _orig(self)
+                finally:
+                    _clear_vllm_weight_update_target(self)
 
             NPUWorker.start_weight_update = _vime_start_weight_update
-            NPUWorker._vime_start_patched = True  # type: ignore[attr-defined]
+            NPUWorker.update_weights = _vime_update_weights
+            NPUWorker.finish_weight_update = _vime_finish_weight_update
+            NPUWorker._vime_weight_update_patched = True  # type: ignore[attr-defined]
+
+
+def _set_vllm_weight_update_target(worker: Any, model: Any, model_config: Any, *, role: str) -> None:
+    worker._vime_weight_update_model = model
+    worker._vime_weight_update_model_config = model_config
+    worker._vime_weight_update_role = role
+
+
+def _selected_vllm_weight_update_model(worker: Any) -> Any:
+    selected = getattr(worker, "_vime_weight_update_model", None)
+    return worker.model_runner.model if selected is None else selected
+
+
+def _clear_vllm_weight_update_target(worker: Any) -> None:
+    worker._vime_weight_update_model = None
+    worker._vime_weight_update_model_config = None
+    worker._vime_weight_update_role = None
+
+
+def _get_vllm_draft_weight_update_target(worker: Any) -> tuple[Any, Any]:
+    drafter = getattr(worker.model_runner, "drafter", None)
+    draft_model = getattr(drafter, "model", None)
+    if draft_model is None:
+        raise RuntimeError("MTP draft weight update requested, but no draft model is configured")
+
+    speculative_config = getattr(worker.vllm_config, "speculative_config", None)
+    draft_model_config = getattr(speculative_config, "draft_model_config", None)
+    if draft_model_config is None:
+        raise RuntimeError("MTP draft weight update requested, but no draft model config is configured")
+    return draft_model, draft_model_config
+
+
+@contextmanager
+def _use_selected_vllm_weight_update_target(worker: Any):
+    """Temporarily expose the selected target through vllm-ascend's native fields."""
+    selected_model = getattr(worker, "_vime_weight_update_model", None)
+    selected_config = getattr(worker, "_vime_weight_update_model_config", None)
+    if selected_model is None or selected_config is None:
+        yield
+        return
+
+    original_model = worker.model_runner.model
+    original_config = worker.model_config
+    worker.model_runner.model = selected_model
+    worker.model_config = selected_config
+    try:
+        yield
+    finally:
+        worker.model_runner.model = original_model
+        worker.model_config = original_config
 
 
 def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
@@ -695,6 +783,32 @@ class vLLMColocateWorkerExtension:
         _VLLMHijack.hijack()
         return super().__new__(cls)
 
+    def start_draft_weight_update(self) -> None:
+        """Start a checkpoint-format update against the speculative draft."""
+        self._check_weight_transfer_engine()
+        if self._weight_update_active:
+            raise RuntimeError(
+                "start_draft_weight_update called while a weight update is already active. "
+                "Call finish_weight_update first."
+            )
+        self._check_nz_disabled()
+
+        model, model_config = _get_vllm_draft_weight_update_target(self)
+        _capture_vllm_param_attrs(model)
+        _restore_vllm_param_attrs(model)
+
+        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+        try:
+            with torch.device(self.device):
+                initialize_layerwise_reload(model)
+            self._is_checkpoint_format = True
+            self._weight_update_active = True
+            _set_vllm_weight_update_target(self, model, model_config, role="draft")
+        except Exception:
+            _clear_vllm_weight_update_target(self)
+            raise
+
     # ── Three-phase weight update protocol ────────────────────────────────────
     # Mirrors SkyRL's NewInferenceWorkerWrap. Callable via /collective_rpc from
     # VLLMEngine.update_weights_chunk / update_weights_chunk on the trainer side.
@@ -766,7 +880,7 @@ class vLLMColocateWorkerExtension:
         # Load weights into the model.
         from vllm.config import set_current_vllm_config
 
-        model = self.model_runner.model
+        model = _selected_vllm_weight_update_model(self)
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             if self._is_checkpoint_format:
                 model.load_weights(weights=iter(weights))

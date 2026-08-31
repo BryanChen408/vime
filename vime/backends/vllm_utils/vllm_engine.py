@@ -597,7 +597,12 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     worker_type = server_args.get("worker_type", "regular")
     disagg_backend = getattr(args, "disaggregation_backend", "nixl")
 
-    if _colocated_engine and "--worker-extension-cls" not in cmd:
+    speculative_config = getattr(args, "vllm_speculative_config", None) or {}
+    sync_mtp_draft = bool(
+        getattr(args, "enable_mtp_training", False)
+        and speculative_config.get("method") == "mtp"
+    )
+    if (_colocated_engine or sync_mtp_draft) and "--worker-extension-cls" not in cmd:
         cmd += [
             "--worker-extension-cls",
             "vime.backends.megatron_utils.update_weight.update_weight_from_tensor.vLLMColocateWorkerExtension",
@@ -1141,6 +1146,13 @@ class VLLMEngine(RayActor):
                     getattr(self, "rank", "?"), getattr(self, "node_rank", "?"),
                     self._http_base(), is_checkpoint_format)
         return self._make_request("start_weight_update", {"is_checkpoint_format": is_checkpoint_format})
+
+    def start_draft_weight_update(self) -> dict:
+        """Start a checkpoint-format update targeting the speculative draft model."""
+        return self._make_request(
+            "collective_rpc",
+            {"method": "start_draft_weight_update", "kwargs": {}},
+        )
 
     def finish_weight_update(self) -> dict:
         """``POST /finish_weight_update`` — signals vLLM to exit IPC weight-update mode.
