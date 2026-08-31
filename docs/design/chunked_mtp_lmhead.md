@@ -1,5 +1,8 @@
 # Chunked LM-head 接入 MTP —— 设计文档
 
+> 推理侧在线 draft 权重同步是另一条独立链路，见
+> [`mtp_online_draft_weight_sync_plan.md`](mtp_online_draft_weight_sync_plan.md)。
+
 > 目标:在 NPU / 长序列(≤32k)下,让 **MTP 训练**(`--enable-mtp-training`)不因 LM-head 全量
 > `[seq, vocab=248320]` logits 而 OOM,方式是把 MTP 头的 CE 也纳入 vime 现有的 chunked LM-head 分块路径。
 > 背景:Qwen3.6-35B-A3B DAPO-math async RL(单机 A3 aarch64,CANN 9.0.0)。
