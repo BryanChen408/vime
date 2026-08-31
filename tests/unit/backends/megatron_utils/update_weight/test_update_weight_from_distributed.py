@@ -158,7 +158,13 @@ class RecordingEngine:
         default_factory=lambda: RecordingRemoteMethod("destroy_ref")
     )
     start_weight_update: RecordingRemoteMethod = field(default_factory=lambda: RecordingRemoteMethod("start_ref"))
+    start_draft_weight_update: RecordingRemoteMethod = field(
+        default_factory=lambda: RecordingRemoteMethod("start_draft_ref")
+    )
     finish_weight_update: RecordingRemoteMethod = field(default_factory=lambda: RecordingRemoteMethod("finish_ref"))
+    pause_generation: RecordingRemoteMethod = field(default_factory=lambda: RecordingRemoteMethod("pause_ref"))
+    flush_cache: RecordingRemoteMethod = field(default_factory=lambda: RecordingRemoteMethod("flush_ref"))
+    continue_generation: RecordingRemoteMethod = field(default_factory=lambda: RecordingRemoteMethod("continue_ref"))
 
 
 @dataclass
@@ -595,6 +601,98 @@ def test_weight_update_session_calls_start_and_finish(upw, monkeypatch):
     assert len(engines[0].finish_weight_update.calls) == 1
     assert len(engines[1].finish_weight_update.calls) == 1
     assert barrier_calls == ["dummy-gloo-group", "dummy-gloo-group"]
+
+
+@pytest.mark.unit
+def test_draft_weight_update_session_calls_draft_start(upw, monkeypatch):
+    engines = [RecordingEngine(), RecordingEngine()]
+    barrier_calls: list[object] = []
+
+    monkeypatch.setattr(upw.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(
+        upw.dist,
+        "barrier",
+        lambda *, group=None, **kwargs: barrier_calls.append(group),
+    )
+    monkeypatch.setattr(upw, "get_gloo_group", lambda: "dummy-gloo-group")
+    monkeypatch.setattr(upw.ray, "get", lambda refs: refs)
+
+    upw._begin_vllm_draft_weight_update_session(engines)
+
+    assert all(len(engine.start_draft_weight_update.calls) == 1 for engine in engines)
+    assert all(len(engine.start_weight_update.calls) == 0 for engine in engines)
+    assert barrier_calls == ["dummy-gloo-group"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("enable_training", "speculative_config", "expected"),
+    [
+        (True, {"method": "mtp"}, True),
+        (False, {"method": "mtp"}, False),
+        (True, {"method": "ngram"}, False),
+        (True, None, False),
+    ],
+)
+def test_sync_mtp_draft_gate(upw, enable_training, speculative_config, expected):
+    args = type(
+        "Args",
+        (),
+        {
+            "enable_mtp_training": enable_training,
+            "vllm_speculative_config": speculative_config,
+        },
+    )()
+    assert upw._sync_mtp_draft_enabled(args) is expected
+
+
+@pytest.mark.unit
+def test_distributed_mtp_update_replays_weights_before_resume(upw, monkeypatch):
+    obj = _make_instance(upw)
+    obj.args.enable_mtp_training = True
+    obj.args.vllm_speculative_config = {"method": "mtp"}
+    engine = RecordingEngine()
+    obj.rollout_engines = [engine]
+    obj._send_weights = MagicMock()
+
+    monkeypatch.setattr(upw.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(upw.dist, "barrier", lambda *args, **kwargs: None)
+    monkeypatch.setattr(upw, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(upw.ray, "get", lambda refs: refs)
+    monkeypatch.setattr(upw.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(upw, "tqdm", lambda **kwargs: "pbar")
+
+    obj.update_weights()
+
+    assert obj._send_weights.call_count == 2
+    assert len(engine.pause_generation.calls) == 1
+    assert len(engine.start_weight_update.calls) == 1
+    assert len(engine.start_draft_weight_update.calls) == 1
+    assert len(engine.finish_weight_update.calls) == 2
+    assert len(engine.continue_generation.calls) == 1
+
+
+@pytest.mark.unit
+def test_distributed_mtp_draft_failure_does_not_resume(upw, monkeypatch):
+    obj = _make_instance(upw)
+    obj.args.enable_mtp_training = True
+    obj.args.vllm_speculative_config = {"method": "mtp"}
+    engine = RecordingEngine()
+    obj.rollout_engines = [engine]
+    obj._send_weights = MagicMock(side_effect=[None, RuntimeError("draft send failed")])
+
+    monkeypatch.setattr(upw.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(upw.dist, "barrier", lambda *args, **kwargs: None)
+    monkeypatch.setattr(upw, "get_gloo_group", lambda: "gloo")
+    monkeypatch.setattr(upw.ray, "get", lambda refs: refs)
+    monkeypatch.setattr(upw.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(upw, "tqdm", lambda **kwargs: "pbar")
+
+    with pytest.raises(RuntimeError, match="draft send failed"):
+        obj.update_weights()
+
+    assert len(engine.finish_weight_update.calls) == 2
+    assert len(engine.continue_generation.calls) == 0
 
 
 @pytest.mark.unit

@@ -199,6 +199,26 @@ def test_build_vllm_cmd_does_not_infer_sleep_mode_from_colocate(vllm_args):
 
 
 @pytest.mark.unit
+def test_build_vllm_cmd_injects_worker_extension_for_dedicated_mtp(vllm_args, monkeypatch):
+    vllm_args.enable_mtp_training = True
+    vllm_args.vllm_speculative_config = {"method": "mtp"}
+    vllm_args.colocate = False
+    monkeypatch.setattr(mod, "is_npu", lambda: False)
+    server_args = mod._compute_server_args(
+        vllm_args,
+        rank=0,
+        dist_init_addr=None,
+        host="127.0.0.1",
+        port=8000,
+    )
+
+    cmd, _ = mod.build_vllm_cmd_and_env(server_args)
+
+    extension_index = cmd.index("--worker-extension-cls")
+    assert cmd[extension_index + 1].endswith(".vLLMColocateWorkerExtension")
+
+
+@pytest.mark.unit
 def test_build_mooncake_kv_transfer_config_uses_disaggregation_port(vllm_args):
     vllm_args.disaggregation_backend = "mooncake"
     vllm_args.rollout_external = False
@@ -278,6 +298,27 @@ def test_start_weight_update_posts_four_phase_endpoint(vllm_engine, monkeypatch)
     assert len(calls) == 1
     assert calls[0][0] == "start_weight_update"
     assert calls[0][1] == {"is_checkpoint_format": True}
+
+
+@pytest.mark.unit
+def test_start_draft_weight_update_posts_collective_rpc(vllm_engine, monkeypatch):
+    calls: list[tuple] = []
+
+    def fake_post(endpoint: str, payload: dict):
+        calls.append((endpoint, payload))
+        return {"ok": True}
+
+    monkeypatch.setattr(vllm_engine, "_make_request", fake_post)
+
+    result = vllm_engine.start_draft_weight_update()
+
+    assert result == {"ok": True}
+    assert calls == [
+        (
+            "collective_rpc",
+            {"method": "start_draft_weight_update", "kwargs": {}},
+        )
+    ]
 
 
 @pytest.mark.unit
@@ -723,6 +764,7 @@ def test_control_plane_methods_noop_on_headless_worker(vllm_engine, monkeypatch)
 
     assert vllm_engine.init_weight_transfer_engine({"init_info": {}}) is None
     assert vllm_engine.start_weight_update() is None
+    assert vllm_engine.start_draft_weight_update() is None
     assert vllm_engine.finish_weight_update() is None
     assert vllm_engine.init_weights_update_group("addr", 1, 0, 4, "g", "nccl") is None
     assert vllm_engine.update_weights_from_distributed(["w"], [torch.float32], [[1]], "g") is None

@@ -6,6 +6,7 @@ import importlib
 import sys
 import types
 from argparse import Namespace
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock, patch
 
@@ -68,6 +69,13 @@ def _install_stubs():
     upw_dist_mod.disconnect_rollout_engines_from_distributed = MagicMock()
     upw_dist_mod.post_process_weights = MagicMock()
     upw_dist_mod.update_weights_from_distributed = MagicMock(return_value=[])
+    upw_dist_mod._begin_vllm_weight_update_session = MagicMock()
+    upw_dist_mod._begin_vllm_draft_weight_update_session = MagicMock()
+    upw_dist_mod._end_vllm_weight_update_session = MagicMock()
+    upw_dist_mod._sync_mtp_draft_enabled = lambda args: bool(
+        getattr(args, "enable_mtp_training", False)
+        and (getattr(args, "vllm_speculative_config", None) or {}).get("method") == "mtp"
+    )
 
     for key, mod in [
         ("vime.backends.megatron_utils.update_weight.hf_weight_iterator_base", hf_base_mod),
@@ -145,6 +153,7 @@ class RecordingVLLMEngine:
     resume_memory_occupation: RecordingRemoteMethod = field(default_factory=RecordingRemoteMethod)
     init_weight_transfer_engine: RecordingRemoteMethod = field(default_factory=RecordingRemoteMethod)
     start_weight_update: RecordingRemoteMethod = field(default_factory=RecordingRemoteMethod)
+    start_draft_weight_update: RecordingRemoteMethod = field(default_factory=RecordingRemoteMethod)
     finish_weight_update: RecordingRemoteMethod = field(default_factory=RecordingRemoteMethod)
     update_weights_from_tensor: RecordingRemoteMethod = field(default_factory=RecordingRemoteMethod)
     pause_generation: RecordingRemoteMethod = field(default_factory=RecordingRemoteMethod)
@@ -159,6 +168,8 @@ def _default_args(**kwargs) -> Namespace:
         rollout_num_gpus_per_engine=2,
         megatron_to_hf_mode="raw",
         update_weight_buffer_size=1 << 30,
+        enable_mtp_training=False,
+        vllm_speculative_config=None,
     )
     base.update(kwargs)
     return Namespace(**base)
@@ -207,7 +218,7 @@ def _run_update(obj, *, chunks=None, rank=0, slot_size=1) -> dict:
     """
     chunks = chunks or _chunks(1)
     obj._hf_weight_iterator = MagicMock()
-    obj._hf_weight_iterator.get_hf_weight_chunks.return_value = iter(chunks)
+    obj._hf_weight_iterator.get_hf_weight_chunks.side_effect = lambda *args, **kwargs: iter(chunks)
 
     counters = {"barrier": 0, "ipc_collect": 0}
 
@@ -220,7 +231,8 @@ def _run_update(obj, *, chunks=None, rank=0, slot_size=1) -> dict:
     with patch("torch.distributed.get_rank", return_value=rank), patch(
         "torch.distributed.get_world_size", return_value=slot_size
     ), patch("torch.distributed.barrier", side_effect=counting_barrier), patch(
-        "torch.cuda.ipc_collect", side_effect=counting_ipc_collect
+        f"{MODULE_PATH}._device_module",
+        return_value=types.SimpleNamespace(ipc_collect=counting_ipc_collect),
     ):
         obj.update_weights()
     return counters
@@ -443,3 +455,226 @@ def test_ipc_init_runs_once_in_connect(upw_vllm):
         )
     assert len(engines2[0].init_weight_transfer_engine.calls) == 0
     assert len(engines2[1].init_weight_transfer_engine.calls) == 0
+
+
+@pytest.mark.unit
+def test_mtp_update_replays_full_stream_to_draft(upw_vllm):
+    obj = _make_instance(
+        upw_vllm,
+        args=_default_args(
+            enable_mtp_training=True,
+            vllm_speculative_config={"method": "mtp"},
+        ),
+    )
+    engine = RecordingVLLMEngine()
+    _bind_single_slot(obj, engine, src=0)
+    chunks = _chunks(2)
+    dummy_info = {
+        "names": ["w"],
+        "dtype_names": ["float32"],
+        "shapes": [[2, 2]],
+        "ipc_handles": [{"u": ("f", ())}],
+    }
+
+    with patch(
+        f"{MODULE_PATH}._build_ipc_update_info_from_named_tensors",
+        return_value=(dummy_info, []),
+    ):
+        _run_update(obj, chunks=chunks)
+
+    assert len(engine.start_weight_update.calls) == 1
+    assert len(engine.start_draft_weight_update.calls) == 1
+    assert len(engine.finish_weight_update.calls) == 2
+    assert len(engine.update_weights_from_tensor.calls) == 2 * len(chunks)
+    assert obj._hf_weight_iterator.get_hf_weight_chunks.call_count == 2
+    assert len(engine.continue_generation.calls) == 1
+
+
+@pytest.mark.unit
+def test_mtp_update_failure_does_not_resume_generation(upw_vllm):
+    obj = _make_instance(
+        upw_vllm,
+        args=_default_args(
+            enable_mtp_training=True,
+            vllm_speculative_config={"method": "mtp"},
+        ),
+    )
+    engine = RecordingVLLMEngine()
+    _bind_single_slot(obj, engine, src=0)
+    engine.start_draft_weight_update.remote = MagicMock(side_effect=RuntimeError("draft unavailable"))
+    dummy_info = {
+        "names": ["w"],
+        "dtype_names": ["float32"],
+        "shapes": [[2, 2]],
+        "ipc_handles": [{"u": ("f", ())}],
+    }
+
+    with patch(
+        f"{MODULE_PATH}._build_ipc_update_info_from_named_tensors",
+        return_value=(dummy_info, []),
+    ), pytest.raises(RuntimeError, match="draft unavailable"):
+        _run_update(obj, chunks=_chunks(1))
+
+    assert len(engine.continue_generation.calls) == 0
+
+
+@pytest.mark.unit
+def test_mtp_update_replays_to_both_ipc_and_distributed_engines(upw_vllm):
+    obj = _make_instance(
+        upw_vllm,
+        args=_default_args(
+            enable_mtp_training=True,
+            vllm_speculative_config={"method": "mtp"},
+        ),
+    )
+    ipc_engine = RecordingVLLMEngine()
+    distributed_engine = RecordingVLLMEngine()
+    _bind_single_slot(obj, ipc_engine, src=0)
+    obj.use_distribute = True
+    obj.distributed_rollout_engines = [distributed_engine]
+    obj._is_distributed_src_rank = True
+    obj._model_update_groups = "groups"
+    chunks = _chunks(2)
+    dummy_info = {
+        "names": ["w"],
+        "dtype_names": ["float32"],
+        "shapes": [[2, 2]],
+        "ipc_handles": [{"u": ("f", ())}],
+    }
+    upw_vllm.update_weights_from_distributed.reset_mock()
+    upw_vllm._begin_vllm_weight_update_session.reset_mock()
+    upw_vllm._begin_vllm_draft_weight_update_session.reset_mock()
+    upw_vllm._end_vllm_weight_update_session.reset_mock()
+
+    with patch(
+        f"{MODULE_PATH}._build_ipc_update_info_from_named_tensors",
+        return_value=(dummy_info, []),
+    ):
+        _run_update(obj, chunks=chunks)
+
+    assert len(ipc_engine.update_weights_from_tensor.calls) == 2 * len(chunks)
+    assert upw_vllm.update_weights_from_distributed.call_count == 2 * len(chunks)
+    upw_vllm._begin_vllm_weight_update_session.assert_called_once_with([distributed_engine])
+    upw_vllm._begin_vllm_draft_weight_update_session.assert_called_once_with([distributed_engine])
+    assert upw_vllm._end_vllm_weight_update_session.call_count == 2
+    assert len(ipc_engine.continue_generation.calls) == 1
+    assert len(distributed_engine.continue_generation.calls) == 1
+
+
+@pytest.mark.unit
+def test_worker_draft_session_selects_drafter_model(upw_vllm):
+    draft_model = torch.nn.Linear(2, 2, bias=False)
+    target_model = torch.nn.Linear(2, 2, bias=False)
+    target_config = object()
+    draft_config = object()
+    initialize_layerwise_reload = MagicMock()
+    reload_module = types.ModuleType("vllm.model_executor.model_loader.reload")
+    reload_module.initialize_layerwise_reload = initialize_layerwise_reload
+    worker = types.SimpleNamespace(
+        _check_weight_transfer_engine=lambda: None,
+        _check_nz_disabled=lambda: None,
+        _weight_update_active=False,
+        device="cpu",
+        model_runner=types.SimpleNamespace(
+            model=target_model,
+            drafter=types.SimpleNamespace(model=draft_model),
+        ),
+        model_config=target_config,
+        vllm_config=types.SimpleNamespace(
+            speculative_config=types.SimpleNamespace(draft_model_config=draft_config)
+        ),
+    )
+
+    with patch.dict(
+        sys.modules,
+        {"vllm.model_executor.model_loader.reload": reload_module},
+    ):
+        upw_vllm.vLLMColocateWorkerExtension.start_draft_weight_update(worker)
+
+    initialize_layerwise_reload.assert_called_once_with(draft_model)
+    assert worker._weight_update_active is True
+    assert worker._is_checkpoint_format is True
+    assert worker._vime_weight_update_model is draft_model
+    assert worker._vime_weight_update_model_config is draft_config
+    assert worker._vime_weight_update_role == "draft"
+
+    with upw_vllm._use_selected_vllm_weight_update_target(worker):
+        assert worker.model_runner.model is draft_model
+        assert worker.model_config is draft_config
+    assert worker.model_runner.model is target_model
+    assert worker.model_config is target_config
+
+
+@pytest.mark.unit
+def test_worker_draft_session_fails_without_drafter(upw_vllm):
+    worker = types.SimpleNamespace(
+        _check_weight_transfer_engine=lambda: None,
+        _check_nz_disabled=lambda: None,
+        _weight_update_active=False,
+        model_runner=types.SimpleNamespace(model=torch.nn.Linear(2, 2), drafter=None),
+        vllm_config=types.SimpleNamespace(speculative_config=None),
+    )
+
+    with pytest.raises(RuntimeError, match="no draft model"):
+        upw_vllm.vLLMColocateWorkerExtension.start_draft_weight_update(worker)
+
+
+@pytest.mark.unit
+def test_worker_draft_loader_receives_complete_checkpoint_stream(upw_vllm):
+    class RecordingLoader:
+        def __init__(self):
+            self.loaded: list[tuple[str, torch.Tensor]] = []
+
+        def load_weights(self, *, weights):
+            self.loaded.extend((name, weight.clone()) for name, weight in weights)
+
+    target_model = RecordingLoader()
+    draft_model = RecordingLoader()
+    worker = types.SimpleNamespace(
+        _weight_update_active=True,
+        _is_checkpoint_format=True,
+        _vime_weight_update_model=draft_model,
+        device="cpu",
+        model_runner=types.SimpleNamespace(model=target_model),
+        vllm_config=object(),
+    )
+    names = [
+        "model.embed_tokens.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "lm_head.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+    ]
+    physical_gpu_id = "gpu-0"
+
+    def rebuild_tensor(value, *_args):
+        return torch.full((2, 2), value)
+
+    update_info = {
+        "names": names,
+        "shapes": [[2, 2]] * len(names),
+        "ipc_handles": [
+            {
+                physical_gpu_id: (
+                    rebuild_tensor,
+                    (float(index + 1), None, None, None, None, None, 7),
+                )
+            }
+            for index, _name in enumerate(names)
+        ],
+    }
+    config_module = types.ModuleType("vllm.config")
+    config_module.set_current_vllm_config = lambda _config: nullcontext()
+    device_module = types.SimpleNamespace(
+        current_device=lambda: 0,
+        get_device_properties=lambda _index: types.SimpleNamespace(uuid=physical_gpu_id),
+    )
+
+    with patch.dict(sys.modules, {"vllm.config": config_module}), patch(
+        f"{MODULE_PATH}._device_module", return_value=device_module
+    ), patch.object(torch.accelerator, "synchronize"):
+        upw_vllm.vLLMColocateWorkerExtension.update_weights_chunk(worker, update_info)
+
+    assert [name for name, _weight in draft_model.loaded] == names
+    for index, (_name, weight) in enumerate(draft_model.loaded):
+        assert torch.equal(weight, torch.full((2, 2), float(index + 1)))
+    assert target_model.loaded == []
