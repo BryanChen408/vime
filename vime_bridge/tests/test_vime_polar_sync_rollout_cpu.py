@@ -75,6 +75,15 @@ class FakeDataSource:
         return out
 
 
+class RequeueDataSource(FakeDataSource):
+    def __init__(self, exhaust_after: int | None = None):
+        super().__init__(exhaust_after=exhaust_after)
+        self.requeued: list[list[object]] = []
+
+    def add_samples(self, samples):
+        self.requeued.extend(samples)
+
+
 @pytest.fixture
 def stub_output(monkeypatch):
     """Stub the training-output type and metric helpers (they need slime types)."""
@@ -92,10 +101,12 @@ def _script_groups(monkeypatch, script, seconds=None):
     seq = iter(script)
     durations = iter(seconds) if seconds is not None else None
 
-    async def fake_group(*, client, args, config, rollout_id, group, group_id):
+    async def fake_group(*, client, args, config, rollout_id, group, group_id, handle=None):
         verdict = next(seq)
         elapsed = next(durations) if durations is not None else 0.0
         await asyncio.sleep(0)
+        if handle is not None:
+            handle.task_ids.append(f"task-{group_id}")
         if verdict == "raise":
             raise RuntimeError("injected transport failure")
         if verdict:
@@ -221,11 +232,41 @@ def test_policy_version_always_equals_rollout_id(monkeypatch, stub_output):
 
 
 # --------------------------------------------------------------------------
-# 6. the oversubscribe seam refuses to silently leak in-flight sessions
+# 6. oversubscribe cancellation and group requeue
 # --------------------------------------------------------------------------
-def test_oversubscribe_above_one_is_rejected(stub_output):
-    with pytest.raises(NotImplementedError, match="oversubscribe"):
+def test_oversubscribe_requires_group_requeue_capability(stub_output):
+    with pytest.raises(R.PolarRolloutSchedulerError, match="add_samples"):
         asyncio.run(R._run_sync_train_rollout(_args(rollout_sync_oversubscribe_factor=1.5), 0, FakeDataSource()))
+
+
+def test_read_only_rollout_data_source_is_not_treated_as_requeue_capable():
+    def inherited_read_only_add_samples(self, samples):
+        raise RuntimeError("read only")
+
+    inherited_read_only_add_samples.__module__ = "vime.rollout.data_source"
+    inherited_read_only_add_samples.__qualname__ = "RolloutDataSource.add_samples"
+    source_type = type(
+        "RolloutDataSourceChild",
+        (),
+        {"add_samples": inherited_read_only_add_samples},
+    )
+
+    assert not R._supports_sync_requeue(source_type())
+
+
+def test_oversubscribe_factor_is_capped(stub_output):
+    class RequeueDataSource(FakeDataSource):
+        def add_samples(self, samples):
+            self.requeued = samples
+
+    with pytest.raises(ValueError, match="<= 1.50"):
+        asyncio.run(
+            R._run_sync_train_rollout(
+                _args(rollout_sync_oversubscribe_factor=1.51),
+                0,
+                RequeueDataSource(),
+            )
+        )
 
 
 def test_oversubscribe_below_one_is_rejected(stub_output):
@@ -250,6 +291,96 @@ def test_abort_inflight_refuses_to_drop_live_work():
             task.cancel()
 
     asyncio.run(_run())
+
+
+def test_abort_inflight_cancels_tasks_and_requeues_nonselected_groups():
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"all_cancelled": True, "cancelled_sessions": 2}
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, params=None):
+            self.calls.append((url, params))
+            return Response()
+
+    class RequeueDataSource:
+        def __init__(self):
+            self.groups = []
+
+        def add_samples(self, groups):
+            self.groups.extend(groups)
+
+    async def _run():
+        selected = R._SyncGroupHandle(group=["selected"], group_id=0, selected=True)
+        selected.outcome = R._SyncGroupOutcome(group=selected.group, accepted=True)
+        surplus = R._SyncGroupHandle(group=["surplus"], group_id=1)
+        surplus.outcome = R._SyncGroupOutcome(group=surplus.group, accepted=True)
+        pending = R._SyncGroupHandle(group=["pending"], group_id=2, task_ids=["task-pending"])
+        task = asyncio.create_task(asyncio.sleep(60))
+        source = RequeueDataSource()
+        client = Client()
+        try:
+            stats = await R._abort_inflight(
+                {task},
+                _args(),
+                data_source=source,
+                handles={
+                    asyncio.create_task(asyncio.sleep(0)): surplus,
+                    task: pending,
+                },
+                client=client,
+                rollout_server_url="http://polar",
+            )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert stats.aborted_sessions == 2
+        assert source.groups == [["surplus"], ["pending"]]
+        assert client.calls == [
+            (
+                "http://polar/rollout/task/task-pending/cancel",
+                {"reason": "sync_oversubscribe_abort"},
+            )
+        ]
+
+    asyncio.run(_run())
+
+
+def test_oversubscribe_selects_first_groups_and_requeues_surplus(monkeypatch, stub_output):
+    _script_groups(monkeypatch, [True, True, True])
+    source = RequeueDataSource()
+    captured = {}
+
+    async def fake_abort(pending, args, *, data_source, handles=None, client=None, rollout_server_url=None):
+        captured["handles"] = handles
+        for handle in handles.values():
+            if not handle.selected:
+                data_source.add_samples([handle.group])
+        return R._AbortStats(aborted_groups=1, aborted_sessions=2, requeued_groups=1)
+
+    monkeypatch.setattr(R, "_abort_inflight", fake_abort)
+    out = asyncio.run(
+        R._run_sync_train_rollout(
+            _args(rollout_batch_size=2, rollout_sync_oversubscribe_factor=1.5),
+            0,
+            source,
+        )
+    )
+
+    assert len(out.samples) == 2
+    assert out.metrics["polar/sync/submitted_groups"] == 3
+    assert out.metrics["polar/sync/requeued_groups"] == 1
+    assert len(source.requeued) == 1
+    assert source.requeued[0][0].group_index == 3
+    assert len(captured["handles"]) == 1
 
 
 # --------------------------------------------------------------------------

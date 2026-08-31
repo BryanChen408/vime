@@ -728,7 +728,9 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "rollout_batch_size that are accepted. 1.0 means strict synchronous: "
                     "submit exactly what is needed and wait for all of it, so nothing is "
                     "still generating when the call returns and the engine can sleep. "
-                    "Values above 1.0 need in-flight abort, which is not implemented yet."
+                    "Values above 1.0 use Polar task cancellation and require a data source "
+                    "with add_samples() so non-selected groups can be requeued; the "
+                    "supported canary range is capped by the synchronous rollout path."
                 ),
             )
             parser.add_argument("--polar-allow-weight-update-overlap", action=argparse.BooleanOptionalAction, default=None)

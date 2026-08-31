@@ -48,6 +48,9 @@ _SESSION_POOL_RUN_RELEASE_POLL_SECONDS = 2.0
 _SESSION_POOL_RUN_RELEASE_POLL_TIMEOUT_SECONDS = 1.0
 # Synchronous path: per-rollout ceiling on group resubmissions before giving up.
 _SYNC_MAX_SUBMIT_MULTIPLIER = 4
+_SYNC_MAX_OVERSUBSCRIBE_FACTOR = 1.5
+_SYNC_ABORT_REASON = "sync_oversubscribe_abort"
+_SYNC_ABORT_TIMEOUT_SECONDS = 30.0
 _LONGEST_TRACE_ARTIFACT_INTERVAL = 5  # dump longest trace every N rollouts
 _SESSION_POOL_RUN_RELEASE_STATUSES = frozenset({
     str(SessionStatus.POST_RUN),
@@ -65,6 +68,10 @@ class PolarRolloutSchedulerError(RuntimeError):
 
 class PolarLowCompleteAcceptFractionError(PolarRolloutSchedulerError):
     """Raised when a completed task has too few trainable completed sessions."""
+
+
+class _SyncGroupAbortRequested(Exception):
+    """Stop a group between chunk submissions after the winner is selected."""
 
 
 class _NoopCallbackServer:
@@ -908,6 +915,7 @@ async def _submit_and_wait_for_task(
     *,
     poll_interval: float = _POLL_INTERVAL,
     submit_path: str = "/rollout/task/submit",
+    on_task_id: Any | None = None,
 ) -> TaskResult:
     """Submit one task via the async endpoint and poll until terminal."""
     resp = await client.post(
@@ -917,6 +925,8 @@ async def _submit_and_wait_for_task(
     )
     resp.raise_for_status()
     task_id = resp.json()["task_id"]
+    if on_task_id is not None:
+        on_task_id(str(task_id))
 
     while True:
         await asyncio.sleep(poll_interval)
@@ -2643,6 +2653,18 @@ def _pull_sample_groups(data_source: Any, batch_size: int) -> list[list[Any]]:
     return groups
 
 
+def _supports_sync_requeue(data_source: Any) -> bool:
+    add_samples = getattr(data_source, "add_samples", None)
+    if not callable(add_samples):
+        return False
+    implementation = getattr(type(data_source), "add_samples", None)
+    return not (
+        getattr(implementation, "__module__", None) == "vime.rollout.data_source"
+        and getattr(implementation, "__qualname__", None)
+        == "RolloutDataSource.add_samples"
+    )
+
+
 def _build_metrics(
     config: PolarSlimeConfig,
     task_results: list[TaskResult],
@@ -2679,6 +2701,7 @@ class _SyncGroupOutcome:
     samples: list[Any] | None = None
     task_result: TaskResult | None = None
     rejection_reason: str | None = None
+    task_ids: list[str] = field(default_factory=list)
     # Wall-clock from submission to terminal state. Under strict synchronous
     # collection the step lasts as long as the slowest group, so the spread of
     # these is the direct measure of what oversubscribe+abort would buy.
@@ -2692,11 +2715,30 @@ class _AbortStats:
     requeued_groups: int = 0
 
 
+@dataclass(slots=True)
+class _SyncGroupHandle:
+    """Live submission handle for one logical input group."""
+
+    group: list[Any]
+    group_id: int
+    task_ids: list[str] = field(default_factory=list)
+    outcome: _SyncGroupOutcome | None = None
+    selected: bool = False
+    cancel_requested: bool = False
+    submission_idle: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def __post_init__(self) -> None:
+        self.submission_idle.set()
+
+
 async def _abort_inflight(
     pending: set[asyncio.Task],
     args: Any,
     *,
     data_source: Any,
+    handles: dict[asyncio.Task, _SyncGroupHandle] | None = None,
+    client: httpx.AsyncClient | None = None,
+    rollout_server_url: str | None = None,
 ) -> _AbortStats:
     """Terminate groups still generating once the batch is full.
 
@@ -2705,25 +2747,97 @@ async def _abort_inflight(
     once every submitted group reached a terminal state, so ``pending`` is
     always empty here and this is a no-op.
 
-    Implementing oversubscription means filling this in with:
-      1. ``GET /tasks/{task_id}/sessions``  -> session ids (rollout server :8080)
-      2. ``DELETE /sessions/{sid}``         -> gateway :8100; cancels the agent
-         *and* the upstream vLLM generation (polar/gateway/inflight.py:95-108),
-         which is what makes a subsequent engine sleep safe
-      3. ``data_source.add_samples([group])`` -> requeue. RolloutDataSourceWithBuffer
-         drains its buffer before the epoch iterator, so a requeued group is
-         submitted first in the next window.
+    Oversubscription uses one task-level cancel request per Polar child task.
+    Polar owns the session-to-gateway mapping and confirms upstream cleanup;
+    VIME only requeues each original logical group once.
 
     Aborted trajectories must NOT be scored or trained on -- metrics only.
-    Blocked on ``--polar-gateway-url``, which vime does not register today.
+    The optional arguments keep the factor=1.0 no-op and preserve old callers.
     """
-    del args, data_source
-    if pending:
+    del args
+    if not pending and not handles:
+        return _AbortStats()
+    if handles is None or client is None or rollout_server_url is None:
         raise NotImplementedError(
-            f"{len(pending)} groups still in flight; aborting them is not implemented yet. "
-            "Only --rollout-sync-oversubscribe-factor 1.0 is supported."
+            "in-flight abort requires Polar task handles and a rollout server client"
         )
-    return _AbortStats()
+
+    all_handles = list(handles.values())
+    cancel_handles = [
+        handle for handle in all_handles
+        if handle.outcome is None
+        or (handle.outcome.task_result is None and handle.task_ids)
+    ]
+    requeue_handles = [
+        handle for handle in all_handles
+        if not handle.selected and (
+            handle.outcome is None or handle.outcome.accepted
+            or (handle.outcome.task_result is None and handle.task_ids)
+        )
+    ]
+    for handle in cancel_handles:
+        handle.cancel_requested = True
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(handle.submission_idle.wait() for handle in cancel_handles)),
+            timeout=_SYNC_ABORT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise PolarRolloutSchedulerError(
+            "Polar sync abort timed out waiting for task submission IDs"
+        ) from exc
+    cancel_errors: list[str] = []
+    aborted_sessions = 0
+    for handle in cancel_handles:
+        for task_id in dict.fromkeys(handle.task_ids):
+            try:
+                response = await asyncio.wait_for(
+                    client.post(
+                        f"{rollout_server_url}/rollout/task/{task_id}/cancel",
+                        params={"reason": _SYNC_ABORT_REASON},
+                    ),
+                    timeout=_SYNC_ABORT_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                result = response.json()
+                if result.get("all_cancelled") is not True:
+                    cancel_errors.append(f"{task_id}: {result!r}")
+                aborted_sessions += int(result.get("cancelled_sessions", 0) or 0)
+            except Exception as exc:  # noqa: BLE001
+                cancel_errors.append(f"{task_id}: {exc}")
+
+    if cancel_errors:
+        raise PolarRolloutSchedulerError(
+            "Polar sync abort did not converge; refusing to train: "
+            + "; ".join(cancel_errors)
+        )
+
+    pending_tasks = [task for task in pending if not task.done()]
+    for task in pending_tasks:
+        task.cancel()
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    requeued_groups = 0
+    add_samples = getattr(data_source, "add_samples", None)
+    if not callable(add_samples):
+        raise PolarRolloutSchedulerError(
+            "Polar sync oversubscription requires data_source.add_samples() for group requeue"
+        )
+    if requeue_handles:
+        try:
+            add_samples([handle.group for handle in requeue_handles])
+        except Exception as exc:  # noqa: BLE001
+            raise PolarRolloutSchedulerError(
+                "Polar sync abort completed but group requeue failed; refusing to train"
+            ) from exc
+        requeued_groups = len(requeue_handles)
+
+    return _AbortStats(
+        aborted_groups=len(pending_tasks),
+        aborted_sessions=aborted_sessions,
+        requeued_groups=requeued_groups,
+    )
 
 
 async def _run_sync_train_group(
@@ -2734,6 +2848,7 @@ async def _run_sync_train_group(
     rollout_id: int,
     group: list[Any],
     group_id: int,
+    handle: _SyncGroupHandle | None = None,
 ) -> _SyncGroupOutcome:
     """Submit one group and wait for its terminal TaskResult.
 
@@ -2759,17 +2874,39 @@ async def _run_sync_train_group(
     )
 
     async def submit_one(chunk: dict[str, Any]) -> TaskResult:
+        if handle is not None:
+            if handle.cancel_requested:
+                raise _SyncGroupAbortRequested
+            planned_task_id = str(chunk["task_id"])
+            if planned_task_id not in handle.task_ids:
+                handle.task_ids.append(planned_task_id)
+            handle.submission_idle.clear()
         submit_path = (
             "/rollout/operator_samples/submit"
             if config.submit_mode == "operator_samples"
             else "/rollout/task/submit"
         )
-        return await _submit_and_wait_for_task(
-            client,
-            config.rollout_server_url,
-            chunk,
-            submit_path=submit_path,
-        )
+        task_id_recorded = False
+
+        def _record_task_id(task_id: str) -> None:
+            nonlocal task_id_recorded
+            task_id_recorded = True
+            if handle is not None:
+                if task_id not in handle.task_ids:
+                    handle.task_ids.append(task_id)
+                handle.submission_idle.set()
+
+        try:
+            return await _submit_and_wait_for_task(
+                client,
+                config.rollout_server_url,
+                chunk,
+                submit_path=submit_path,
+                on_task_id=(_record_task_id if handle is not None else None),
+            )
+        finally:
+            if handle is not None and not task_id_recorded:
+                handle.submission_idle.set()
 
     task_result = await _submit_payload_in_chunks(
         payload,
@@ -2783,6 +2920,7 @@ async def _run_sync_train_group(
             accepted=False,
             task_result=task_result,
             rejection_reason=reason,
+            task_ids=list(handle.task_ids) if handle is not None else [],
             elapsed=time.monotonic() - group_started,
         )
 
@@ -2806,6 +2944,7 @@ async def _run_sync_train_group(
         accepted=True,
         samples=samples,
         task_result=task_result,
+        task_ids=list(handle.task_ids) if handle is not None else [],
         elapsed=time.monotonic() - group_started,
     )
 
@@ -2853,11 +2992,15 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
     factor = float(getattr(args, "rollout_sync_oversubscribe_factor", 1.0) or 1.0)
     if factor < 1.0:
         raise ValueError("--rollout-sync-oversubscribe-factor must be >= 1.0")
-    if factor > 1.0:
-        # Guard rather than silently leaking in-flight sessions into an engine sleep.
-        raise NotImplementedError(
-            "--rollout-sync-oversubscribe-factor > 1.0 needs _abort_inflight, which is "
-            "blocked on --polar-gateway-url; see vime_polar_sync_colocate_design.md §7."
+    if factor > _SYNC_MAX_OVERSUBSCRIBE_FACTOR:
+        raise ValueError(
+            "--rollout-sync-oversubscribe-factor must be <= "
+            f"{_SYNC_MAX_OVERSUBSCRIBE_FACTOR:.2f}"
+        )
+    oversubscribed = factor > 1.0
+    if oversubscribed and not _supports_sync_requeue(data_source):
+        raise PolarRolloutSchedulerError(
+            "Polar sync oversubscription requires data_source.add_samples() for group requeue"
         )
     submit_n = math.ceil(need * factor)
     # Ceiling on resubmissions within one rollout. A systematically failing group
@@ -2876,29 +3019,37 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         pending: set[asyncio.Task[_SyncGroupOutcome]] = set()
+        handles: dict[asyncio.Task[_SyncGroupOutcome], _SyncGroupHandle] = {}
+        selected_tasks: set[asyncio.Task[_SyncGroupOutcome]] = set()
 
         def _spawn(groups: list[list[Any]]) -> None:
             nonlocal group_counter
             for group in groups:
-                pending.add(
-                    asyncio.create_task(
-                        _run_sync_train_group(
-                            client=client,
-                            args=args,
-                            config=config,
-                            rollout_id=rollout_id,
-                            group=group,
-                            group_id=group_counter,
-                        ),
-                        name=f"polar-sync-group-{rollout_id}-{group_counter}",
-                    )
+                handle = _SyncGroupHandle(group=group, group_id=group_counter)
+                kwargs = {
+                    "client": client,
+                    "args": args,
+                    "config": config,
+                    "rollout_id": rollout_id,
+                    "group": group,
+                    "group_id": group_counter,
+                }
+                if oversubscribed:
+                    kwargs["handle"] = handle
+                task = asyncio.create_task(
+                    _run_sync_train_group(**kwargs),
+                    name=f"polar-sync-group-{rollout_id}-{group_counter}",
                 )
+                pending.add(task)
+                handles[task] = handle
                 group_counter += 1
 
         _spawn(_pull_sample_groups(data_source, submit_n))
 
         while len(accepted) < need:
             if not pending:
+                if oversubscribed:
+                    break
                 # Every submitted group was rejected or failed; pull replacements.
                 # Without this the call would return an undersized batch.
                 if group_counter >= max_submissions:
@@ -2922,15 +3073,23 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
             )
             pending = set(still_pending)
 
-            for task in done:
+            for task in sorted(done, key=lambda item: handles[item].group_id):
+                handle = handles[task]
                 exc = task.exception()
                 if exc is not None:
                     rejected += 1
+                    handle.outcome = _SyncGroupOutcome(
+                        group=handle.group,
+                        accepted=False,
+                        rejection_reason=str(exc),
+                        task_ids=list(handle.task_ids),
+                    )
                     logger.warning(
                         "Polar sync group failed, will top up: %s", exc, exc_info=exc
                     )
                     continue
                 outcome = task.result()
+                handle.outcome = outcome
                 group_seconds.append(outcome.elapsed)
                 if not outcome.accepted:
                     rejected += 1
@@ -2939,10 +3098,45 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
                     )
                 elif len(accepted) < need:
                     accepted.append(outcome)
+                    handle.selected = True
+                    selected_tasks.add(task)
                 else:
                     surplus += 1
 
-        abort_stats = await _abort_inflight(pending, args, data_source=data_source)
+        if oversubscribed:
+            if len(accepted) < need:
+                nonselected = {
+                    task: handle
+                    for task, handle in handles.items()
+                    if task not in selected_tasks
+                }
+                abort_stats = await _abort_inflight(
+                    pending,
+                    args,
+                    data_source=data_source,
+                    handles=nonselected,
+                    client=client,
+                    rollout_server_url=config.rollout_server_url,
+                )
+                raise PolarRolloutSchedulerError(
+                    f"Polar sync rollout {rollout_id}: only {len(accepted)}/{need} "
+                    "oversubscribed groups were accepted"
+                )
+            nonselected = {
+                task: handle
+                for task, handle in handles.items()
+                if task not in selected_tasks
+            }
+            abort_stats = await _abort_inflight(
+                pending,
+                args,
+                data_source=data_source,
+                handles=nonselected,
+                client=client,
+                rollout_server_url=config.rollout_server_url,
+            )
+        else:
+            abort_stats = await _abort_inflight(pending, args, data_source=data_source)
 
     elapsed = time.monotonic() - started
     logger.info(
