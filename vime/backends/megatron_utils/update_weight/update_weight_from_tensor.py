@@ -804,6 +804,63 @@ def _restore_vllm_param_attrs(model, captured: dict[str, dict[str, object]] | No
     return patched
 
 
+def _is_transposed_fused_moe_parameter(module: Any, parameter_name: str, parameter: Any) -> bool:
+    """Return whether an Ascend fused-MoE parameter uses runtime layout.
+
+    vLLM checkpoints use ``[experts, intermediate, hidden]`` for ``w13`` and
+    ``[experts, hidden, intermediate]`` for ``w2``.  Ascend's unquantized MoE
+    kernel stores both matrices with the final two dimensions exchanged.  The
+    runtime shape is the only reliable signal after ``process_weights_after_loading``
+    has replaced the Parameter object.
+    """
+    if getattr(parameter, "ndim", 0) != 3:
+        return False
+    quant_method = getattr(module, "quant_method", None)
+    if getattr(type(quant_method), "__name__", "") != "AscendUnquantizedFusedMoEMethod":
+        return False
+    moe_config = getattr(module, "moe_config", None)
+    hidden_size = getattr(moe_config, "hidden_dim", None)
+    if hidden_size is None:
+        return False
+    shape = tuple(parameter.shape)
+    if parameter_name == "w13_weight":
+        return shape[-2] == hidden_size and shape[-1] != hidden_size
+    if parameter_name == "w2_weight":
+        return shape[-1] == hidden_size and shape[-2] != hidden_size
+    return False
+
+
+def _make_transposed_fused_moe_loader(loader: Callable) -> Callable:
+    """Adapt canonical expert matrices to Ascend's transposed runtime layout."""
+    if getattr(loader, "_vime_transposed_moe_loader", False):
+        return loader
+
+    from functools import wraps
+
+    @wraps(loader)
+    def transposed_loader(param, loaded_weight, *args, **kwargs):
+        shard_id = kwargs.get("shard_id")
+        if shard_id is None and len(args) >= 2:
+            # Bound FusedMoE.weight_loader(..., weight_name, shard_id, ...).
+            shard_id = args[1]
+        weight_name = kwargs.get("weight_name")
+        if weight_name is None and args:
+            weight_name = args[0]
+        # Only unquantized expert matrices need this conversion.  Scales and
+        # auxiliary tensors have their own layouts and must pass through.
+        if (
+            shard_id in ("w1", "w2", "w3")
+            and isinstance(loaded_weight, torch.Tensor)
+            and loaded_weight.ndim >= 2
+            and not (isinstance(weight_name, str) and any(x in weight_name for x in ("scale", "zero", "offset")))
+        ):
+            loaded_weight = loaded_weight.transpose(-1, -2).contiguous()
+        return loader(param, loaded_weight, *args, **kwargs)
+
+    transposed_loader._vime_transposed_moe_loader = True  # type: ignore[attr-defined]
+    return transposed_loader
+
+
 def _restore_fused_moe_weight_loaders(model: Any) -> int:
     """Restore loaders lost when fused-MoE parameters are replaced.
 
@@ -811,7 +868,10 @@ def _restore_fused_moe_weight_loaders(model: Any) -> int:
     ``w2_weight`` with fresh ``Parameter`` objects. The replacement keeps the
     data but drops vLLM's custom ``weight_loader`` attribute. Reuse the owning
     FusedMoE loader so TP/EP shard and expert routing semantics remain intact;
-    a generic default loader could silently write the wrong shard.
+    a generic default loader could silently write the wrong shard. When the
+    replacement is in Ascend's runtime-transposed layout, install the small
+    adapter that transposes each canonical expert matrix and marks the loader
+    so vLLM flips its sharding dimension as well.
     """
     modules = getattr(model, "modules", None)
     if not callable(modules):
@@ -826,10 +886,28 @@ def _restore_fused_moe_weight_loaders(model: Any) -> int:
             continue
         for parameter_name in ("w13_weight", "w2_weight"):
             parameter = getattr(module, parameter_name, None)
-            if parameter is None or hasattr(parameter, "weight_loader"):
+            if parameter is None:
                 continue
+            is_transposed = _is_transposed_fused_moe_parameter(module, parameter_name, parameter)
+            if not is_transposed and hasattr(parameter, "weight_loader"):
+                continue
+            parameter_loader = _make_transposed_fused_moe_loader(loader) if is_transposed else loader
             try:
-                set_weight_attrs(parameter, {"weight_loader": loader})
+                if is_transposed and getattr(parameter, "_vime_transposed_moe_loader", False):
+                    continue
+                # ``set_weight_attrs`` intentionally rejects overwrites.  A
+                # previous reload may have reattached the raw owner loader,
+                # so remove only the two layout markers before installing the
+                # runtime-layout-aware loader.
+                if is_transposed:
+                    for attr in ("weight_loader", "is_transposed"):
+                        if hasattr(parameter, attr):
+                            delattr(parameter, attr)
+                attrs = {"weight_loader": parameter_loader}
+                if is_transposed:
+                    attrs["is_transposed"] = True
+                    attrs["_vime_transposed_moe_loader"] = True
+                set_weight_attrs(parameter, attrs)
             except (AssertionError, AttributeError, TypeError, RuntimeError):
                 # A repeated reload may attach it between the check and set.
                 continue

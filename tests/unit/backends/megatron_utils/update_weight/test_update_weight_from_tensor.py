@@ -706,3 +706,84 @@ def test_restore_fused_moe_weight_loaders_after_ep_parameter_replacement(upw_vll
         assert moe.w13_weight.weight_loader.__self__ is moe
         assert moe.w2_weight.weight_loader.__self__ is moe
         assert upw_vllm._restore_fused_moe_weight_loaders(model) == 0
+
+
+def test_restore_fused_moe_loader_adapts_ascend_runtime_layout(upw_vllm):
+    """A post-process replacement must not feed canonical matrices to runtime
+    transposed MoE storage.  This is the exact MTP/EP shape failure seen on NPU:
+    the owner loader shards w1/w3 on dim 1 and receives a per-expert transpose.
+    """
+
+    class FakeFusedMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.moe_config = types.SimpleNamespace(hidden_dim=8)
+
+            class AscendUnquantizedFusedMoEMethod:
+                pass
+
+            self.quant_method = AscendUnquantizedFusedMoEMethod()
+            # Ascend runtime layout: w13 [experts, hidden, 2 * intermediate].
+            self.w13_weight = torch.nn.Parameter(torch.zeros(2, 8, 4))
+            # Ascend runtime layout: w2 [experts, intermediate, hidden].
+            self.w2_weight = torch.nn.Parameter(torch.zeros(2, 2, 8))
+
+        def weight_loader(
+            self,
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success=False,
+        ):
+            shard_dim = {"w1": 0, "w2": 1, "w3": 0}[shard_id]
+            if getattr(param, "is_transposed", False):
+                shard_dim = int(not shard_dim)
+            expert_data = param.data[expert_id]
+            if shard_id == "w2":
+                expert_data.copy_(loaded_weight)
+                return True if return_success else None
+            shard_size = expert_data.shape[shard_dim] // 2
+            if shard_id == "w3":
+                start = shard_size
+            else:
+                start = 0
+            expert_data.narrow(shard_dim, start, shard_size).copy_(loaded_weight)
+            return True if return_success else None
+
+    model = torch.nn.Module()
+    moe = FakeFusedMoE()
+    model.add_module("moe", moe)
+    utils_module = types.ModuleType("vllm.model_executor.utils")
+
+    def set_weight_attrs(weight, attrs):
+        for name, value in attrs.items():
+            setattr(weight, name, value)
+
+    with patch.dict(sys.modules, {"vllm.model_executor.utils": utils_module}):
+        utils_module.set_weight_attrs = set_weight_attrs
+        assert upw_vllm._restore_fused_moe_weight_loaders(model) == 2
+
+    assert moe.w13_weight.is_transposed is True
+    loaded = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    moe.w13_weight.weight_loader(
+        moe.w13_weight,
+        loaded,
+        "experts.gate_up_proj.weight",
+        shard_id="w1",
+        expert_id=0,
+        return_success=True,
+    )
+    assert torch.equal(moe.w13_weight[0, :, :2], loaded.t())
+
+    loaded_w2 = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+    moe.w2_weight.weight_loader(
+        moe.w2_weight,
+        loaded_w2,
+        "experts.down_proj.weight",
+        shard_id="w2",
+        expert_id=0,
+        return_success=True,
+    )
+    assert torch.equal(moe.w2_weight[0], loaded_w2.t())
