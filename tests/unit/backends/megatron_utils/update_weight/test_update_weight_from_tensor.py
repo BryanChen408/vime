@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import warnings
 from argparse import Namespace
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -706,6 +707,20 @@ def test_restore_fused_moe_weight_loaders_after_ep_parameter_replacement(upw_vll
         assert moe.w13_weight.weight_loader.__self__ is moe
         assert moe.w2_weight.weight_loader.__self__ is moe
         assert upw_vllm._restore_fused_moe_weight_loaders(model) == 0
+
+
+@pytest.mark.unit
+def test_capture_vllm_param_attrs_skips_tensor_transpose_properties(upw_vllm):
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.zeros(2, 3, 4))
+    model.weight.weight_loader = object()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        attrs = upw_vllm._capture_vllm_param_attrs(model)["weight"]
+
+    assert attrs["weight_loader"] is model.weight.weight_loader
+    assert not {"T", "H", "mT", "mH"}.intersection(attrs)
 
 
 def test_restore_fused_moe_loader_adapts_ascend_runtime_layout(upw_vllm):
