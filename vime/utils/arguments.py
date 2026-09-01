@@ -679,6 +679,16 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             # vime_bridge/rollout.py:210 的 drain 超时。同步(colocate)训练里 prepare_policy_update
             # 要等 polar session 排空,而 agent session 动辄几十分钟,原来写死的 300s 必然超时。
             parser.add_argument("--polar-weight-update-pause-timeout", type=float, default=300.0)
+            parser.add_argument(
+                "--polar-policy-transition-enabled",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Use Polar's durable policy/weight transition protocol. Default off "
+                    "preserves the existing bridge control path."
+                ),
+            )
+            parser.add_argument("--polar-policy-control-timeout", type=float, default=45.0)
             # 关掉 = 权重更新时不等 polar 的 in-flight session,直接丢。同步(colocate)训练下
             # 引擎整个训练步都在 sleep,等 session 只是白等,见 vime_bridge/rollout.py prepare_policy_update。
             parser.add_argument(

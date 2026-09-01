@@ -14,7 +14,7 @@ Panels:
   - operator solve status (session COMPLETED/TIMEOUT/ERROR/running, current op, mean turns)
 
 Usage:
-    python3 tools/rl_dashboard.py                # port 6007, auto-detect latest run
+    python3 tools/rl_dashboard.py                # port 6007, follow locally launched run
     PORT=6010 python3 tools/rl_dashboard.py
     python3 tools/rl_dashboard.py --log /path/to/train_*.log --polar /path/to/runs
 
@@ -33,8 +33,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ----------------------------- config -----------------------------
-# 日志目录:默认两个候选(pd 时代的 /home/docker/logs + 混合部署的 /mnt/pipeline-data/train_log),
-# latest_log 取全部候选里 mtime 最新的 train_*.log;可用 RL_LOG_DIRS="dir1:dir2" 覆盖。
+# 本机训练启动器会把它实际使用的 LOG_FILE 原子发布到 LOG_POINTER。只要指针
+# 存在，dashboard 就严格跟随该文件，不再从共享 /mnt 中按 mtime 误选其他机器的日志。
+# 指针尚未生成时页面保持空白；只有显式把 RL_LOG_POINTER 设为空，才回退到
+# 原来的目录自动发现行为。
+LOG_POINTER = os.environ.get(
+    "RL_LOG_POINTER", "/tmp/vime_rl_dashboard_train_log"
+).strip()
+# 回退日志目录:默认两个候选(pd 时代的 /home/docker/logs + 混合部署的
+# /mnt/pipeline-data/train_log);可用 RL_LOG_DIRS="dir1:dir2" 覆盖。
 LOG_DIRS = os.environ.get("RL_LOG_DIRS", "/home/docker/logs:/mnt/pipeline-data/train_log").split(":")
 POLAR_RUNS = "/home/docker/polar_can/ProRL-Agent-Server/output/ascend_operator/runs"
 PORT = int(os.environ.get("PORT", "6007"))
@@ -107,7 +114,40 @@ def _epoch_from(line):
         return 0.0
 
 
+def _pointed_log():
+    """Return ``(claimed, path)`` for the local launcher log pointer.
+
+    ``claimed`` stays true when the pointer exists but its target has not been
+    created yet. In that short startup window we deliberately return no log
+    instead of falling back to an unrelated, newer file in the shared mount.
+    """
+    if not LOG_POINTER:
+        return False, None
+    try:
+        with open(LOG_POINTER, encoding="utf-8") as f:
+            path = f.readline().strip()
+    except FileNotFoundError:
+        # A configured local-launch pointer is an ownership boundary, not merely
+        # a preference. Before the first local run, show no log instead of a
+        # stranger's file from the shared fallback directories.
+        return True, None
+    except OSError:
+        return True, None
+    if not path:
+        return True, None
+    path = os.path.abspath(os.path.expanduser(path))
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return True, path
+    except OSError:
+        pass
+    return True, None
+
+
 def latest_log():
+    claimed, path = _pointed_log()
+    if claimed:
+        return path
     files = []
     for d in LOG_DIRS:
         files.extend(glob.glob(os.path.join(d, "train_qwen36_polar_*.log")))
@@ -515,6 +555,12 @@ PEER_METRICS_URL = os.environ.get("PEER_METRICS_URL",
                                   "http://80.48.5.64:19100/node_metrics")
 PEER = {"last_try": 0.0, "good": None, "good_ts": 0.0}
 
+# 本机的 vLLM monitor 已经负责运行时 engine 发现、Prometheus 采集和吞吐
+# delta 计算。dashboard 只读它的缓存 API，避免再逐个探测繁忙的 engine。
+LOCAL_VLLM_METRICS_URL = os.environ.get(
+    "LOCAL_VLLM_METRICS_URL", "http://127.0.0.1:5000/api/metrics")
+LOCAL_VLLM = {"last_try": 0.0, "good": None, "good_ts": 0.0}
+
 
 def peer_metrics():
     now = time.time()
@@ -539,6 +585,38 @@ def peer_metrics():
         if PEER["good"] is not None and now - PEER["good_ts"] < 120:
             out = dict(PEER["good"])
             out.update(stale=True, age=round(now - PEER["good_ts"]))
+            return out
+        return {"ok": False, "err": type(e).__name__}
+
+
+def local_vllm_metrics():
+    """Read the local N-engine monitor cache without polling engines again."""
+    now = time.time()
+    if now - LOCAL_VLLM["last_try"] < 3:
+        if LOCAL_VLLM["good"] is not None:
+            out = dict(LOCAL_VLLM["good"])
+            out["age"] = round(now - LOCAL_VLLM["good_ts"])
+            return out
+        return {"ok": False, "err": "pending"}
+    LOCAL_VLLM["last_try"] = now
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(LOCAL_VLLM_METRICS_URL, timeout=1.0) as r:
+            data = json.loads(r.read().decode())
+        # monitor 的 300 点历史用于它自己的曲线页；6007 只展示当前快照，
+        # 不把约百 KB 的 history 每 3 秒再转发给浏览器。
+        data = {key: data.get(key) for key in (
+            "last_update", "engines", "engines_total", "engines_alive",
+            "combined", "avg_per_engine", "starved_pct",
+        )}
+        LOCAL_VLLM["good"] = {"ok": True, "data": data}
+        LOCAL_VLLM["good_ts"] = now
+        return {"ok": True, "age": 0, "data": data}
+    except Exception as e:
+        if LOCAL_VLLM["good"] is not None and now - LOCAL_VLLM["good_ts"] < 30:
+            out = dict(LOCAL_VLLM["good"])
+            out.update(stale=True, age=round(now - LOCAL_VLLM["good_ts"]))
             return out
         return {"ok": False, "err": type(e).__name__}
 
@@ -1161,6 +1239,7 @@ def build_metrics():
         "train": train_block(),
         "npu": npu_info(),
         "peer": peer_metrics(),
+        "local_vllm": local_vllm_metrics(),
         "host": host_mem(),
         "sglang": STATE.get("sglang", {}),
         "operators": operator_status(),
@@ -1397,6 +1476,7 @@ th{font-size:11px;color:var(--muted);font-weight:600;text-align:left;padding:2px
   <div class=grid>
     <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · Actor</h2><div id=npu></div></div>
     <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · Rollout</h2><div id=npu_peer></div></div>
+    <div class=card><h2>🚀 本机 vLLM 推理引擎</h2><div id=local_vllm></div></div>
     <div class=card><h2>🧠 Host CPU memory · 训练阶段</h2><div id=host></div>
         <canvas id=c_hostmem style="height:140px;margin-top:8px" title="波谷逐轮抬升=泄漏;回到同一基线=尖峰"></canvas>
         <div id=hostmem_stat class=muted style="font-size:11px;margin-top:2px"></div>
@@ -1608,6 +1688,21 @@ async function tick(){
    const engSec = engRows ? `<div class=row style="margin-top:6px"><span class=muted>── vllm 推理性能(引擎 /metrics)──</span></div>` + engRows : '';
    return head+rows+engSec||'<span class=muted>140 无 npu 数据</span>';
  })();
+ // 本机 vLLM：复用 :5000 N-engine monitor 的缓存，不直接轮询 engine。
+ const lv=m.local_vllm||{};
+ $('local_vllm').innerHTML=(()=>{
+   if(!lv.ok)return `<span class=muted>本机指标聚合器离线(${lv.err||'未配置'}) · 启动 scripts/vllm_metrics_monitor_v2.py</span>`;
+   const d=lv.data||{}, c=d.combined||{}, engines=d.engines||[];
+   const stale=lv.stale?` · <span style="color:#ff9f0a">数据 ${lv.age}s 前</span>`:'';
+   const head=`<div class=row><span><span class="dot ${(d.engines_alive||0)>0?'on':'off'}"></span><b>${d.engines_alive||0}/${d.engines_total||0} engines</b></span><span class=muted>更新 ${d.last_update||'—'}${stale}</span></div>
+     <div class=row><span>总吞吐 <b>${fmt(c.throughput,1)} tok/s</b></span><span class=muted>平均 ${fmt(d.avg_per_engine,1)}/engine · 运行/排队 ${c.running||0}/${c.waiting||0}</span></div>`;
+   const rows=engines.map(e=>{
+     const port=(e.key||'').split(':').pop()||'—';
+     const wait=(e.waiting||0)>0?`<span style="color:#ff9f0a">${e.waiting}</span>`:'0';
+     return `<div class=row><span><span class="dot ${e.alive?'on':'off'}"></span>eng :${port}</span><span class=muted>${fmt(e.throughput,1)} tok/s · 运行/排队 ${e.running||0}/${wait}</span></div>`;
+   }).join('');
+   return head+(rows||'<div class=muted style="margin-top:6px">尚未发现本机 engine</div>');
+ })();
  // host
  const ph=m.phase||{};
  const pbadge=(on,txt,col)=>on?`<span class=tag style="background:${col}22;color:${col};margin-right:4px">${txt}</span>`:'';
@@ -1733,6 +1828,11 @@ async function loadTail(){
   if(d.text)logbox.appendChild(logFrag(d.text));else logbox.textContent='(暂无日志输出)';
   logbox.scrollTop=logbox.scrollHeight;logFollow=true;logStat();
 }
+// [2026-08-31] 日志 DOM 上限:pollLog 只增不删,长跑 run 挂几小时就是几十万节点,
+// pre-wrap 的 <pre> 每次追加+scrollHeight 读取都全量排版,标签页内存/CPU 无界膨胀
+// 把整机拖卡。到上限就重拉一次 tail(loadTail 清空重装,跟随态视觉无感);
+// 硬上限兜底覆盖"滚上去读历史挂机"的场景(会跳回底部,牺牲极少数情况保内存)。
+const LOG_MAX_NODES=20000, LOG_HARD_MAX_NODES=40000;   // ~20000节点≈6000+行≈1MB文本
 async function pollLog(){
   if(logFile===null){await loadTail();return;}
   const d=await logGet('?from='+logEnd+'&file='+encodeURIComponent(logFile));if(!d)return;
@@ -1740,7 +1840,9 @@ async function pollLog(){
   logSize=d.size||logSize;
   if(d.text){const stick=atBottom();
     logbox.appendChild(logFrag(d.text));logEnd=d.end;
-    if(stick)logbox.scrollTop=logbox.scrollHeight;}   // 到底则跟随最新
+    if(stick)logbox.scrollTop=logbox.scrollHeight;   // 到底则跟随最新
+    if(logbox.childNodes.length>LOG_HARD_MAX_NODES||(stick&&logbox.childNodes.length>LOG_MAX_NODES)){
+      await loadTail();return;}}   // DOM 裁剪:清回 256KB tail 规模
   logFollow=atBottom();logStat();
 }
 async function loadOlder(){
@@ -1779,18 +1881,27 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        # [2026-08-31] 轮询响应永不落盘缓存(页面每3s重取也无妨,量级几十KB)
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
 
 def main():
-    global LOG_DIRS, POLAR_RUNS, PORT
+    global LOG_POINTER, LOG_DIRS, POLAR_RUNS, PORT
     ap = argparse.ArgumentParser()
     ap.add_argument("--log", default=":".join(LOG_DIRS), help="train_*.log dirs, colon-separated")
+    ap.add_argument(
+        "--log-pointer",
+        default=LOG_POINTER,
+        help="file containing the exact locally launched train log; empty disables it",
+    )
     ap.add_argument("--polar", default=POLAR_RUNS, help="polar runs dir")
     ap.add_argument("--port", type=int, default=PORT)
     a = ap.parse_args()
+    LOG_POINTER = a.log_pointer.strip()
     LOG_DIRS, POLAR_RUNS, PORT = a.log.split(":"), a.polar, a.port
+    print(f"[rl_dashboard] log ptr : {LOG_POINTER or '(disabled)'}")
     print(f"[rl_dashboard] log dirs: {LOG_DIRS}")
     print(f"[rl_dashboard] latest  : {latest_log()}")
     print(f"[rl_dashboard] polar   : {latest_polar_run()}")

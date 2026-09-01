@@ -531,9 +531,15 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
-        for monitor in self._health_monitors:
-            monitor.stop()
-        logging_utils.finish_tracking(self.args)
+        try:
+            self._call_rollout_function_hook(
+                "dispose_rollout",
+                raise_on_error=True,
+            )
+        finally:
+            for monitor in self._health_monitors:
+                monitor.stop()
+            logging_utils.finish_tracking(self.args)
 
     @property
     def server(self) -> RolloutServer | None:
@@ -619,13 +625,90 @@ class RolloutManager:
                 raise
             logger.warning("Failed to call rollout function hook %s", hook_name, exc_info=True)
 
-    def prepare_policy_update(self, policy_version: int):
-        """Close external admission, abort engines, and commit a clean weight boundary."""
+    def _rollout_engine_versions(self) -> dict[str, str]:
+        """Read a complete weight-version proof from every updatable serving engine."""
+        server = self._get_updatable_server()
+        engines = [engine for engine in (server.engines if server is not None else []) if engine is not None]
+        if not engines:
+            raise RuntimeError("Cannot prove policy epoch: no rollout engines are available")
+        versions = ray.get([engine.get_weight_version.remote() for engine in engines])
+        evidence = {f"engine-{index:03d}": str(version) for index, version in enumerate(versions)}
+        if any(version in {"", "None"} for version in evidence.values()):
+            raise RuntimeError(f"Incomplete rollout-engine weight versions: {evidence}")
+        if len(set(evidence.values())) != 1:
+            raise RuntimeError(f"Mixed rollout-engine weight versions: {evidence}")
+        return evidence
+
+    def _abort_rollout_engines(self) -> None:
+        """Abort every serving engine and wait for the full fanout to succeed."""
+        engines = [engine for engine in self.rollout_engines if engine is not None]
+        if not engines:
+            if bool(getattr(self.args, "polar_policy_transition_enabled", False)):
+                raise RuntimeError(
+                    "Cannot prove the Polar weight boundary: no rollout engines "
+                    "were available for the abort fanout"
+                )
+            return
+        logger.info(
+            "Aborting in-flight generation on %d rollout engines before policy sync",
+            len(engines),
+        )
+        ray.get([engine.pause_generation.remote() for engine in engines])
+
+    def prepare_initial_policy(self, policy_version: int):
+        """Close stale Polar admission before the first serving-weight mutation."""
         status = self._call_rollout_function_hook(
-            "prepare_policy_update",
+            "prepare_initial_policy",
             policy_version,
             raise_on_error=True,
         )
+        if not isinstance(status, dict) or status.get("all_paused") is not True:
+            raise RuntimeError(
+                f"prepare_initial_policy did not prove admission was paused: {status!r}"
+            )
+        self._abort_rollout_engines()
+        if bool(getattr(self.args, "polar_policy_transition_enabled", False)):
+            self._call_rollout_function_hook(
+                "commit_policy_update_boundary",
+                policy_version,
+                True,
+                raise_on_error=True,
+            )
+        else:
+            self._call_rollout_function_hook(
+                "commit_policy_update_boundary",
+                policy_version,
+                raise_on_error=True,
+            )
+        return status
+
+    def finish_initial_policy(self, policy_version: int):
+        """Publish first-engine evidence and open the run-scoped Polar namespace."""
+        for srv in self.servers.values():
+            if srv.update_weights:
+                srv.clear_lb_proxy_sticky_cache(policy_version)
+        self._call_rollout_function_hook(
+            "finish_initial_policy",
+            policy_version,
+            self._rollout_engine_versions(),
+            raise_on_error=True,
+        )
+
+    def prepare_policy_update(self, policy_version: int):
+        """Close external admission, abort engines, and commit a clean weight boundary."""
+        if bool(getattr(self.args, "polar_policy_transition_enabled", False)):
+            status = self._call_rollout_function_hook(
+                "prepare_policy_update",
+                policy_version,
+                self._rollout_engine_versions(),
+                raise_on_error=True,
+            )
+        else:
+            status = self._call_rollout_function_hook(
+                "prepare_policy_update",
+                policy_version,
+                raise_on_error=True,
+            )
         if status is None:
             return None
         if not isinstance(status, dict) or status.get("all_paused") is not True:
@@ -637,30 +720,40 @@ class RolloutManager:
         # and dedicated) while they are still fully awake; only after those RPCs return
         # may a shared engine enter level-2 sleep.  This uses the same vLLM endpoint as
         # the updater, just at the safe side of the sleep/wake boundary.
-        engines = [engine for engine in self.rollout_engines if engine is not None]
-        if engines:
-            logger.info(
-                "Aborting in-flight generation on %d rollout engines before offload",
-                len(engines),
-            )
-            ray.get([engine.pause_generation.remote() for engine in engines])
+        self._abort_rollout_engines()
 
         # Polar re-checks drained state after the abort fanout and only then stamps the
         # next version.  Modules without this optional hook remain backward-compatible.
-        self._call_rollout_function_hook(
-            "commit_policy_update_boundary",
-            policy_version,
-            raise_on_error=True,
-        )
+        if bool(getattr(self.args, "polar_policy_transition_enabled", False)):
+            self._call_rollout_function_hook(
+                "commit_policy_update_boundary",
+                policy_version,
+                True,
+                raise_on_error=True,
+            )
+        else:
+            self._call_rollout_function_hook(
+                "commit_policy_update_boundary",
+                policy_version,
+                raise_on_error=True,
+            )
         return status
 
     def update_policy_version(self, policy_version: int):
         """Notify a custom rollout function that serving weights advanced."""
-        self._call_rollout_function_hook(
-            "update_policy_version",
-            policy_version,
-            raise_on_error=True,
-        )
+        if bool(getattr(self.args, "polar_policy_transition_enabled", False)):
+            self._call_rollout_function_hook(
+                "update_policy_version",
+                policy_version,
+                self._rollout_engine_versions(),
+                raise_on_error=True,
+            )
+        else:
+            self._call_rollout_function_hook(
+                "update_policy_version",
+                policy_version,
+                raise_on_error=True,
+            )
 
     def finish_policy_update(self, policy_version: int):
         """Clear stale affinity, then reopen the custom rollout function.
@@ -673,9 +766,26 @@ class RolloutManager:
         for srv in self.servers.values():
             if srv.update_weights:
                 srv.clear_lb_proxy_sticky_cache(policy_version)
+        if bool(getattr(self.args, "polar_policy_transition_enabled", False)):
+            self._call_rollout_function_hook(
+                "finish_policy_update",
+                policy_version,
+                self._rollout_engine_versions(),
+                raise_on_error=True,
+            )
+        else:
+            self._call_rollout_function_hook(
+                "finish_policy_update",
+                policy_version,
+                raise_on_error=True,
+            )
+
+    def fail_policy_update(self, policy_version: int, reason: str):
+        """Persist a failed/ambiguous transition without reopening admission."""
         self._call_rollout_function_hook(
-            "finish_policy_update",
+            "fail_policy_update",
             policy_version,
+            reason,
             raise_on_error=True,
         )
 

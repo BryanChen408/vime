@@ -29,6 +29,14 @@ def _finish_rollout_memory_handoff(args, actor_model, rollout_manager) -> None:
 
 def train(args):
     configure_logger()
+    durable_polar_boundary = bool(
+        getattr(args, "polar_policy_transition_enabled", False)
+    )
+    if durable_polar_boundary and not args.offload_rollout:
+        raise RuntimeError(
+            "--polar-policy-transition-enabled currently requires --offload-rollout; "
+            "otherwise training can overlap an open serving engine"
+        )
     # allocate the GPUs
     pgs = create_placement_groups(args)
     init_tracking(args)
@@ -44,25 +52,56 @@ def train(args):
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
 
-    # [vime 2026-08-24 定案] 同步窗口 KV 不驻留(verl/slime 同款):只醒权重壳
-    # 灌新权重,KV 同步后才醒。同步窗口瞬时最重(all_gather/reload 搅动),
-    # 必须让它空 —— 权重壳 35G+workspace 4G+trainer ~10G ≈ 50G,余量 11G+;
-    # KV 重映射只是同步后一次 ~1.4G 小额申请,放在 clear_memory 之后做。
-    # (此前"KV 先醒"把 KV 塞进同步窗口 → 顶格 OOM,141406/142800 实锤,回正。)
-    _prepare_rollout_memory_handoff(args, actor_model, rollout_manager)
+    initial_boundary_attempted = False
+    try:
+        if durable_polar_boundary:
+            # Bootstrap is a real transaction: close the previous run namespace and
+            # abort all old engine work before the first weight mutation.
+            initial_boundary_attempted = True
+            ray.get(
+                rollout_manager.prepare_initial_policy.remote(args.start_rollout_id)
+            )
 
-    # Always push actor weights to rollout once weights are loaded.
-    actor_model.update_weights()
-    # Advance the rollout manager's policy version so custom rollout functions that
-    # track off-policy staleness (e.g. vime_bridge) see the initial weights.
-    # No-op for rollout functions without an update_policy_version hook.
-    ray.get(rollout_manager.update_policy_version.remote(args.start_rollout_id))
+        # [vime 2026-08-24 定案] 同步窗口 KV 不驻留(verl/slime 同款):只醒权重壳
+        # 灌新权重,KV 同步后才醒。同步窗口瞬时最重(all_gather/reload 搅动),
+        # 必须让它空 —— 权重壳 35G+workspace 4G+trainer ~10G ≈ 50G,余量 11G+;
+        # KV 重映射只是同步后一次 ~1.4G 小额申请,放在 clear_memory 之后做。
+        # (此前"KV 先醒"把 KV 塞进同步窗口 → 顶格 OOM,141406/142800 实锤,回正。)
+        _prepare_rollout_memory_handoff(args, actor_model, rollout_manager)
 
-    if args.check_weight_update_equal:
-        ray.get(rollout_manager.check_weights.remote(action="compare"))
+        # Always push actor weights to rollout once weights are loaded.
+        actor_model.update_weights()
+        if not durable_polar_boundary:
+            # Preserve the original hook order for every non-transactional rollout.
+            ray.get(
+                rollout_manager.update_policy_version.remote(args.start_rollout_id)
+            )
 
-    # 同步完成后醒 KV(与每步同序:权重壳 → 同步 → KV)。
-    _finish_rollout_memory_handoff(args, actor_model, rollout_manager)
+        if args.check_weight_update_equal:
+            ray.get(rollout_manager.check_weights.remote(action="compare"))
+
+        # 同步完成后醒 KV(与每步同序:权重壳 → 同步 → KV)。
+        _finish_rollout_memory_handoff(args, actor_model, rollout_manager)
+
+        if durable_polar_boundary:
+            ray.get(
+                rollout_manager.finish_initial_policy.remote(args.start_rollout_id)
+            )
+            initial_boundary_attempted = False
+    except Exception as exc:
+        if initial_boundary_attempted:
+            try:
+                ray.get(
+                    rollout_manager.fail_policy_update.remote(
+                        args.start_rollout_id,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist Polar bootstrap failure; admission remains closed"
+                )
+        raise
 
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
@@ -106,48 +145,72 @@ def train(args):
         # pauses the gateway and drains what is in flight first. No-op for rollout functions
         # without the hook.
         next_policy_version = rollout_id + 1
-        if args.offload_rollout:
-            # Hard safety gate: this returns only after Polar admission is closed,
-            # every serving engine has aborted old requests, and Polar confirms drained.
-            # Any failure propagates and leaves the gateway closed; sleeping an engine
-            # without that proof caused the 20260826 507001 half-wake crash.
-            ray.get(rollout_manager.prepare_policy_update.remote(next_policy_version))
+        policy_update_attempted = False
 
-        if args.offload_rollout:
-            ray.get(rollout_manager.offload.remote())
+        try:
+            if args.offload_rollout:
+                # Mark the attempt before the RPC: a partial remote prepare must also
+                # be driven to a durable fail-closed state if the acknowledgement dies.
+                policy_update_attempted = True
+                ray.get(
+                    rollout_manager.prepare_policy_update.remote(next_policy_version)
+                )
+            if args.offload_rollout:
+                ray.get(rollout_manager.offload.remote())
 
-        actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
+            actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
 
-        if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
-            if actor_trains_this_step:
-                ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+            if args.use_critic:
+                value_refs = critic_model.async_train(rollout_id, rollout_data_ref)
+                if actor_trains_this_step:
+                    ray.get(actor_model.async_train(rollout_id, rollout_data_ref, external_data=value_refs))
+                else:
+                    ray.get(value_refs)
             else:
-                ray.get(value_refs)
-        else:
-            ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
+                ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
-        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-            save(rollout_id)
+            if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+                save(rollout_id)
 
-        offload_train(actor_trains_this_step)
-        # 同步窗口 KV 不驻留(定案,见文件头注):只醒权重壳做同步。
-        _prepare_rollout_memory_handoff(args, actor_model, rollout_manager)
-        actor_model.update_weights()
-        # Advance policy version so off-policy staleness tracking (vime_bridge) stays
-        # live; a frozen version makes staleness grow without bound and drops every
-        # group as stale (see vime_bridge/rollout.py drain_completed ->
-        # max_off_policy_steps), which hangs training a few rollouts in.
-        ray.get(rollout_manager.update_policy_version.remote(next_policy_version))
-        if args.offload_rollout:
-            # 同步完成 + clear_memory 之后,才醒 KV(此时空闲最足,重映射最稳)。
-            _finish_rollout_memory_handoff(args, actor_model, rollout_manager)
-            # Resume only after train, weight sync, and KV restoration all succeeded.
-            # On any exception above the gateway intentionally remains fail-closed.
-            ray.get(rollout_manager.finish_policy_update.remote(next_policy_version))
+            offload_train(actor_trains_this_step)
+            # 同步窗口 KV 不驻留(定案,见文件头注):只醒权重壳做同步。
+            _prepare_rollout_memory_handoff(args, actor_model, rollout_manager)
+            actor_model.update_weights()
+            # Advance policy version so off-policy staleness tracking (vime_bridge) stays
+            # live; a frozen version makes staleness grow without bound and drops every
+            # group as stale (see vime_bridge/rollout.py drain_completed ->
+            # max_off_policy_steps), which hangs training a few rollouts in.
+            if not durable_polar_boundary:
+                ray.get(
+                    rollout_manager.update_policy_version.remote(next_policy_version)
+                )
+            if args.offload_rollout:
+                # 同步完成 + clear_memory 之后,才醒 KV(此时空闲最足,重映射最稳)。
+                _finish_rollout_memory_handoff(args, actor_model, rollout_manager)
+                # Resume only after train, weight sync, KV restore, and an all-engine
+                # weight-version proof succeeded.
+                ray.get(rollout_manager.finish_policy_update.remote(next_policy_version))
+                policy_update_attempted = False
+        except Exception as exc:
+            if policy_update_attempted:
+                try:
+                    ray.get(
+                        rollout_manager.fail_policy_update.remote(
+                            next_policy_version,
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist Polar policy-update failure; admission remains closed"
+                    )
+            raise
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
-            ray.get(rollout_manager.eval.remote(rollout_id))
+            eval_policy_version = (
+                next_policy_version if durable_polar_boundary else rollout_id
+            )
+            ray.get(rollout_manager.eval.remote(eval_policy_version))
 
     ray.get(rollout_manager.dispose.remote())
     finish_tracking(args)

@@ -215,12 +215,32 @@ echo "[topo] actor=8卡@${MASTER_ADDR}  rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
 LOG_FILE=${LOG_FILE:-/mnt/pipeline-data/train_log/train_${RUN_ID}.log}
-mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs
+if [[ "${LOG_FILE}" != /* ]]; then
+   LOG_FILE="${VIME_ROOT}/${LOG_FILE}"
+fi
+mkdir -p logs "${POLAR_OUTPUT_DIR}" /home/docker/logs "$(dirname -- "${LOG_FILE}")"
+
+# 6007 dashboard 不能按共享 /mnt 的最新 mtime 选日志：别的机器复制进来的
+# train_*.log 会把当前页面抢走。由真正启动训练的 head 把精确 LOG_FILE 发布到
+# 本机 /tmp；dashboard 严格跟随这个指针。worker 分支不会调用此函数。
+publish_observer_log_pointer() {
+   local pointer=${RL_LOG_POINTER:-/tmp/vime_rl_dashboard_train_log}
+   local pointer_dir pointer_tmp
+   if [[ "${pointer}" != /* ]]; then
+      pointer="${VIME_ROOT}/${pointer}"
+   fi
+   pointer_dir=$(dirname -- "${pointer}")
+   mkdir -p "${pointer_dir}"
+   pointer_tmp=$(mktemp "${pointer_dir}/.rl-log-pointer.XXXXXX")
+   printf '%s\n' "${LOG_FILE}" > "${pointer_tmp}"
+   mv -f -- "${pointer_tmp}" "${pointer}"
+   echo "[observer] bound ${pointer} -> ${LOG_FILE}"
+}
 
 # ─── 参数分组 ───
 CKPT_ARGS=(
-   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}
-   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
+   --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-YaRN-525k-15020-bf16}
+   --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-YaRN-525k-15020_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
    --save-interval 100
    --no-save-optim
@@ -271,6 +291,12 @@ else
    DRAIN_ARGS=(--no-polar-weight-update-drain-sessions)
 fi
 
+if [ "${POLAR_POLICY_TRANSITION_ENABLED:-0}" = "1" ]; then
+   POLICY_TRANSITION_ARGS=(--polar-policy-transition-enabled)
+else
+   POLICY_TRANSITION_ARGS=(--no-polar-policy-transition-enabled)
+fi
+
 # 跨权重更新的组要不要。默认(不传)沿用 max_async_level+update_weights_interval 的推导值,
 # 下限恒为 2 → 跨一次更新的 staleness=1 永远被接受,也就是混权轨迹会进训练集。
 # colocate 下 polar 侧没有 /admin/policy_version(version-span guard 会 404 降级),
@@ -294,7 +320,9 @@ POLAR_ARGS=(
    --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
    --rollout-release-on-postrun
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6}"
+   --polar-policy-control-timeout "${POLAR_POLICY_CONTROL_TIMEOUT:-45}"
    ${DRAIN_ARGS[@]+"${DRAIN_ARGS[@]}"}
+   ${POLICY_TRANSITION_ARGS[@]+"${POLICY_TRANSITION_ARGS[@]}"}
    ${STALENESS_ARGS[@]+"${STALENESS_ARGS[@]}"}
 )
 
@@ -596,6 +624,10 @@ PY
          #   需把 polar 推理端点指向 :${VLLM_ROUTER_PORT}。见 docs/design/router_return_token_ids_passthrough.md §10。
          if [ "${FEAT_LB_PROXY:-0}" = "1" ]; then
             EXTRA_ARGS+=(--rollout-lb-proxy)
+         fi
+         # observer 是旁路能力；即使本机 /tmp 不可写，也绝不能阻断训练启动。
+         if ! publish_observer_log_pointer; then
+            echo "[observer][WARN] failed to publish log pointer; training continues" >&2
          fi
          # ─── 启动 vLLM metrics 监控面板(旁路,失败不影响训练)───
          # 引擎由 head 的 driver 远程创建在 rollout 节点 → 发现目标必须是
