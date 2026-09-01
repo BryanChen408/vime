@@ -83,6 +83,12 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
+# Keep the JSON out of a ${var:-...} expansion: a caller-provided value must
+# not inherit the closing brace from the default literal.
+if [ "${FEAT_MTP:-1}" = "1" ] && [ -z "${VLLM_SPEC_CONFIG:-}" ]; then
+   VLLM_SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":3}'
+fi
+
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
 CURRENT_IP=80.48.5.52  MASTER_ADDR=80.48.5.52  NNODES=1  NPUS_PER_NODE=16  SOCKET_IFNAME=ens1f3 \
 ACTOR_NUM_NODES=1 \
@@ -90,12 +96,17 @@ ACTOR_NUM_GPUS_PER_NODE=16 \
 TRAIN_ENTRY=train.py \
 FEAT_OFFLOAD=1 \
 FEAT_SYNC_ROLLOUT=1 \
+FEAT_MTP=${FEAT_MTP:-1} \
+FEAT_MTP_TRAIN=${FEAT_MTP_TRAIN:-1} \
 RESOURCE_LAYOUT="${SCRIPT_DIR}/resource_layout.single52_homo_colocate.yaml" \
 ROLLOUT_NODE_IP=80.48.5.52 \
 ROLLOUT_NUM_GPUS=12 \
 ROLLOUT_NUM_GPUS_PER_ENGINE=2 \
 FEAT_PD_DISAGG=0 \
+HF_CKPT="${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B}" \
+REF_LOAD="${REF_LOAD:-/workspace/Qwen3.6-35B-A3B_mtp_torch_dist}" \
 VLLM_SERVED_MODEL_NAME=/home/docker/Qwen3.6-35B-A3B \
+VLLM_SPEC_CONFIG="${VLLM_SPEC_CONFIG}" \
 VLLM_GPU_MEM_UTIL=0.70 \
 MAX_TOKENS_PER_GPU=32768 \
 SEQ_LENGTH=262144 \
