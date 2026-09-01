@@ -603,6 +603,7 @@ class _VLLMHijack:
                 model = _selected_vllm_weight_update_model(self)
                 with torch.device(self.device):
                     if self._is_checkpoint_format:
+                        _restore_fused_moe_weight_loaders(model)
                         self.weight_transfer_engine.receive_weights(
                             typed_update_info,
                             load_weights=lambda weights: model.load_weights(weights=iter(weights)),
@@ -803,6 +804,39 @@ def _restore_vllm_param_attrs(model, captured: dict[str, dict[str, object]] | No
     return patched
 
 
+def _restore_fused_moe_weight_loaders(model: Any) -> int:
+    """Restore loaders lost when fused-MoE parameters are replaced.
+
+    ``process_weights_after_loading`` can replace ``w13_weight`` and
+    ``w2_weight`` with fresh ``Parameter`` objects. The replacement keeps the
+    data but drops vLLM's custom ``weight_loader`` attribute. Reuse the owning
+    FusedMoE loader so TP/EP shard and expert routing semantics remain intact;
+    a generic default loader could silently write the wrong shard.
+    """
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return 0
+
+    from vllm.model_executor.utils import set_weight_attrs
+
+    patched = 0
+    for module in modules():
+        loader = getattr(module, "weight_loader", None)
+        if not callable(loader):
+            continue
+        for parameter_name in ("w13_weight", "w2_weight"):
+            parameter = getattr(module, parameter_name, None)
+            if parameter is None or hasattr(parameter, "weight_loader"):
+                continue
+            try:
+                set_weight_attrs(parameter, {"weight_loader": loader})
+            except (AssertionError, AttributeError, TypeError, RuntimeError):
+                # A repeated reload may attach it between the check and set.
+                continue
+            patched += 1
+    return patched
+
+
 class vLLMColocateWorkerExtension:
     """vLLM ``--worker-extension-cls`` entry for colocated IPC weight sync."""
 
@@ -910,6 +944,7 @@ class vLLMColocateWorkerExtension:
         model = _selected_vllm_weight_update_model(self)
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             if self._is_checkpoint_format:
+                _restore_fused_moe_weight_loaders(model)
                 model.load_weights(weights=iter(weights))
             else:
                 for name, weight in weights:

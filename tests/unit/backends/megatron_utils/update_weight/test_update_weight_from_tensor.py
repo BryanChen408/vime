@@ -678,3 +678,31 @@ def test_worker_draft_loader_receives_complete_checkpoint_stream(upw_vllm):
     for index, (_name, weight) in enumerate(draft_model.loaded):
         assert torch.equal(weight, torch.full((2, 2), float(index + 1)))
     assert target_model.loaded == []
+
+
+@pytest.mark.unit
+def test_restore_fused_moe_weight_loaders_after_ep_parameter_replacement(upw_vllm):
+    class FakeFusedMoE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w13_weight = torch.nn.Parameter(torch.zeros(2, 2))
+            self.w2_weight = torch.nn.Parameter(torch.zeros(2, 2))
+
+        def weight_loader(self, *_args, **_kwargs):
+            return True
+
+    model = torch.nn.Module()
+    moe = FakeFusedMoE()
+    model.add_module("moe", moe)
+    utils_module = types.ModuleType("vllm.model_executor.utils")
+
+    def set_weight_attrs(weight, attrs):
+        for name, value in attrs.items():
+            setattr(weight, name, value)
+
+    utils_module.set_weight_attrs = set_weight_attrs
+    with patch.dict(sys.modules, {"vllm.model_executor.utils": utils_module}):
+        assert upw_vllm._restore_fused_moe_weight_loaders(model) == 2
+        assert moe.w13_weight.weight_loader.__self__ is moe
+        assert moe.w2_weight.weight_loader.__self__ is moe
+        assert upw_vllm._restore_fused_moe_weight_loaders(model) == 0
