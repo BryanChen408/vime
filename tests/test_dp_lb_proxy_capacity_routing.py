@@ -11,6 +11,7 @@ import sys
 import types
 from collections import Counter
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -68,18 +69,24 @@ def proxy_state():
         [("127.0.0.1", 8100), ("127.0.0.1", 8101)],
         capacity_units=[100.0, 200.0],
     )
+    # Existing routing tests exercise the fail-open estimate path without making
+    # network requests. Tests below opt into explicit live metric snapshots.
+    state.read_live_server_loads = AsyncMock(return_value=None)
     yield state
     asyncio.run(_close_state(state))
 
 
-def _assign_and_finish(state, session_id: str, token_count: float = 10.0) -> int:
-    idx = state.select_server_by_session(session_id, token_count)
+async def _assign_and_finish(state, session_id: str, token_count: float = 10.0) -> int:
+    idx = await state.select_server_by_session(session_id, token_count)
     state.release_server(idx, token_count)
     return idx
 
 
 def test_new_sessions_are_distributed_by_kv_capacity(proxy_state):
-    assignments = [_assign_and_finish(proxy_state, f"session-{i}") for i in range(6)]
+    async def _exercise():
+        return [await _assign_and_finish(proxy_state, f"session-{i}") for i in range(6)]
+
+    assignments = asyncio.run(_exercise())
 
     # Equal-length sessions follow the 1:2 KV-capacity ratio instead of splitting
     # equally by raw session count.
@@ -89,20 +96,72 @@ def test_new_sessions_are_distributed_by_kv_capacity(proxy_state):
         for server in proxy_state.dp_servers
     ]
     assert pressures == pytest.approx([0.2, 0.2])
+    assert proxy_state.read_live_server_loads.await_count == 6
 
 
 def test_existing_session_stays_pinned_and_updates_its_kv_estimate(proxy_state):
-    first_idx = _assign_and_finish(proxy_state, "same-session", token_count=10.0)
-    second_idx = _assign_and_finish(proxy_state, "same-session", token_count=35.0)
+    proxy_state.read_live_server_loads.return_value = [
+        LB.LiveServerLoad(0.1, 0.0, 0.0),
+        LB.LiveServerLoad(0.2, 0.0, 0.0),
+    ]
+
+    async def _exercise():
+        first_idx = await _assign_and_finish(proxy_state, "same-session", token_count=10.0)
+        second_idx = await _assign_and_finish(proxy_state, "same-session", token_count=35.0)
+        return first_idx, second_idx
+
+    first_idx, second_idx = asyncio.run(_exercise())
 
     assert second_idx == first_idx
+    assert proxy_state.read_live_server_loads.await_count == 1
     assert sum(server.active_sessions for server in proxy_state.dp_servers) == 1
     assert proxy_state.session_map["same-session"].estimated_kv_tokens == 35.0
     assert proxy_state.dp_servers[first_idx].estimated_session_kv_tokens == 35.0
 
 
+def test_new_session_prefers_real_kv_usage_over_stale_proxy_estimate(proxy_state):
+    # Proxy bookkeeping says server 0 is much fuller, while vLLM reports that its
+    # actual cache is mostly free. Live KV must be the primary routing signal.
+    proxy_state.dp_servers[0].estimated_session_kv_tokens = 90.0
+    proxy_state.dp_servers[1].estimated_session_kv_tokens = 10.0
+    proxy_state.read_live_server_loads.return_value = [
+        LB.LiveServerLoad(0.05, 0.0, 0.0),
+        LB.LiveServerLoad(0.80, 0.0, 0.0),
+    ]
+
+    idx = asyncio.run(proxy_state.select_server_by_session("live-kv-session", 10.0))
+
+    assert idx == 0
+
+
+def test_concurrent_new_sessions_reserve_load_before_metrics_catch_up():
+    state = LB.ProxyState(
+        [("127.0.0.1", 8200), ("127.0.0.1", 8201)],
+        capacity_units=[100.0, 100.0],
+    )
+    state.read_live_server_loads = AsyncMock(
+        return_value=[
+            LB.LiveServerLoad(0.0, 0.0, 0.0),
+            LB.LiveServerLoad(0.0, 0.0, 0.0),
+        ]
+    )
+
+    async def _exercise():
+        try:
+            return await asyncio.gather(
+                state.select_server_by_session("concurrent-a", 40.0),
+                state.select_server_by_session("concurrent-b", 40.0),
+            )
+        finally:
+            await _close_state(state)
+
+    assignments = asyncio.run(_exercise())
+
+    assert assignments == [0, 1]
+
+
 def test_policy_boundary_clear_is_fail_closed_until_requests_are_drained(proxy_state):
-    idx = proxy_state.select_server_by_session("busy-session", 10.0)
+    idx = asyncio.run(proxy_state.select_server_by_session("busy-session", 10.0))
 
     with pytest.raises(RuntimeError, match="active requests"):
         proxy_state.clear_sticky_cache()
@@ -117,8 +176,12 @@ def test_policy_boundary_clear_is_fail_closed_until_requests_are_drained(proxy_s
 
 
 def test_terminal_session_release_is_targeted_and_idempotent(proxy_state):
-    first_idx = _assign_and_finish(proxy_state, "finished-session", token_count=35.0)
-    other_idx = _assign_and_finish(proxy_state, "live-session", token_count=15.0)
+    async def _exercise():
+        first_idx = await _assign_and_finish(proxy_state, "finished-session", token_count=35.0)
+        other_idx = await _assign_and_finish(proxy_state, "live-session", token_count=15.0)
+        return first_idx, other_idx
+
+    first_idx, other_idx = asyncio.run(_exercise())
 
     first = proxy_state.release_sticky_session("finished-session")
     duplicate = proxy_state.release_sticky_session("finished-session")
@@ -156,6 +219,93 @@ def test_server_info_capacity_and_token_id_estimation_use_existing_fields(proxy_
     assert proxy_state.estimate_prompt_tokens({"prompt_token_ids": list(range(37))}, 9999) == 37
     assert proxy_state.estimate_prompt_tokens({"prompt": [[1, 2], [3, 4, 5]]}, 9999) == 5
     assert proxy_state.estimate_prompt_tokens({"messages": [{"content": "fallback"}]}, 400) == 100
+
+
+def test_live_load_parser_uses_vllm_prometheus_gauges():
+    load = LB._live_server_load_from_prometheus(
+        """
+# HELP vllm:kv_cache_usage_perc KV-cache usage.
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine="0",model_name="model"} 0.625
+# HELP vllm:num_requests_running Number of running requests.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="model"} 7
+# HELP vllm:num_requests_waiting Number of waiting requests.
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{engine="0",model_name="model"} 2
+"""
+    )
+
+    assert load == LB.LiveServerLoad(
+        kv_cache_usage=0.625,
+        running_requests=7.0,
+        waiting_requests=2.0,
+    )
+
+
+def test_live_load_parser_fails_closed_when_required_gauge_is_missing():
+    with pytest.raises(ValueError, match="missing required gauges"):
+        LB._live_server_load_from_prometheus(
+            """
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine="0"} 0.25
+"""
+        )
+
+
+def test_live_metric_collection_is_all_or_nothing_and_backs_off_after_failure():
+    metrics = """
+# TYPE vllm:kv_cache_usage_perc gauge
+vllm:kv_cache_usage_perc{engine="0"} 0.25
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0"} 3
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{engine="0"} 0
+"""
+
+    class _Response:
+        text = metrics
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        def __init__(self, fail: bool):
+            self.fail = fail
+            self.calls = 0
+
+        async def get(self, *args, **kwargs):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("metrics unavailable")
+            return _Response()
+
+        async def aclose(self):
+            return None
+
+    state = LB.ProxyState(
+        [("127.0.0.1", 8300), ("127.0.0.1", 8301)],
+        capacity_units=[100.0, 100.0],
+    )
+
+    async def _exercise():
+        await _close_state(state)
+        healthy = _Client(fail=False)
+        failed = _Client(fail=True)
+        state.dp_servers[0].client = healthy
+        state.dp_servers[1].client = failed
+        try:
+            assert await state.read_live_server_loads() is None
+            # The immediate retry takes the estimate fallback without hitting either
+            # endpoint again, so a failed backend cannot serialize a whole burst.
+            assert await state.read_live_server_loads() is None
+            return healthy.calls, failed.calls
+        finally:
+            await _close_state(state)
+
+    calls = asyncio.run(_exercise())
+
+    assert calls == (1, 1)
 
 
 def test_capacity_discovery_is_all_or_nothing(proxy_state):

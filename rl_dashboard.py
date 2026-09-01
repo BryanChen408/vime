@@ -101,6 +101,15 @@ STATE = {
 HOST_HIST_EVERY = 15.0      # seconds between samples
 HOST_HIST_MAX = 1440        # keep ~6h at 15s
 
+# The selected training log may live on /mnt.  A stalled NFS mount can leave a
+# stat/read syscall in uninterruptible sleep for minutes, so request threads
+# must never touch that path directly.  At most one daemon worker performs log
+# I/O; metrics requests keep serving the last parsed snapshot meanwhile.
+LOG_IO_LOCK = threading.Lock()
+LOG_RESULT_LOCK = threading.Lock()
+LOG_RESULTS = {}
+LOG_RESULT_MAX = 16
+
 
 def _epoch_from(line):
     """Parse the leading [YYYY-MM-DD HH:MM:SS] to epoch (only used for diffs,
@@ -136,12 +145,10 @@ def _pointed_log():
     if not path:
         return True, None
     path = os.path.abspath(os.path.expanduser(path))
-    try:
-        if os.path.isfile(path) and os.path.getsize(path) > 0:
-            return True, path
-    except OSError:
-        pass
-    return True, None
+    # The pointer itself is local and trusted.  Do not stat its target here:
+    # it is commonly on NFS, and a stuck mount used to block every dashboard
+    # request before cached NPU/vLLM metrics could be rendered.
+    return True, path
 
 
 def latest_log():
@@ -521,31 +528,45 @@ def _npu_info_parse(out):
     return [cards[i] for i in sorted(cards)]
 
 
-# [2026-08-11] npu-smi 在训练高负载下会变慢(实测 8s+,甚至分钟级),
-# 原先同步调用 + 5s 超时会静默返回 [] → 面板 NPU 空白。
-# 改成后台线程刷新 + 旧缓存兜底:请求永不阻塞,瞬时变慢显示缓存(标 stale)。
-_NPU_CACHE = {"data": [], "ts": 0.0, "refreshing": False, "ever_ok": False}
+# NPU probing is owned by the independent single-flight sampler.  Dashboard
+# requests only read its atomic local cache and can never start/kill npu-smi.
+NPU_METRICS_CACHE = os.environ.get(
+    "NPU_METRICS_CACHE", "/tmp/vime_npu_metrics.json")
+NPU_METRICS_MAX_AGE = float(os.environ.get("NPU_METRICS_MAX_AGE", "600"))
 
 
-def _npu_refresh():
+def _npu_cache_snapshot():
+    now = time.time()
     try:
-        out = subprocess.run(["npu-smi", "info"], capture_output=True,
-                             text=True, timeout=30).stdout
-        data = _npu_info_parse(out)
-        if data:
-            _NPU_CACHE.update(data=data, ts=time.time(), ever_ok=True)
-    except Exception:
-        pass
-    finally:
-        _NPU_CACHE["refreshing"] = False
+        with open(NPU_METRICS_CACHE, encoding="utf-8") as cache_file:
+            cached = json.load(cache_file)
+        cards = cached.get("npu", [])
+        if not isinstance(cards, list):
+            raise ValueError("npu cache field is not a list")
+        last_success = float(cached.get("last_success_ts") or 0.0)
+        age = round(max(0.0, now - last_success), 1) if last_success else None
+        status = {
+            "status": cached.get("status", "unknown"),
+            "ok": bool(cached.get("ok")),
+            "stale": (not cached.get("ok")) or age is None or age > NPU_METRICS_MAX_AGE,
+            "age": age,
+            "error": cached.get("error"),
+            "last_success_ts": last_success or None,
+            "collector_pid": cached.get("collector_pid"),
+            "child_pid": cached.get("child_pid"),
+        }
+        return cards, status
+    except Exception as exc:
+        return [], {"status": "cache_unavailable", "ok": False, "stale": True,
+                    "age": None, "error": type(exc).__name__}
 
 
 def npu_info():
-    now = time.time()
-    if not _NPU_CACHE["refreshing"] and (now - _NPU_CACHE["ts"] > 10):
-        _NPU_CACHE["refreshing"] = True
-        threading.Thread(target=_npu_refresh, daemon=True).start()
-    return _NPU_CACHE["data"]
+    return _npu_cache_snapshot()[0]
+
+
+def npu_status():
+    return _npu_cache_snapshot()[1]
 
 
 # --------------------------- peer node (140) ------------------------------
@@ -553,7 +574,16 @@ def npu_info():
 # 无免密 ssh,故走 HTTP。拉取失败用 ≤120s 的旧缓存兜底,绝不让面板刷新被拖死。
 PEER_METRICS_URL = os.environ.get("PEER_METRICS_URL",
                                   "http://80.48.5.64:19100/node_metrics")
-PEER = {"last_try": 0.0, "good": None, "good_ts": 0.0}
+PEER = {"next_try": 0.0, "good": None, "good_ts": 0.0, "failures": 0}
+PEER_LOCK = threading.Lock()
+
+
+def _peer_cached(now, err="pending"):
+    if PEER["good"] is not None and now - PEER["good_ts"] < 120:
+        out = dict(PEER["good"])
+        out.update(stale=True, age=round(now - PEER["good_ts"]))
+        return out
+    return {"ok": False, "err": err}
 
 # 本机的 vLLM monitor 已经负责运行时 engine 发现、Prometheus 采集和吞吐
 # delta 计算。dashboard 只读它的缓存 API，避免再逐个探测繁忙的 engine。
@@ -564,14 +594,16 @@ LOCAL_VLLM = {"last_try": 0.0, "good": None, "good_ts": 0.0}
 
 def peer_metrics():
     now = time.time()
-    if now - PEER["last_try"] < 5:           # 5s 内不重复拉,直接用缓存
-        if PEER["good"] is not None:
-            out = dict(PEER["good"])
-            out["age"] = round(now - PEER["good_ts"])
-            return out
-        return {"ok": False, "err": "pending"}
-    PEER["last_try"] = now
+    if now < PEER["next_try"]:
+        return _peer_cached(now)
+    # ThreadingHTTPServer may serve several browser refreshes concurrently.
+    # Only one request may fetch the peer; all others immediately use cache.
+    if not PEER_LOCK.acquire(blocking=False):
+        return _peer_cached(now, "refreshing")
     try:
+        now = time.time()
+        if now < PEER["next_try"]:
+            return _peer_cached(now)
         import urllib.request
         # 集群内网地址必须绕开 http_proxy 代理,否则被代理网关拦(504)。
         # 训练脚本靠 no_proxy 环境变量;面板进程环境不一定有 → 代码里硬性绕过。
@@ -580,13 +612,17 @@ def peer_metrics():
             data = json.loads(r.read().decode())
         PEER["good"] = {"ok": True, "data": data}
         PEER["good_ts"] = now
+        PEER["failures"] = 0
+        PEER["next_try"] = now + 5
         return {"ok": True, "age": 0, "data": data}
     except Exception as e:
-        if PEER["good"] is not None and now - PEER["good_ts"] < 120:
-            out = dict(PEER["good"])
-            out.update(stale=True, age=round(now - PEER["good_ts"]))
-            return out
-        return {"ok": False, "err": type(e).__name__}
+        now = time.time()
+        PEER["failures"] += 1
+        backoff = min(60, 5 * (2 ** min(4, PEER["failures"] - 1)))
+        PEER["next_try"] = now + backoff
+        return _peer_cached(now, type(e).__name__)
+    finally:
+        PEER_LOCK.release()
 
 
 def local_vllm_metrics():
@@ -1218,10 +1254,10 @@ def eval_operator_status():
 
 # --------------------------- payload ------------------------------
 def build_metrics():
-    update_log()
     r = STATE["rollouts"]
     cur_step = max(r) if r else None
     latest = r[cur_step] if cur_step is not None else {}
+    npu, npu_state = _npu_cache_snapshot()
     return {
         "meta": {
             "log_file": os.path.basename(STATE["log_path"] or ""),
@@ -1237,7 +1273,8 @@ def build_metrics():
         },
         "rollouts": rollout_block(),
         "train": train_block(),
-        "npu": npu_info(),
+        "npu": npu,
+        "npu_status": npu_state,
         "peer": peer_metrics(),
         "local_vllm": local_vllm_metrics(),
         "host": host_mem(),
@@ -1339,6 +1376,71 @@ def serve_log(qs):
             "size": sz, "at_start": start == 0}
 
 
+def _log_request_key(qs):
+    """Stable key for one asynchronous /api/log read request."""
+    return tuple(sorted((key, tuple(values)) for key, values in qs.items()))
+
+
+def _log_busy_response():
+    """Response used while the sole log-I/O worker is busy or stalled."""
+    claimed, path = _pointed_log()
+    return {
+        "busy": True,
+        "file": os.path.basename(path) if claimed and path else None,
+        "text": "",
+    }
+
+
+def _finish_log_request(key, qs):
+    try:
+        result = serve_log(qs)
+    except Exception as exc:
+        result = {"file": None, "text": "", "error": type(exc).__name__}
+    with LOG_RESULT_LOCK:
+        LOG_RESULTS[key] = result
+        while len(LOG_RESULTS) > LOG_RESULT_MAX:
+            del LOG_RESULTS[next(iter(LOG_RESULTS))]
+    LOG_IO_LOCK.release()
+
+
+def serve_log_nonblocking(qs):
+    """Return a completed log read, or schedule exactly one background read.
+
+    A worker can remain blocked in an NFS syscall without consuming HTTP
+    threads.  The browser retries the same cursor and receives the cached
+    result once the worker completes.
+    """
+    key = _log_request_key(qs)
+    with LOG_RESULT_LOCK:
+        ready = LOG_RESULTS.pop(key, None)
+    if ready is not None:
+        return ready
+    if not LOG_IO_LOCK.acquire(blocking=False):
+        return _log_busy_response()
+    threading.Thread(
+        target=_finish_log_request, args=(key, qs), daemon=True,
+        name="dashboard-log-read",
+    ).start()
+    return _log_busy_response()
+
+
+def _finish_log_update():
+    try:
+        update_log()
+    finally:
+        LOG_IO_LOCK.release()
+
+
+def schedule_log_update():
+    """Start a single background incremental parse without blocking HTTP."""
+    if not LOG_IO_LOCK.acquire(blocking=False):
+        return False
+    threading.Thread(
+        target=_finish_log_update, daemon=True, name="dashboard-log-parse"
+    ).start()
+    return True
+
+
 # ----------------------------- HTML -------------------------------
 PAGE = r"""<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -1421,6 +1523,14 @@ canvas{width:100%;height:248px;display:block;border-radius:8px}
 .bar{height:8px;background:var(--grid);border-radius:980px;overflow:hidden;margin:5px 0}
 .bar>span{display:block;height:100%;border-radius:980px;transition:width .4s ease;box-shadow:inset 0 1px 0 rgba(255,255,255,.25)}
 .row{display:flex;justify-content:space-between;align-items:center;font-size:12px;margin:3px 0;font-variant-numeric:tabular-nums}
+.resource-wide{grid-column:1/-1}
+.cachelegend{font-size:11px;color:var(--muted);margin:-3px 0 10px}
+.nodegrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(390px,1fr));gap:12px}
+.nodepanel{min-width:0;border:.5px solid var(--line);border-radius:11px;padding:10px 12px;background:color-mix(in srgb,var(--panel) 92%,var(--bg))}
+.nodehead{display:flex;justify-content:space-between;align-items:center;gap:10px;padding-bottom:6px;margin-bottom:6px;border-bottom:.5px solid var(--line);font-size:12px}
+.enghead{font-size:11px;color:var(--muted);font-weight:600;margin:9px 0 4px;padding-top:6px;border-top:.5px solid var(--line)}
+.engine-row{gap:10px;padding:2px 0;border-bottom:.5px dashed color-mix(in srgb,var(--line) 70%,transparent)}
+.engine-row:last-child{border-bottom:0}.engine-row>span:last-child{text-align:right}
 table{width:100%;border-collapse:collapse;font-size:12px}td{padding:2px 4px}
 .tag{display:inline-block;padding:2px 10px;border-radius:980px;font-size:11px;font-weight:600;letter-spacing:-.003em}
 th{font-size:11px;color:var(--muted);font-weight:600;text-align:left;padding:2px 4px;border-bottom:.5px solid var(--line)}
@@ -1474,9 +1584,10 @@ th{font-size:11px;color:var(--muted);font-weight:600;text-align:left;padding:2px
 <section class=sec id=sec-sys style="--sa:#ff9f0a">
   <div class=sechead><span class=secbadge>系统资源</span></div>
   <div class=grid>
-    <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · Actor</h2><div id=npu></div></div>
-    <div class=card><h2>🖥️ NPU load (算力 AICore% / 显存 HBM%) · Rollout</h2><div id=npu_peer></div></div>
-    <div class=card><h2>🚀 本机 vLLM 推理引擎</h2><div id=local_vllm></div></div>
+    <div class="card resource-wide"><h2>🖥️ NPU load (AICore% / HBM%) · 本机 + Rollout</h2>
+      <div class=cachelegend>每个推理引擎同时显示：KV=当前缓存块占用率；Prefix命中=KV cache 前缀复用率。</div>
+      <div id=npu_cluster class=nodegrid></div>
+    </div>
     <div class=card><h2>🧠 Host CPU memory · 训练阶段</h2><div id=host></div>
         <canvas id=c_hostmem style="height:140px;margin-top:8px" title="波谷逐轮抬升=泄漏;回到同一基线=尖峰"></canvas>
         <div id=hostmem_stat class=muted style="font-size:11px;margin-top:2px"></div>
@@ -1660,49 +1771,33 @@ async function tick(){
    +(tp.capped?` · <span style="color:#ff9f0a">仅最近${tp.n}个(略${tp.capped}个)</span>`:'')
    +`　│　对比 sglang decode 聚合 ≈ <b>${fmt(m.sglang&&m.sglang.throughput,0)}</b> tok/s`
    : '<span>暂无 completion_metrics 数据</span>';
- // NPU
- $('npu').innerHTML=m.npu.map(n=>{const hp=n.hbm_total?100*n.hbm_used/n.hbm_total:0,ap=n.aicore||0;
+ // 本机 + Rollout 节点统一资源视图。NPU 和引擎数据仍复用各自现有缓存，页面不直探 engine。
+ const renderNpus=cards=>(cards||[]).map(n=>{const hp=n.hbm_total?100*n.hbm_used/n.hbm_total:0,ap=n.aicore??0;
    return `<div class=row><b>NPU ${n.id}</b><span class=muted>AICore ${ap}% · HBM ${hp.toFixed(0)}% (${(n.hbm_used/1024).toFixed(1)}/${(n.hbm_total/1024).toFixed(0)}GB) · ${n.temp}°C</span></div>
-   <div class=bar title="HBM 显存占比 ${hp.toFixed(0)}%"><span style="width:${hp}%;background:${barColor(hp)}"></span></div>`;}).join('')||'<span class=muted>npu-smi 无数据</span>';
- // peer node (140,经 tools/node_exporter.py)
+   <div class=bar title="HBM 显存占比 ${hp.toFixed(0)}%"><span style="width:${hp}%;background:${barColor(hp)}"></span></div>`;}).join('')||'<div class=muted>NPU 指标暂无数据</div>';
+ const cachePct=v=>v==null?'—':(v*100).toFixed(1)+'%';
+ const renderEngines=(engines,source)=>(engines||[]).map(e=>{
+   const port=e.port??((e.key||'').split(':').pop()||'—');
+   const wait=e.waiting||0, alive=e.alive!==false;
+   const perf=source==='local'?`${fmt(e.throughput,1)} tok/s`:`TTFT ${(e.ttft||{}).mean??'—'}s · TPOT ${(e.tpot||{}).mean??'—'}s`;
+   return `<div class="row engine-row"><span><span class="dot ${alive?'on':'off'}"></span><b>eng :${port}</b></span><span class=muted>${perf} · KV <b>${cachePct(e.kv_usage)}</b> · Prefix命中 <b>${cachePct(e.prefix_hit)}</b> · 运行/排队 ${e.running||0}/${wait}</span></div>`;
+ }).join('')||'<div class=muted>尚未发现推理引擎</div>';
+ const statusAge=s=>(s&&s.stale)?` · <span style="color:#ff9f0a">NPU数据 ${s.age??'—'}s 前</span>`:'';
+ const lv=m.local_vllm||{},ld=lv.data||{},lc=ld.combined||{},lns=m.npu_status||{};
+ const localMeta=lv.ok
+   ?`${ld.engines_alive||0}/${ld.engines_total||0} engines · ${fmt(lc.throughput,1)} tok/s · 运行/排队 ${lc.running||0}/${lc.waiting||0}${lv.stale?` · 数据 ${lv.age}s 前`:''}`
+   :`引擎聚合器离线(${lv.err||'未配置'})`;
+ const localPanel=`<div class=nodepanel><div class=nodehead><b>本机 · Actor / Rollout 共卡</b><span class=muted>${localMeta}${statusAge(lns)}</span></div>${renderNpus(m.npu)}<div class=enghead>本机 vLLM · KV / Prefix cache</div>${renderEngines(ld.engines,'local')}</div>`;
  const pr=m.peer||{};
- $('npu_peer').innerHTML=(()=>{
-   if(!pr.ok)return `<span class=muted>140 exporter 离线(${pr.err||'未配置'}) · 在 140 起:python3 tools/node_exporter.py</span>`;
-   const d=pr.data||{},mem=d.mem||{},cpu=d.cpu_pct==null?'—':d.cpu_pct+'%';
-   const head=`<div class=row><b>host ${d.host||'140'}</b><span class=muted>CPU ${cpu} · 内存 ${mem.used_gb??'—'}/${mem.total_gb??'—'}GB${pr.stale?` · <span style="color:#ff9f0a">数据 ${pr.age}s 前</span>`:''}</span></div>`;
-   const rows=(d.npu||[]).map(n=>{const hp=n.hbm_total?100*n.hbm_used/n.hbm_total:0,ap=n.aicore||0;
-     return `<div class=row><b>NPU ${n.id}</b><span class=muted>AICore ${ap}% · HBM ${hp.toFixed(0)}% (${(n.hbm_used/1024).toFixed(1)}/${(n.hbm_total/1024).toFixed(0)}GB) · ${n.temp}°C</span></div>
-     <div class=bar><span style="width:${hp}%;background:${barColor(hp)}"></span></div>`;}).join('');
-   // vllm 推理性能(来自 140 exporter 采的 /metrics)
-   const eng=(d.engines||[]);
-   const engRows = eng.length ? eng.map(e=>{
-     const t=e.ttft||{}, o=e.tpot||{}, q=e.queue_t||{}, ee=e.e2e||{};
-     const tpotTxt = o.mean>0 ? ` · TPOT ${o.mean}s` : '';
-     const qTxt = q.mean!=null ? ` · 排队 ${q.mean}s` : '';
-     const e2eTxt = ee.mean!=null ? ` · e2e ${ee.mean}s` : '';
-     const kv = e.kv_usage!=null ? ` · KV ${(e.kv_usage*100).toFixed(0)}%` : '';
-     const phit = e.prefix_hit!=null ? ` · 命中 ${(e.prefix_hit*100).toFixed(0)}%` : '';
-     const w = (e.waiting||0) > 0 ? ` · <span style="color:#ff9f0a">等待 ${e.waiting}</span>` : '';
-     return `<div class=row><b>eng :${e.port}</b><span class=muted>TTFT ${t.mean??'—'}s(p90 ${t.p90??'—'})${tpotTxt}${qTxt}${e2eTxt}${kv}${phit} · 运行 ${e.running??0}${w}</span></div>`;
-   }).join('') : '';
-   const engSec = engRows ? `<div class=row style="margin-top:6px"><span class=muted>── vllm 推理性能(引擎 /metrics)──</span></div>` + engRows : '';
-   return head+rows+engSec||'<span class=muted>140 无 npu 数据</span>';
- })();
- // 本机 vLLM：复用 :5000 N-engine monitor 的缓存，不直接轮询 engine。
- const lv=m.local_vllm||{};
- $('local_vllm').innerHTML=(()=>{
-   if(!lv.ok)return `<span class=muted>本机指标聚合器离线(${lv.err||'未配置'}) · 启动 scripts/vllm_metrics_monitor_v2.py</span>`;
-   const d=lv.data||{}, c=d.combined||{}, engines=d.engines||[];
-   const stale=lv.stale?` · <span style="color:#ff9f0a">数据 ${lv.age}s 前</span>`:'';
-   const head=`<div class=row><span><span class="dot ${(d.engines_alive||0)>0?'on':'off'}"></span><b>${d.engines_alive||0}/${d.engines_total||0} engines</b></span><span class=muted>更新 ${d.last_update||'—'}${stale}</span></div>
-     <div class=row><span>总吞吐 <b>${fmt(c.throughput,1)} tok/s</b></span><span class=muted>平均 ${fmt(d.avg_per_engine,1)}/engine · 运行/排队 ${c.running||0}/${c.waiting||0}</span></div>`;
-   const rows=engines.map(e=>{
-     const port=(e.key||'').split(':').pop()||'—';
-     const wait=(e.waiting||0)>0?`<span style="color:#ff9f0a">${e.waiting}</span>`:'0';
-     return `<div class=row><span><span class="dot ${e.alive?'on':'off'}"></span>eng :${port}</span><span class=muted>${fmt(e.throughput,1)} tok/s · 运行/排队 ${e.running||0}/${wait}</span></div>`;
-   }).join('');
-   return head+(rows||'<div class=muted style="margin-top:6px">尚未发现本机 engine</div>');
- })();
+ let peerPanel;
+ if(!pr.ok){
+   peerPanel=`<div class=nodepanel><div class=nodehead><b>远端 · Rollout</b><span class=muted>exporter 离线(${pr.err||'未配置'})</span></div><div class=muted>等待远端 NPU / vLLM 指标</div></div>`;
+ }else{
+   const d=pr.data||{},mem=d.mem||{},cpu=d.cpu_pct==null?'—':d.cpu_pct+'%',pns=d.npu_status||{};
+   const peerMeta=`host ${d.host||'peer'} · CPU ${cpu} · 内存 ${mem.used_gb??'—'}/${mem.total_gb??'—'}GB${pr.stale?` · 数据 ${pr.age}s 前`:''}${statusAge(pns)}`;
+   peerPanel=`<div class=nodepanel><div class=nodehead><b>远端 · Rollout</b><span class=muted>${peerMeta}</span></div>${renderNpus(d.npu)}<div class=enghead>远端 vLLM · KV / Prefix cache</div>${renderEngines(d.engines,'peer')}</div>`;
+ }
+ $('npu_cluster').innerHTML=localPanel+peerPanel;
  // host
  const ph=m.phase||{};
  const pbadge=(on,txt,col)=>on?`<span class=tag style="background:${col}22;color:${col};margin-right:4px">${txt}</span>`:'';
@@ -1821,7 +1916,7 @@ function logStat(){
 }
 async function logGet(q){try{return await(await fetch('/api/log'+q)).json();}catch(e){return null;}}
 async function loadTail(){
-  const d=await logGet('?tail=1');if(!d)return;
+  const d=await logGet('?tail=1');if(!d||d.busy)return;
   logFile=d.file;logTop=d.start||0;logEnd=d.end||0;logSize=d.size||0;logAtStart=!!d.at_start;
   $('logfile').textContent=d.file||'(无日志)';
   logbox.textContent='';
@@ -1835,7 +1930,7 @@ async function loadTail(){
 const LOG_MAX_NODES=20000, LOG_HARD_MAX_NODES=40000;   // ~20000节点≈6000+行≈1MB文本
 async function pollLog(){
   if(logFile===null){await loadTail();return;}
-  const d=await logGet('?from='+logEnd+'&file='+encodeURIComponent(logFile));if(!d)return;
+  const d=await logGet('?from='+logEnd+'&file='+encodeURIComponent(logFile));if(!d||d.busy)return;
   if(d.rotated){await loadTail();return;}      // 新一轮 run 换了日志文件
   logSize=d.size||logSize;
   if(d.text){const stick=atBottom();
@@ -1849,7 +1944,7 @@ async function loadOlder(){
   if(logLoading||logAtStart||logFile===null||logTop<=0)return;
   logLoading=true;
   const d=await logGet('?before='+logTop+'&file='+encodeURIComponent(logFile));
-  if(!d){logLoading=false;return;}
+  if(!d||d.busy){logLoading=false;return;}
   if(d.rotated){logLoading=false;await loadTail();return;}
   if(d.text){const pH=logbox.scrollHeight,pT=logbox.scrollTop;
     logbox.insertBefore(logFrag(d.text),logbox.firstChild);
@@ -1871,9 +1966,14 @@ class H(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/metrics":
             body = json.dumps(build_metrics()).encode()
+            # Parse newly appended training-log data after serializing this
+            # response.  The next poll sees it; this poll can never wait on NFS.
+            schedule_log_update()
             ctype = "application/json"
         elif parsed.path == "/api/log":
-            body = json.dumps(serve_log(parse_qs(parsed.query))).encode()
+            body = json.dumps(
+                serve_log_nonblocking(parse_qs(parsed.query))
+            ).encode()
             ctype = "application/json"
         else:
             body = PAGE.encode()
@@ -1884,7 +1984,11 @@ class H(BaseHTTPRequestHandler):
         # [2026-08-31] 轮询响应永不落盘缓存(页面每3s重取也无妨,量级几十KB)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Browser refresh/close while a response is in flight is normal.
+            pass
 
 
 def main():

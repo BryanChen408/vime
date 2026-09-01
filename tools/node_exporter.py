@@ -10,49 +10,40 @@ import json
 import os
 import re
 import socket
-import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+NPU_CACHE_PATH = os.environ.get("NPU_METRICS_CACHE", "/tmp/vime_npu_metrics.json")
+NPU_CACHE_MAX_AGE = float(os.environ.get("NPU_METRICS_MAX_AGE", "180"))
+
+
 def npu_info():
-    """A3 兼容解析(8 模组 × 2 die = 16 逻辑卡),与 rl_dashboard.npu_info 同步。"""
+    """Read the sampler's atomic local cache; never invoke npu-smi here."""
+    now = time.time()
     try:
-        out = subprocess.run(["npu-smi", "info"], capture_output=True,
-                             text=True, timeout=5).stdout
-    except Exception:
-        return []
-    cards, module_temp = {}, {}
-    r1 = re.compile(r"\|\s*(\d+)\s+\S+\s*\|\s*\w+\s*\|\s*(?:[\d.]+|-)\s+(\d+)\s")
-    r2 = re.compile(r"\|\s*(\d+)(?:\s+(\d+))?\s*\|\s*[\w:.]+\s*\|"
-                    r"\s*([\d.]+)\s+[\d.]+\s*/\s*[\d.]+\s+(\d+)\s*/\s*(\d+)")
-    last_npu_id = None   # 行1 刚给出的 NPU 号,留给紧随其后的行2 用
-    for line in out.splitlines():
-        m = r1.search(line)
-        if m:
-            last_npu_id = int(m.group(1))
-            module_temp[last_npu_id] = int(m.group(2))
-            continue
-        m = r2.search(line)
-        if m:
-            if m.group(2) is not None:
-                # A3 双 die:首格是 "模组号 die号",die 的 Phy-ID(0-15)即卡号。
-                cid = int(m.group(2))
-                temp = module_temp.get(cid // 2, 0)
-            else:
-                # [2026-08-14 修复] 单 die(910B2C 等):行2 首格是 **Chip 号**,恒为 0
-                #   —— 见 npu-smi 表头 "| Chip | Bus-Id | AICore(%) ... |",它不是卡号。
-                #   旧代码拿它当卡号 → 所有卡全写进 cards[0],只剩 1 条、且数值是最后
-                #   一张卡的。卡号只在行1 里,故回退到 r1 刚解析出的 NPU 号。
-                #   (rl_dashboard._npu_info_parse 同步修了同一处。)
-                cid = last_npu_id if last_npu_id is not None else int(m.group(1))
-                temp = module_temp.get(cid, 0)
-            cards[cid] = {"id": cid, "power": 0.0,
-                          "temp": temp,
-                          "aicore": int(float(m.group(3))),
-                          "hbm_used": int(m.group(4)),
-                          "hbm_total": int(m.group(5))}
-    return [cards[i] for i in sorted(cards)]
+        with open(NPU_CACHE_PATH, encoding="utf-8") as cache_file:
+            cached = json.load(cache_file)
+        cards = cached.get("npu", [])
+        if not isinstance(cards, list):
+            raise ValueError("npu cache field is not a list")
+        last_success = float(cached.get("last_success_ts") or 0.0)
+        age = round(max(0.0, now - last_success), 1) if last_success else None
+        status = {
+            "status": cached.get("status", "unknown"),
+            "ok": bool(cached.get("ok")),
+            "stale": (not cached.get("ok")) or age is None or age > NPU_CACHE_MAX_AGE,
+            "age": age,
+            "error": cached.get("error"),
+            "last_success_ts": last_success or None,
+            "collector_pid": cached.get("collector_pid"),
+            "child_pid": cached.get("child_pid"),
+        }
+        return cards, status
+    except Exception as exc:
+        return [], {"status": "cache_unavailable", "ok": False, "stale": True,
+                    "age": None, "error": type(exc).__name__}
 
 
 def mem_info():
@@ -78,6 +69,8 @@ _prev_cpu = None
 import urllib.request
 
 _ENG_CACHE = {"ts": 0.0, "ports": []}
+_ENG_SNAPSHOT = {"ts": 0.0, "data": [], "refreshing": False}
+_ENG_LOCK = threading.Lock()
 # 集群内网必须绕过 http_proxy(代理网关会劫持→连接失败)
 _NOPROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -175,8 +168,8 @@ def _ratio(body, num, den):
     return round(float(n.group(1)) / float(d.group(1)), 4)
 
 
-def engine_metrics():
-    """抓取本机 vllm 引擎的性能指标(TTFT/TPOT/排队/e2e/KV/缓存命中)。失败静默跳过。"""
+def _collect_engine_metrics():
+    """Collect vLLM metrics. This may scan ports and must stay off HTTP threads."""
     host = _local_ip()
     out = []
     for p in _discover_engine_ports():
@@ -200,6 +193,29 @@ def engine_metrics():
     return out
 
 
+def _refresh_engine_metrics():
+    try:
+        data = _collect_engine_metrics()
+        with _ENG_LOCK:
+            _ENG_SNAPSHOT.update(ts=time.time(), data=data)
+    finally:
+        with _ENG_LOCK:
+            _ENG_SNAPSHOT["refreshing"] = False
+
+
+def engine_metrics():
+    """Return cached engine metrics and start at most one background refresh."""
+    start_refresh = False
+    with _ENG_LOCK:
+        if not _ENG_SNAPSHOT["refreshing"] and time.time() - _ENG_SNAPSHOT["ts"] >= 5:
+            _ENG_SNAPSHOT["refreshing"] = True
+            start_refresh = True
+        data = list(_ENG_SNAPSHOT["data"])
+    if start_refresh:
+        threading.Thread(target=_refresh_engine_metrics, daemon=True).start()
+    return data
+
+
 def cpu_pct():
     """两次抓取间 /proc/stat 差值;首次返回 None。"""
     global _prev_cpu
@@ -220,16 +236,21 @@ def cpu_pct():
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/node_metrics"):
+            npu, npu_status = npu_info()
             body = json.dumps({
                 "host": socket.gethostname(), "ts": time.time(),
-                "npu": npu_info(), "cpu_pct": cpu_pct(), "mem": mem_info(),
+                "npu": npu, "npu_status": npu_status,
+                "cpu_pct": cpu_pct(), "mem": mem_info(),
                 "engines": engine_metrics(),
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
         elif self.path.startswith("/health"):
             body = b"ok"
             self.send_response(200)
@@ -247,6 +268,11 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=6010)
+    ap.add_argument("--npu-cache", default=NPU_CACHE_PATH)
+    ap.add_argument("--npu-cache-max-age", type=float, default=NPU_CACHE_MAX_AGE)
     a = ap.parse_args()
+    NPU_CACHE_PATH = a.npu_cache
+    NPU_CACHE_MAX_AGE = a.npu_cache_max_age
     print(f"[node_exporter] serving http://0.0.0.0:{a.port}/node_metrics", flush=True)
+    engine_metrics()  # warm asynchronously; the HTTP endpoint remains non-blocking
     ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()

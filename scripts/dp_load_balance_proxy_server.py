@@ -17,8 +17,8 @@
 # vime 适配(ITEM 1 透传 + DP #4 的 B+ 方案 —— 见 docs/design/router_return_token_ids_passthrough.md §10):
 # - 原样 dict 转发请求(req_data = request.json() → json=req_data),不像 Rust router 的 typed 解析
 #   会丢 vLLM 扩展字段 return_token_ids → 保 token 保真(这是替 Rust router 的根本原因)。
-# - session 亲和:读 x-session-id header(vime consistent_hash 约定)一致性哈希钉引擎;无则负载均衡
-#   (= vLLM 官方 DP proxy 同款 active_tokens)。
+# - session 亲和:读 x-session-id header(vime consistent_hash 约定);首次按 vLLM 实时 KV 负载选引擎,
+#   后续钉住该引擎复用 prefix cache;无 session id 则用 vLLM 官方 DP proxy 同款 active_tokens。
 # - 加 /health 就绪探针(polar 探测)。
 #
 # Prerequisites:
@@ -93,6 +93,7 @@ import functools
 import hashlib
 import heapq
 import json
+import math
 import os
 import sys
 import time
@@ -104,6 +105,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
+from prometheus_client.parser import text_string_to_metric_families
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -140,6 +142,12 @@ _SESSION_POLICY = os.environ.get("VIME_LB_SESSION_POLICY", "least_load").strip()
 #   TTL 取 2 小时留足余量(误清只会让该 session 换引擎、丢一次前缀缓存,不会出错)。
 _SESSION_TTL = float(os.environ.get("VIME_LB_SESSION_TTL", "7200"))
 _SESSION_PRUNE_INTERVAL = 60.0
+# Live load is sampled only while binding a previously unseen session.  A short
+# timeout keeps a broken metrics endpoint from delaying rollout admission; the
+# existing capacity-aware estimate remains the fail-open path.
+_LIVE_METRICS_TIMEOUT = float(os.environ.get("VIME_LB_METRICS_TIMEOUT", "2.0"))
+_LIVE_METRICS_RETRY_INTERVAL = float(os.environ.get("VIME_LB_METRICS_RETRY_INTERVAL", "5.0"))
+_LIVE_METRICS_WARNING_INTERVAL = 60.0
 
 
 @dataclass
@@ -147,6 +155,13 @@ class SessionBinding:
     server_idx: int
     last_seen: float
     estimated_kv_tokens: float
+
+
+@dataclass(frozen=True)
+class LiveServerLoad:
+    kv_cache_usage: float
+    running_requests: float
+    waiting_requests: float
 
 
 class ServerState:
@@ -177,7 +192,6 @@ class ProxyState:
     def __init__(self, server_instances, capacity_units: list[float] | None = None):
         self.dp_servers: list[ServerState] = [ServerState(h, p) for h, p in server_instances]
         self.req_id_lock = asyncio.Lock()
-        # Removed selection locks - no longer needed for synchronous methods
 
         # Initialize priority queues for efficient server selection
         # Each entry is (priority_score, server_index, server_reference)
@@ -188,6 +202,12 @@ class ProxyState:
         #   之后同 session 恒定复用 → 前缀 KV 命中(实测 87-95%)靠它。
         self.session_map: dict[str, SessionBinding] = {}
         self._last_prune = time.monotonic()
+        # Only first-time session bindings enter this lock. Existing sessions keep
+        # their zero-extra-I/O affinity path while concurrent new sessions cannot all
+        # observe the same low-KV backend and stampede it.
+        self._new_session_lock = asyncio.Lock()
+        self._live_metrics_retry_after = 0.0
+        self._last_live_metrics_warning = float("-inf")
         if capacity_units is not None:
             self.set_capacity_units(capacity_units)
 
@@ -238,6 +258,42 @@ class ProxyState:
         logger.info("Discovered backend KV capacity units: %s", capacities)
         return True
 
+    async def read_live_server_loads(self) -> list[LiveServerLoad] | None:
+        """Read current vLLM scheduler/KV gauges for a new-session decision.
+
+        No successful result is cached: every newly bound session gets a fresh
+        snapshot.  On a metrics failure, a short circuit-breaker interval prevents
+        a backend outage from serially adding the full timeout to a burst of new
+        sessions; callers then use the existing estimate-based fallback.
+        """
+
+        now = time.monotonic()
+        if now < self._live_metrics_retry_after:
+            return None
+
+        async def _read(server: ServerState) -> LiveServerLoad:
+            url = f"http://{server.host}:{server.port}/metrics"
+            response = await server.client.get(url, timeout=_LIVE_METRICS_TIMEOUT)
+            response.raise_for_status()
+            return _live_server_load_from_prometheus(response.text)
+
+        results = await asyncio.gather(*(_read(server) for server in self.dp_servers), return_exceptions=True)
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if failures:
+            self._live_metrics_retry_after = now + _LIVE_METRICS_RETRY_INTERVAL
+            if now - self._last_live_metrics_warning >= _LIVE_METRICS_WARNING_INTERVAL:
+                self._last_live_metrics_warning = now
+                logger.warning(
+                    "Live KV metrics failed for %d/%d backends; using capacity-aware estimate until retry: %s",
+                    len(failures),
+                    len(self.dp_servers),
+                    failures,
+                )
+            return None
+
+        self._live_metrics_retry_after = 0.0
+        return [result for result in results if isinstance(result, LiveServerLoad)]
+
     def _update_server_priority(self, server_idx: int):
         """Update the priority of a decoder server in the heap."""
         server = self.dp_servers[server_idx]
@@ -285,7 +341,73 @@ class ProxyState:
         if stale:
             logger.debug("Pruned %d stale session mappings", len(stale))
 
-    def select_server_by_session(self, session_id: str, token_count):
+    def _reserve_existing_session(
+        self,
+        session_id: str,
+        token_count: float,
+        entry: SessionBinding,
+        now: float,
+    ) -> int:
+        idx = entry.server_idx
+        # 每轮请求携带完整增长后的上下文。用本 session 见过的最大请求估算
+        # 其可复用 KV footprint；上下文偶尔截断时不立即低估仍留在缓存中的旧块。
+        estimated_kv_tokens = max(entry.estimated_kv_tokens, float(token_count))
+        server = self.dp_servers[idx]
+        server.estimated_session_kv_tokens += estimated_kv_tokens - entry.estimated_kv_tokens
+        self.session_map[session_id] = SessionBinding(idx, now, estimated_kv_tokens)
+        server.active_tokens += token_count
+        server.active_requests += 1
+        self._update_server_priority(idx)
+        return idx
+
+    def _choose_new_session_server(
+        self,
+        token_count: float,
+        live_loads: list[LiveServerLoad] | None,
+    ) -> int:
+        if live_loads is not None:
+            if len(live_loads) != len(self.dp_servers):
+                raise ValueError(
+                    f"live load count ({len(live_loads)}) does not match server count ({len(self.dp_servers)})"
+                )
+
+            # The vLLM gauge accounts for cache blocks that really exist, including
+            # shared prefixes and blocks retained after a request becomes idle. Add
+            # active_tokens as a short-lived reservation because a just-selected
+            # request may not have reached the engine's next /metrics scrape yet.
+            return min(
+                range(len(self.dp_servers)),
+                key=lambda i: (
+                    live_loads[i].kv_cache_usage
+                    + (self.dp_servers[i].active_tokens + token_count)
+                    / self.dp_servers[i].kv_capacity_units,
+                    live_loads[i].waiting_requests,
+                    live_loads[i].running_requests + self.dp_servers[i].active_requests,
+                    (
+                        self.dp_servers[i].estimated_session_kv_tokens + token_count
+                    )
+                    / self.dp_servers[i].kv_capacity_units,
+                    self.dp_servers[i].active_sessions,
+                    i,
+                ),
+            )
+
+        # Metrics unavailable: retain the proven capacity-aware routing behavior.
+        return min(
+            range(len(self.dp_servers)),
+            key=lambda i: (
+                (
+                    self.dp_servers[i].estimated_session_kv_tokens + token_count
+                )
+                / self.dp_servers[i].kv_capacity_units,
+                (self.dp_servers[i].active_tokens + token_count)
+                / self.dp_servers[i].kv_capacity_units,
+                self.dp_servers[i].active_sessions,
+                i,
+            ),
+        )
+
+    async def select_server_by_session(self, session_id: str, token_count: float) -> int:
         """Session 亲和:同一 session_id(vime 每条 rollout sample 一个)恒定钉在同一引擎,
         多轮请求复用前缀 KV —— 对齐 vime/slime 上游 router_policy=consistent_hash 的效果。
 
@@ -296,51 +418,52 @@ class ProxyState:
           变异系数 0.36,且长会话(54 分钟/40+ 轮)会把一次偏斜放大成整场偏斜。
           亲和性不受影响 —— 只改"第一次选谁",选定后照样钉死。
           置 VIME_LB_SESSION_POLICY=hash 可回退到旧的纯哈希行为。
+
+        [2026-09-01] least_load 首次分配读取各 vLLM /metrics 的真实 KV 使用率，
+          同时保留 active_tokens 作为尚未反映到指标中的请求预留量。指标失败时回退到
+          原有的容量归一化 session 估算；已经绑定的 session 不读取指标也不迁移。
         """
         now = time.monotonic()
         self._maybe_prune_sessions(now)
         entry = self.session_map.get(session_id)
         if entry is not None:
-            idx = entry.server_idx
-            # 每轮请求携带完整增长后的上下文。用本 session 见过的最大请求估算
-            # 其可复用 KV footprint；上下文偶尔截断时不立即低估仍留在缓存中的旧块。
-            estimated_kv_tokens = max(entry.estimated_kv_tokens, float(token_count))
-            server = self.dp_servers[idx]
-            server.estimated_session_kv_tokens += estimated_kv_tokens - entry.estimated_kv_tokens
-        else:
+            # Existing sessions never query /metrics and never change engines.
+            return self._reserve_existing_session(session_id, token_count, entry, now)
+
+        # Serialize only first-time bindings. This avoids duplicate metric reads for
+        # concurrent turns of the same new session and makes each reservation visible
+        # before the next new session chooses an engine. Existing sessions bypass it.
+        async with self._new_session_lock:
+            now = time.monotonic()
+            self._maybe_prune_sessions(now)
+            entry = self.session_map.get(session_id)
+            if entry is not None:
+                return self._reserve_existing_session(session_id, token_count, entry, now)
+
+            live_loads = None
             if _SESSION_POLICY == "hash":
                 idx = int(hashlib.md5(session_id.encode("utf-8")).hexdigest(), 16) % len(self.dp_servers)
             else:
-                # 主序:预计常驻 session KV / 本引擎实际 KV 容量；次序:实时在飞
-                # token / 容量。这样容量相差 2x 的引擎会自然承接约 2x 的上下文，
-                # 而不是被 raw session count 强行平均。
-                idx = min(
-                    range(len(self.dp_servers)),
-                    key=lambda i: (
-                        (
-                            self.dp_servers[i].estimated_session_kv_tokens + token_count
-                        )
-                        / self.dp_servers[i].kv_capacity_units,
-                        (self.dp_servers[i].active_tokens + token_count)
-                        / self.dp_servers[i].kv_capacity_units,
-                        self.dp_servers[i].active_sessions,
-                        i,
-                    ),
-                )
+                live_loads = await self.read_live_server_loads()
+                idx = self._choose_new_session_server(token_count, live_loads)
+
             server = self.dp_servers[idx]
             estimated_kv_tokens = float(token_count)
             server.active_sessions += 1
             server.estimated_session_kv_tokens += estimated_kv_tokens
+            self.session_map[session_id] = SessionBinding(idx, now, estimated_kv_tokens)
+            server.active_tokens += token_count
+            server.active_requests += 1
+            self._update_server_priority(idx)
             logger.debug(
-                "New session %s -> server %d (policy=%s, sessions=%s, kv_pressure=%s)",
-                session_id, idx, _SESSION_POLICY,
+                "New session %s -> server %d (policy=%s, live_kv=%s, sessions=%s, estimated_kv_pressure=%s)",
+                session_id,
+                idx,
+                _SESSION_POLICY,
+                None if live_loads is None else [round(load.kv_cache_usage, 4) for load in live_loads],
                 [sv.active_sessions for sv in self.dp_servers],
                 [round(sv.estimated_session_kv_tokens / sv.kv_capacity_units, 4) for sv in self.dp_servers],
             )
-        self.session_map[session_id] = SessionBinding(idx, now, estimated_kv_tokens)
-        self.dp_servers[idx].active_tokens += token_count
-        self.dp_servers[idx].active_requests += 1
-        self._update_server_priority(idx)
         return idx
 
     def release_server(self, idx: int, token_count):  # Changed to synchronous
@@ -441,6 +564,44 @@ class ProxyState:
 
 
 proxy_state = None
+
+
+def _live_server_load_from_prometheus(payload: str) -> LiveServerLoad:
+    """Parse vLLM's existing Prometheus gauges without depending on log text."""
+
+    metric_names = {
+        "vllm:kv_cache_usage_perc",
+        "vllm:num_requests_running",
+        "vllm:num_requests_waiting",
+    }
+    values: dict[str, list[float]] = {name: [] for name in metric_names}
+    for family in text_string_to_metric_families(payload):
+        for sample in family.samples:
+            if sample.name in values:
+                values[sample.name].append(float(sample.value))
+
+    missing = [name for name, samples in values.items() if not samples]
+    if missing:
+        raise ValueError(f"vLLM /metrics is missing required gauges: {sorted(missing)!r}")
+
+    # An endpoint normally exposes one engine. max(KV) and sum(requests) also give
+    # safe semantics if an endpoint exposes several engine-labelled samples.
+    kv_cache_usage = max(values["vllm:kv_cache_usage_perc"])
+    running_requests = sum(values["vllm:num_requests_running"])
+    waiting_requests = sum(values["vllm:num_requests_waiting"])
+    if not all(math.isfinite(value) for value in (kv_cache_usage, running_requests, waiting_requests)):
+        raise ValueError("vLLM /metrics returned a non-finite live load gauge")
+    if not 0.0 <= kv_cache_usage <= 1.0:
+        raise ValueError(f"vLLM /metrics returned invalid KV usage: {kv_cache_usage}")
+    if running_requests < 0.0 or waiting_requests < 0.0:
+        raise ValueError(
+            f"vLLM /metrics returned negative request counts: running={running_requests}, waiting={waiting_requests}"
+        )
+    return LiveServerLoad(
+        kv_cache_usage=kv_cache_usage,
+        running_requests=running_requests,
+        waiting_requests=waiting_requests,
+    )
 
 
 def _kv_capacity_units_from_server_info(payload: Any) -> float:
@@ -601,7 +762,7 @@ async def _select_instance(api: str, req_data: Any, request_length: int, session
     request_id = await proxy_state.next_req_id()
     if session_id:
         # session 亲和(对齐上游 consistent_hash 默认):同一 sample 的多轮钉同一引擎、复用前缀 KV
-        server_idx = proxy_state.select_server_by_session(session_id, priority_score)
+        server_idx = await proxy_state.select_server_by_session(session_id, priority_score)
     else:
         # 无 x-session-id → 退回 active_tokens 最小负载(= vLLM 官方 DP proxy 同款)
         server_idx = proxy_state.select_server(priority_score)

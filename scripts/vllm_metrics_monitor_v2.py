@@ -18,6 +18,10 @@
   "KV 卡住准入"和"负载不足"靠的就是 ``waiting>0 且 running<=1`` 的占比
   （tp2 34% vs tp4 0%）。面板直接算出这个比例。
 
+* **KV 使用率和 prefix cache 命中率直接取 Prometheus。** dashboard 不从日志
+  文本反推，分别使用 ``vllm:kv_cache_usage_perc`` 和累计的
+  ``prefix_cache_hits_total / prefix_cache_queries_total``。
+
 * **扫描不能骚扰非 HTTP 端口。** 同一区间里还挤着 Mooncake 的 KV 握手端口
   （vime 给每个 engine 分配 ``port`` / ``port+1`` (nccl) / ``port+2 .. port+1+tp``
   (bootstrap)）。往握手端口发 ``GET /metrics``，Mooncake 会把 HTTP 头当成二进制
@@ -261,6 +265,10 @@ def _blank_engine(url: str) -> dict:
         "waiting": 0,
         "generation_tokens_total": 0.0,
         "prompt_tokens_total": 0.0,
+        "kv_usage": None,
+        "prefix_hit": None,
+        "prefix_cache_hits_total": 0.0,
+        "prefix_cache_queries_total": 0.0,
         "_prev_tokens": None,  # None = 尚未建立基线，首轮不产出吞吐
         "_prev_time": None,
     }
@@ -274,6 +282,8 @@ def update_engine(key: str, raw: dict | None) -> dict:
         eng["throughput"] = 0.0
         eng["running"] = 0
         eng["waiting"] = 0
+        eng["kv_usage"] = None
+        eng["prefix_hit"] = None
         # 保留 _prev_tokens：短暂抓取失败后恢复，仍能按真实时间跨度算 delta
         return eng
 
@@ -290,6 +300,11 @@ def update_engine(key: str, raw: dict | None) -> dict:
             delta = 0.0  # engine 重启 → 计数器回退，钳到 0
         throughput = delta / elapsed if elapsed > 0 else 0.0
 
+    prefix_hits = raw.get("vllm:prefix_cache_hits_total", 0.0)
+    prefix_queries = raw.get("vllm:prefix_cache_queries_total", 0.0)
+    prefix_hit = prefix_hits / prefix_queries if prefix_queries > 0 else None
+    kv_usage = raw.get("vllm:kv_cache_usage_perc")
+
     eng.update(
         alive=True,
         throughput=throughput,
@@ -297,6 +312,10 @@ def update_engine(key: str, raw: dict | None) -> dict:
         waiting=int(raw.get("vllm:num_requests_waiting", 0)),
         generation_tokens_total=gen_total,
         prompt_tokens_total=raw.get("vllm:prompt_tokens_total", 0.0),
+        kv_usage=kv_usage,
+        prefix_hit=prefix_hit,
+        prefix_cache_hits_total=prefix_hits,
+        prefix_cache_queries_total=prefix_queries,
         _prev_tokens=gen_total,
         _prev_time=now,
     )
@@ -336,6 +355,8 @@ def collector():
                             "throughput": eng["throughput"],
                             "running": eng["running"],
                             "waiting": eng["waiting"],
+                            "kv_usage": eng["kv_usage"],
+                            "prefix_hit": eng["prefix_hit"],
                         }
                     )
 
@@ -429,7 +450,7 @@ HTML_TEMPLATE = """
     <div class="chart">
         <h2>Per-Engine Breakdown</h2>
         <table>
-            <thead><tr><th>Engine</th><th>Throughput</th><th>Running</th><th>Waiting</th><th>Gen tokens</th></tr></thead>
+            <thead><tr><th>Engine</th><th>Throughput</th><th>Running</th><th>Waiting</th><th>KV usage</th><th>Prefix hit</th><th>Gen tokens</th></tr></thead>
             <tbody id="engRows"></tbody>
         </table>
         <p class="hint">
@@ -454,6 +475,7 @@ const reqChart = new Chart(document.getElementById('reqChart'), {...base, data:{
     {label:'Waiting',data:[],borderColor:'#f85149',backgroundColor:'rgba(248,81,73,.18)',fill:true,tension:.35,pointRadius:0}]}});
 
 function fmt(n,d=1){ return (n===null||n===undefined)?'--':Number(n).toFixed(d); }
+function fmtPct(n){ return (n===null||n===undefined)?'--':(Number(n)*100).toFixed(1)+'%'; }
 
 function update(){
   fetch('/api/metrics').then(r=>r.json()).then(d=>{
@@ -464,17 +486,18 @@ function update(){
     document.getElementById('wait').textContent    = d.combined.waiting;
     document.getElementById('perEng').textContent  = fmt(d.avg_per_engine);
 
-    const pct = d.starved_pct;
-    document.getElementById('starve').textContent = fmt(pct,0) + '%';
+    const starvedPct = d.starved_pct;
+    document.getElementById('starve').textContent = fmt(starvedPct,0) + '%';
     const c = document.getElementById('starveCard');
-    c.className = 'card' + (pct >= 20 ? ' bad' : (pct >= 5 ? ' warn' : ''));
+    c.className = 'card' + (starvedPct >= 20 ? ' bad' : (starvedPct >= 5 ? ' warn' : ''));
 
     const rows = d.engines.map(e => `<tr class="${e.waiting>0&&e.running<=1?'starved':''}">
         <td><span class="dot ${e.alive?'up':'down'}"></span>${e.key}</td>
         <td>${fmt(e.throughput)}</td><td>${e.running}</td><td>${e.waiting}</td>
+        <td>${fmtPct(e.kv_usage)}</td><td>${fmtPct(e.prefix_hit)}</td>
         <td>${Number(e.generation_tokens_total).toLocaleString()}</td></tr>`).join('');
     document.getElementById('engRows').innerHTML = rows ||
-        '<tr><td colspan="5" style="text-align:center;color:#8b949e">尚未发现 engine — 等待 vLLM 启动…</td></tr>';
+        '<tr><td colspan="7" style="text-align:center;color:#8b949e">尚未发现 engine — 等待 vLLM 启动…</td></tr>';
 
     if(d.history){
       tpChart.data.labels = d.history.timestamps;
@@ -511,6 +534,10 @@ def api_metrics():
                 "running": e["running"],
                 "waiting": e["waiting"],
                 "generation_tokens_total": e["generation_tokens_total"],
+                "kv_usage": e["kv_usage"],
+                "prefix_hit": e["prefix_hit"],
+                "prefix_cache_hits_total": e["prefix_cache_hits_total"],
+                "prefix_cache_queries_total": e["prefix_cache_queries_total"],
             }
             for key, e in sorted(engines.items())
         ]
