@@ -695,7 +695,7 @@ def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
         {
             "data", "dtype", "device", "grad", "grad_fn", "layout",
             "name", "names", "ndim", "output_nr", "requires_grad",
-            "retains_grad", "shape", "size",
+            "retains_grad", "shape", "size", "T", "H", "mT", "mH",
         }
     )
     for key in dir(src):
@@ -738,7 +738,7 @@ def _capture_vllm_param_attrs(model) -> dict[str, dict[str, object]]:
         {
             "data", "dtype", "device", "grad", "grad_fn", "layout",
             "name", "names", "ndim", "output_nr", "requires_grad",
-            "retains_grad", "shape", "size",
+            "retains_grad", "shape", "size", "T", "H", "mT", "mH",
         }
     )
     captured: dict[str, dict[str, object]] = {}
