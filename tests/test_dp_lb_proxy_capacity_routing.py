@@ -119,9 +119,10 @@ def test_existing_session_stays_pinned_and_updates_its_kv_estimate(proxy_state):
     assert proxy_state.dp_servers[first_idx].estimated_session_kv_tokens == 35.0
 
 
-def test_new_session_prefers_real_kv_usage_over_stale_proxy_estimate(proxy_state):
-    # Proxy bookkeeping says server 0 is much fuller, while vLLM reports that its
-    # actual cache is mostly free. Live KV must be the primary routing signal.
+def test_sticky_debt_prevents_deceptively_empty_engine_from_attracting_new_session(proxy_state):
+    # Server 0 has just released most physical KV but still owns far more sticky
+    # sessions that can return.  Dominant pressure must keep that future obligation
+    # in the primary score instead of treating it as an almost-unused tie-breaker.
     proxy_state.dp_servers[0].estimated_session_kv_tokens = 90.0
     proxy_state.dp_servers[1].estimated_session_kv_tokens = 10.0
     proxy_state.read_live_server_loads.return_value = [
@@ -131,7 +132,30 @@ def test_new_session_prefers_real_kv_usage_over_stale_proxy_estimate(proxy_state
 
     idx = asyncio.run(proxy_state.select_server_by_session("live-kv-session", 10.0))
 
-    assert idx == 0
+    assert idx == 1
+
+
+def test_real_kv_pressure_still_protects_physically_full_engine():
+    state = LB.ProxyState(
+        [("127.0.0.1", 8150), ("127.0.0.1", 8151)],
+        capacity_units=[100.0, 100.0],
+    )
+    state.dp_servers[0].estimated_session_kv_tokens = 10.0
+    state.dp_servers[1].estimated_session_kv_tokens = 50.0
+    state.read_live_server_loads = AsyncMock(
+        return_value=[
+            LB.LiveServerLoad(0.90, 0.0, 0.0),
+            LB.LiveServerLoad(0.10, 0.0, 0.0),
+        ]
+    )
+
+    async def _exercise():
+        try:
+            return await state.select_server_by_session("physical-kv-session", 10.0)
+        finally:
+            await _close_state(state)
+
+    assert asyncio.run(_exercise()) == 1
 
 
 def test_concurrent_new_sessions_reserve_load_before_metrics_catch_up():
@@ -158,6 +182,97 @@ def test_concurrent_new_sessions_reserve_load_before_metrics_catch_up():
     assignments = asyncio.run(_exercise())
 
     assert assignments == [0, 1]
+
+
+def test_current_heterogeneous_pool_gets_five_and_six_session_quotas():
+    capacities = [1_376_256.0] * 8 + [1_691_648.0] * 4
+    state = LB.ProxyState(
+        [("127.0.0.1", 8200 + i) for i in range(12)],
+        capacity_units=capacities,
+        max_active_sessions=64,
+    )
+
+    try:
+        assert state.session_quotas == [5] * 8 + [6] * 4
+        assert sum(state.session_quotas) == 64
+        snapshot = state.snapshot()
+        assert snapshot["max_active_sessions"] == 64
+        assert snapshot["session_quotas"] == [5] * 8 + [6] * 4
+        assert [server["session_quota"] for server in snapshot["servers"]] == [5] * 8 + [6] * 4
+    finally:
+        asyncio.run(_close_state(state))
+
+
+def test_all_64_max_length_sessions_stay_within_capacity_weighted_quotas():
+    capacities = [1_376_256.0] * 8 + [1_691_648.0] * 4
+    state = LB.ProxyState(
+        [("127.0.0.1", 8400 + i) for i in range(12)],
+        capacity_units=capacities,
+        max_active_sessions=64,
+    )
+    # Keep one backend deceptively empty while every other live gauge remains at
+    # 40%. Without the quota boundary, completed first turns can repeatedly fall
+    # back into that same backend after active_tokens returns to zero.
+    state.read_live_server_loads = AsyncMock(
+        return_value=[LB.LiveServerLoad(0.0, 0.0, 0.0)]
+        + [LB.LiveServerLoad(0.4, 0.0, 0.0)] * 11
+    )
+
+    async def _exercise():
+        try:
+            for i in range(64):
+                await _assign_and_finish(state, f"max-length-{i}", token_count=262_144.0)
+        finally:
+            await _close_state(state)
+
+    asyncio.run(_exercise())
+
+    assert [server.active_sessions for server in state.dp_servers] == [5] * 8 + [6] * 4
+    assert state.read_live_server_loads.await_count == 64
+    pressures = [
+        server.estimated_session_kv_tokens / server.kv_capacity_units
+        for server in state.dp_servers
+    ]
+    assert max(pressures) == pytest.approx(20 / 21)
+    assert all(pressure < 1.0 for pressure in pressures)
+
+
+def test_full_quotas_fail_open_and_terminal_release_reopens_exact_slot():
+    state = LB.ProxyState(
+        [("127.0.0.1", 8600), ("127.0.0.1", 8601)],
+        capacity_units=[100.0, 200.0],
+        max_active_sessions=3,
+    )
+    state.read_live_server_loads = AsyncMock(return_value=None)
+
+    async def _exercise():
+        try:
+            assignments = [
+                await _assign_and_finish(state, f"quota-{i}", token_count=10.0)
+                for i in range(3)
+            ]
+            assert [server.active_sessions for server in state.dp_servers] == [1, 2]
+
+            # A delayed terminal callback must not make the proxy reject session 4.
+            overflow_idx = await _assign_and_finish(state, "quota-overflow", token_count=10.0)
+            assert sum(server.active_sessions for server in state.dp_servers) == 4
+
+            server_zero_session = next(
+                session_id
+                for session_id, binding in state.session_map.items()
+                if binding.server_idx == 0
+            )
+            state.release_sticky_session(server_zero_session)
+            reopened_idx = await _assign_and_finish(state, "quota-reopened", token_count=10.0)
+            return assignments, overflow_idx, reopened_idx
+        finally:
+            await _close_state(state)
+
+    assignments, overflow_idx, reopened_idx = asyncio.run(_exercise())
+
+    assert Counter(assignments) == {0: 1, 1: 2}
+    assert overflow_idx in (0, 1)
+    assert reopened_idx == 0
 
 
 def test_policy_boundary_clear_is_fail_closed_until_requests_are_drained(proxy_state):
@@ -352,6 +467,98 @@ def test_capacity_discovery_is_all_or_nothing(proxy_state):
     asyncio.run(_exercise())
 
 
+def test_capacity_discovery_failure_disables_weighted_session_quotas():
+    class _Response:
+        def __init__(self, blocks: int):
+            self.blocks = blocks
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "vllm_config": {
+                    "cache_config": {
+                        "num_gpu_blocks": self.blocks,
+                        "block_size": 10,
+                    }
+                }
+            }
+
+    class _Client:
+        def __init__(self, blocks: int | None):
+            self.blocks = blocks
+
+        async def get(self, *args, **kwargs):
+            if self.blocks is None:
+                raise RuntimeError("backend unavailable")
+            return _Response(self.blocks)
+
+        async def aclose(self):
+            return None
+
+    state = LB.ProxyState(
+        [("127.0.0.1", 8700), ("127.0.0.1", 8701)],
+        max_active_sessions=3,
+    )
+
+    async def _exercise():
+        await _close_state(state)
+        state.dp_servers[0].client = _Client(10)
+        state.dp_servers[1].client = _Client(20)
+        assert await state.discover_kv_capacities() is True
+        assert state.session_quotas == [1, 2]
+
+        state.dp_servers[1].client = _Client(None)
+        assert await state.discover_kv_capacities() is False
+        assert state.session_quotas is None
+        assert [server.kv_capacity_units for server in state.dp_servers] == [1.0, 1.0]
+        await _close_state(state)
+
+    asyncio.run(_exercise())
+
+
+def test_proxy_lifespan_retries_capacity_discovery_in_background(monkeypatch):
+    class _Client:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    class _State:
+        def __init__(self):
+            self.dp_servers = [types.SimpleNamespace(client=_Client())]
+            self.discovery_calls = 0
+
+        async def discover_kv_capacities(self):
+            self.discovery_calls += 1
+            return self.discovery_calls >= 2
+
+    state = _State()
+    monkeypatch.setattr(LB, "ProxyState", lambda *args, **kwargs: state)
+    monkeypatch.setattr(
+        LB,
+        "global_args",
+        types.SimpleNamespace(server_instances=[("127.0.0.1", 8800)], max_active_sessions=64),
+        raising=False,
+    )
+    monkeypatch.setattr(LB, "_SESSION_POLICY", "least_load")
+    monkeypatch.setattr(LB, "_CAPACITY_RETRY_INTERVAL", 0.0)
+
+    async def _exercise():
+        async with LB.lifespan(None):
+            for _ in range(10):
+                if state.discovery_calls >= 2:
+                    break
+                await asyncio.sleep(0)
+
+    asyncio.run(_exercise())
+
+    assert state.discovery_calls == 2
+    assert state.dp_servers[0].client.closed is True
+
+
 def test_cancelled_forward_releases_live_load(proxy_state, monkeypatch):
     class _Request:
         headers = {"x-session-id": "cancelled-session"}
@@ -394,6 +601,19 @@ def test_rollout_manager_clears_affinity_before_resuming_polar():
     }
 
     assert call_lines["srv.clear_lb_proxy_sticky_cache"] < call_lines["self._call_rollout_function_hook"]
+
+
+def test_rollout_manager_passes_existing_active_session_limit_to_lb_proxy():
+    tree = ast.parse((REPO_ROOT / "vime" / "ray" / "rollout.py").read_text())
+    start_proxy = next(
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_start_lb_proxy"
+    )
+    source = ast.unparse(start_proxy)
+
+    assert "rollout_max_active_sessions" in source
+    assert "--max-active-sessions" in source
 
 
 if __name__ == "__main__":

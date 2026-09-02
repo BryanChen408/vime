@@ -1425,6 +1425,9 @@ def _start_lb_proxy(args, router_ip, router_port, engine_urls):
         "--dp-ports",
         *ports,
     ]
+    max_active_sessions = getattr(args, "rollout_max_active_sessions", None)
+    if max_active_sessions is not None:
+        cmd.extend(["--max-active-sessions", str(max_active_sessions)])
     logger.info("Launching LB proxy: %s", " ".join(cmd))
     proc = subprocess.Popen(cmd)
     time.sleep(3)

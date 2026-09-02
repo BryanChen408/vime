@@ -17,8 +17,9 @@
 # vime 适配(ITEM 1 透传 + DP #4 的 B+ 方案 —— 见 docs/design/router_return_token_ids_passthrough.md §10):
 # - 原样 dict 转发请求(req_data = request.json() → json=req_data),不像 Rust router 的 typed 解析
 #   会丢 vLLM 扩展字段 return_token_ids → 保 token 保真(这是替 Rust router 的根本原因)。
-# - session 亲和:读 x-session-id header(vime consistent_hash 约定);首次按 vLLM 实时 KV 负载选引擎,
-#   后续钉住该引擎复用 prefix cache;无 session id 则用 vLLM 官方 DP proxy 同款 active_tokens。
+# - session 亲和:读 x-session-id header(vime consistent_hash 约定);首次按实际 KV 容量配额与
+#   max(实时负载,长期 session 负债)选引擎,后续钉住复用 prefix cache;无 session id 则用
+#   vLLM 官方 DP proxy 同款 active_tokens。
 # - 加 /health 就绪探针(polar 探测)。
 #
 # Prerequisites:
@@ -148,6 +149,8 @@ _SESSION_PRUNE_INTERVAL = 60.0
 _LIVE_METRICS_TIMEOUT = float(os.environ.get("VIME_LB_METRICS_TIMEOUT", "2.0"))
 _LIVE_METRICS_RETRY_INTERVAL = float(os.environ.get("VIME_LB_METRICS_RETRY_INTERVAL", "5.0"))
 _LIVE_METRICS_WARNING_INTERVAL = 60.0
+_CAPACITY_RETRY_INTERVAL = float(os.environ.get("VIME_LB_CAPACITY_RETRY_INTERVAL", "30.0"))
+_SESSION_QUOTA_WARNING_INTERVAL = 60.0
 
 
 @dataclass
@@ -189,8 +192,21 @@ class ServerState:
 
 
 class ProxyState:
-    def __init__(self, server_instances, capacity_units: list[float] | None = None):
+    def __init__(
+        self,
+        server_instances,
+        capacity_units: list[float] | None = None,
+        max_active_sessions: int | None = None,
+    ):
+        if max_active_sessions is not None and max_active_sessions <= 0:
+            raise ValueError("max_active_sessions must be greater than 0")
         self.dp_servers: list[ServerState] = [ServerState(h, p) for h, p in server_instances]
+        self.max_active_sessions = max_active_sessions
+        # Capacity-weighted upper bounds for first-time sticky bindings.  They are
+        # enabled only after every backend supplied a real /server_info capacity;
+        # equal fallback values must never masquerade as authoritative capacity for
+        # a heterogeneous colocated+dedicated rollout pool.
+        self.session_quotas: list[int] | None = None
         self.req_id_lock = asyncio.Lock()
 
         # Initialize priority queues for efficient server selection
@@ -208,10 +224,30 @@ class ProxyState:
         self._new_session_lock = asyncio.Lock()
         self._live_metrics_retry_after = 0.0
         self._last_live_metrics_warning = float("-inf")
+        self._last_session_quota_warning = float("-inf")
         if capacity_units is not None:
             self.set_capacity_units(capacity_units)
 
-    def set_capacity_units(self, capacity_units: list[float]) -> None:
+    @staticmethod
+    def _allocate_capacity_quotas(capacity_units: list[float], total_sessions: int) -> list[int]:
+        """Apportion an exact global session limit by KV-capacity weight.
+
+        Hamilton/largest-remainder apportionment preserves the configured global
+        limit while avoiding hard-coded host or gpu_memory_utilization assumptions.
+        """
+        total_capacity = float(sum(capacity_units))
+        exact = [total_sessions * float(capacity) / total_capacity for capacity in capacity_units]
+        quotas = [math.floor(value) for value in exact]
+        remaining = total_sessions - sum(quotas)
+        order = sorted(
+            range(len(capacity_units)),
+            key=lambda i: (-(exact[i] - quotas[i]), i),
+        )
+        for i in order[:remaining]:
+            quotas[i] += 1
+        return quotas
+
+    def set_capacity_units(self, capacity_units: list[float], *, authoritative: bool = True) -> None:
         if len(capacity_units) != len(self.dp_servers):
             raise ValueError(
                 f"capacity count ({len(capacity_units)}) does not match server count ({len(self.dp_servers)})"
@@ -225,6 +261,13 @@ class ProxyState:
             for i, server in enumerate(self.dp_servers)
         ]
         heapq.heapify(self.lb_heap)
+        if authoritative and self.max_active_sessions is not None:
+            self.session_quotas = self._allocate_capacity_quotas(
+                [server.kv_capacity_units for server in self.dp_servers],
+                self.max_active_sessions,
+            )
+        else:
+            self.session_quotas = None
 
     async def discover_kv_capacities(self) -> bool:
         """Read initialized KV capacity from vLLM's existing ``/server_info``.
@@ -244,9 +287,10 @@ class ProxyState:
         results = await asyncio.gather(*(_read(server) for server in self.dp_servers), return_exceptions=True)
         failures = [result for result in results if isinstance(result, BaseException)]
         if failures:
-            self.set_capacity_units([1.0] * len(self.dp_servers))
+            self.set_capacity_units([1.0] * len(self.dp_servers), authoritative=False)
             logger.warning(
-                "KV capacity discovery failed for %d/%d backends; falling back to equal weights: %s",
+                "KV capacity discovery failed for %d/%d backends; falling back to equal weights "
+                "with session quotas disabled: %s",
                 len(failures),
                 len(self.dp_servers),
                 failures,
@@ -255,7 +299,12 @@ class ProxyState:
 
         capacities = [float(result) for result in results]
         self.set_capacity_units(capacities)
-        logger.info("Discovered backend KV capacity units: %s", capacities)
+        logger.info(
+            "Discovered backend KV capacity units: %s; max_active_sessions=%s session_quotas=%s",
+            capacities,
+            self.max_active_sessions,
+            self.session_quotas,
+        )
         return True
 
     async def read_live_server_loads(self) -> list[LiveServerLoad] | None:
@@ -365,43 +414,72 @@ class ProxyState:
         token_count: float,
         live_loads: list[LiveServerLoad] | None,
     ) -> int:
+        candidates = list(range(len(self.dp_servers)))
+        if self.session_quotas is not None:
+            under_quota = [
+                i
+                for i, server in enumerate(self.dp_servers)
+                if server.active_sessions < self.session_quotas[i]
+            ]
+            if under_quota:
+                candidates = under_quota
+            else:
+                # Global admission should normally prevent this.  Never reject or
+                # deadlock a request if terminal release is delayed: fail open to the
+                # pressure score, but leave an actionable diagnostic.
+                now = time.monotonic()
+                if now - self._last_session_quota_warning >= _SESSION_QUOTA_WARNING_INTERVAL:
+                    self._last_session_quota_warning = now
+                    logger.warning(
+                        "All capacity-weighted session quotas are full; routing new session "
+                        "by pressure (active_sessions=%s quotas=%s configured_max=%s)",
+                        [server.active_sessions for server in self.dp_servers],
+                        self.session_quotas,
+                        self.max_active_sessions,
+                    )
+
         if live_loads is not None:
             if len(live_loads) != len(self.dp_servers):
                 raise ValueError(
                     f"live load count ({len(live_loads)}) does not match server count ({len(self.dp_servers)})"
                 )
 
-            # The vLLM gauge accounts for cache blocks that really exist, including
-            # shared prefixes and blocks retained after a request becomes idle. Add
-            # active_tokens as a short-lived reservation because a just-selected
-            # request may not have reached the engine's next /metrics scrape yet.
-            return min(
-                range(len(self.dp_servers)),
-                key=lambda i: (
-                    live_loads[i].kv_cache_usage
-                    + (self.dp_servers[i].active_tokens + token_count)
-                    / self.dp_servers[i].kv_capacity_units,
+            # Avoid adding live and sticky pressure: both can describe the same KV
+            # blocks.  Their maximum is the dominant resource pressure. active_tokens
+            # remains a short-lived live-metrics-lag reservation, while the sticky
+            # estimate prevents an idle long-running session from disappearing from
+            # the primary score between turns.
+            def _live_key(i: int):
+                server = self.dp_servers[i]
+                capacity = server.kv_capacity_units
+                physical_pressure = live_loads[i].kv_cache_usage + server.active_tokens / capacity
+                sticky_pressure = server.estimated_session_kv_tokens / capacity
+                projected_pressure = max(physical_pressure, sticky_pressure) + token_count / capacity
+                return (
+                    projected_pressure,
                     live_loads[i].waiting_requests,
-                    live_loads[i].running_requests + self.dp_servers[i].active_requests,
-                    (
-                        self.dp_servers[i].estimated_session_kv_tokens + token_count
-                    )
-                    / self.dp_servers[i].kv_capacity_units,
-                    self.dp_servers[i].active_sessions,
+                    live_loads[i].running_requests + server.active_requests,
+                    server.active_sessions,
                     i,
-                ),
+                )
+
+            return min(
+                candidates,
+                key=_live_key,
             )
 
-        # Metrics unavailable: retain the proven capacity-aware routing behavior.
+        # Metrics unavailable: use the same dominant-pressure rule with the
+        # capacity-aware proxy counters. Capacity quota protection remains active
+        # only when /server_info discovery was authoritative.
         return min(
-            range(len(self.dp_servers)),
+            candidates,
             key=lambda i: (
-                (
-                    self.dp_servers[i].estimated_session_kv_tokens + token_count
+                max(
+                    self.dp_servers[i].estimated_session_kv_tokens,
+                    self.dp_servers[i].active_tokens,
                 )
-                / self.dp_servers[i].kv_capacity_units,
-                (self.dp_servers[i].active_tokens + token_count)
-                / self.dp_servers[i].kv_capacity_units,
+                / self.dp_servers[i].kv_capacity_units
+                + token_count / self.dp_servers[i].kv_capacity_units,
                 self.dp_servers[i].active_sessions,
                 i,
             ),
@@ -422,6 +500,10 @@ class ProxyState:
         [2026-09-01] least_load 首次分配读取各 vLLM /metrics 的真实 KV 使用率，
           同时保留 active_tokens 作为尚未反映到指标中的请求预留量。指标失败时回退到
           原有的容量归一化 session 估算；已经绑定的 session 不读取指标也不迁移。
+
+        [2026-09-02] 将长期 session 负债提升为主压力，并按 /server_info 的实际 KV
+          容量分摊全局 active-session 上限。防止当前 KV 刚释放但仍绑定大量长 session
+          的引擎继续吸入新会话；配额全满时只告警并按压力 fail-open，不拒绝请求。
         """
         now = time.monotonic()
         self._maybe_prune_sessions(now)
@@ -456,12 +538,14 @@ class ProxyState:
             server.active_requests += 1
             self._update_server_priority(idx)
             logger.debug(
-                "New session %s -> server %d (policy=%s, live_kv=%s, sessions=%s, estimated_kv_pressure=%s)",
+                "New session %s -> server %d (policy=%s, live_kv=%s, sessions=%s, quotas=%s, "
+                "estimated_kv_pressure=%s)",
                 session_id,
                 idx,
                 _SESSION_POLICY,
                 None if live_loads is None else [round(load.kv_cache_usage, 4) for load in live_loads],
                 [sv.active_sessions for sv in self.dp_servers],
+                self.session_quotas,
                 [round(sv.estimated_session_kv_tokens / sv.kv_capacity_units, 4) for sv in self.dp_servers],
             )
         return idx
@@ -517,17 +601,20 @@ class ProxyState:
     def snapshot(self) -> dict[str, Any]:
         return {
             "sessions": len(self.session_map),
+            "max_active_sessions": self.max_active_sessions,
+            "session_quotas": self.session_quotas,
             "servers": [
                 {
                     "host": server.host,
                     "port": server.port,
                     "kv_capacity_units": server.kv_capacity_units,
+                    "session_quota": None if self.session_quotas is None else self.session_quotas[i],
                     "active_sessions": server.active_sessions,
                     "estimated_session_kv_tokens": server.estimated_session_kv_tokens,
                     "active_requests": server.active_requests,
                     "active_tokens": server.active_tokens,
                 }
-                for server in self.dp_servers
+                for i, server in enumerate(self.dp_servers)
             ],
         }
 
@@ -624,6 +711,12 @@ def parse_args():
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--dp-hosts", type=str, nargs="+", default=["localhost"])
     parser.add_argument("--dp-ports", type=int, nargs="+", default=[8001])
+    parser.add_argument(
+        "--max-active-sessions",
+        type=int,
+        default=None,
+        help="Global active-session limit used for capacity-weighted sticky quotas",
+    )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries for HTTP requests")
     parser.add_argument(
         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
@@ -631,6 +724,8 @@ def parse_args():
     args = parser.parse_args()
     if len(args.dp_hosts) != len(args.dp_ports):
         raise ValueError("Number of dp hosts must match number of dp ports")
+    if args.max_active_sessions is not None and args.max_active_sessions <= 0:
+        raise ValueError("max-active-sessions must be greater than 0")
     args.server_instances = list(zip(args.dp_hosts, args.dp_ports))
     return args
 
@@ -638,13 +733,33 @@ def parse_args():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global proxy_state
-    proxy_state = ProxyState(global_args.server_instances)
+    proxy_state = ProxyState(
+        global_args.server_instances,
+        max_active_sessions=global_args.max_active_sessions,
+    )
+    capacity_retry_task = None
     if _SESSION_POLICY != "hash":
-        await proxy_state.discover_kv_capacities()
+        capacity_ready = await proxy_state.discover_kv_capacities()
+        if not capacity_ready:
+            async def _retry_capacity_discovery():
+                while True:
+                    await asyncio.sleep(_CAPACITY_RETRY_INTERVAL)
+                    if await proxy_state.discover_kv_capacities():
+                        return
+
+            # Keep requests fail-open on equal weights while capacity discovery
+            # retries independently.  A later success only steers future bindings;
+            # existing sticky sessions are never migrated.
+            capacity_retry_task = asyncio.create_task(_retry_capacity_discovery())
     print(f"Initialized {len(proxy_state.dp_servers)} dp server clients.")
-    yield
-    for p in proxy_state.dp_servers:
-        await p.client.aclose()
+    try:
+        yield
+    finally:
+        if capacity_retry_task is not None:
+            capacity_retry_task.cancel()
+            await asyncio.gather(capacity_retry_task, return_exceptions=True)
+        for p in proxy_state.dp_servers:
+            await p.client.aclose()
 
 
 async def listen_for_disconnect(request: Request) -> None:
