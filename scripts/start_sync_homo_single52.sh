@@ -86,7 +86,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Keep the JSON out of a ${var:-...} expansion: a caller-provided value must
 # not inherit the closing brace from the default literal.
 if [ "${FEAT_MTP:-1}" = "1" ] && [ -z "${VLLM_SPEC_CONFIG:-}" ]; then
-   VLLM_SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":3}'
+   VLLM_SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":3,"enforce_eager":true}'
 fi
 
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
