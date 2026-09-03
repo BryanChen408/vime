@@ -9,8 +9,11 @@ plus abort->dummy and multi-group GRPO reward parity with the slime oracle behav
 """
 from __future__ import annotations
 
+import asyncio
 import os
 from types import SimpleNamespace
+
+import httpx
 
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
@@ -202,3 +205,39 @@ def test_group_mode_admission_pause_resume():
     assert worker._admission_paused is True
     worker.resume_admission()
     assert worker._admission_paused is False
+
+
+def test_task_status_poll_has_bounded_timeout_and_retries():
+    poll_timeouts = []
+
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json={"task_id": "task-1"})
+        poll_timeouts.append(request.extensions["timeout"]["read"])
+        if len(poll_timeouts) == 1:
+            raise httpx.ReadTimeout("stalled task-status response", request=request)
+        return httpx.Response(200, json={
+            "task_id": "task-1",
+            "status": "completed",
+            "total_sessions": 0,
+            "completed_sessions": 0,
+            "results": [],
+            "result_paths": [],
+        })
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await R._submit_and_wait_for_task(
+                client,
+                "http://polar:8080",
+                {"task_id": "task-1"},
+                poll_interval=0,
+            )
+
+    result = asyncio.run(run())
+
+    assert result.status == "completed"
+    assert poll_timeouts == [
+        R._TASK_STATUS_POLL_TIMEOUT_SECONDS,
+        R._TASK_STATUS_POLL_TIMEOUT_SECONDS,
+    ]

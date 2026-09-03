@@ -43,6 +43,7 @@ from vime_bridge.version_span import push_policy_version_to_gateway
 logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL = 2.0  # seconds between task-status polls (eval / no-callback path)
+_TASK_STATUS_POLL_TIMEOUT_SECONDS = 60.0
 _CALLBACK_FALLBACK_POLL_SECONDS = 60.0  # defensive backstop for dropped callbacks
 _SESSION_POOL_RUN_RELEASE_POLL_SECONDS = 2.0
 _SESSION_POOL_RUN_RELEASE_POLL_TIMEOUT_SECONDS = 1.0
@@ -1582,14 +1583,22 @@ async def _submit_and_wait_for_task(
     while True:
         await asyncio.sleep(poll_interval)
         try:
-            status_resp = await client.get(f"{base_url}/rollout/task/{task_id}")
+            status_resp = await client.get(
+                f"{base_url}/rollout/task/{task_id}",
+                timeout=_TASK_STATUS_POLL_TIMEOUT_SECONDS,
+            )
             status_resp.raise_for_status()
         except (
             httpx.HTTPStatusError,
             httpx.TimeoutException,
             httpx.TransportError,
         ) as exc:
-            logger.warning("Polling Polar task %s failed; continuing: %s", task_id, exc)
+            logger.warning(
+                "Polling Polar task %s failed; continuing: %s: %r",
+                task_id,
+                type(exc).__name__,
+                exc,
+            )
             continue
         status = TaskStatus.model_validate(status_resp.json())
         if status.status in ("completed", "failed", "cancelled"):
@@ -2063,7 +2072,10 @@ class AsyncPolarRolloutWorker:
         callback_server, callback_task = await self._start_callback_listener()
         timeout = None if self.config.request_timeout is None else httpx.Timeout(self.config.request_timeout)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with (
+                httpx.AsyncClient(timeout=timeout) as result_client,
+                httpx.AsyncClient(timeout=timeout) as release_client,
+            ):
                 while self._running:
                     done = [t for t in active if t.done()]
                     for t in done:
@@ -2212,7 +2224,7 @@ class AsyncPolarRolloutWorker:
                                 )
 
                     await self._poll_session_pool_run_release(
-                        client,
+                        release_client,
                         run_pending,
                         next_status_poll_at,
                     )
@@ -2264,7 +2276,7 @@ class AsyncPolarRolloutWorker:
                         if unit is None:
                             continue
                         task = asyncio.create_task(
-                            self._submit_session_unit(client, unit),
+                            self._submit_session_unit(result_client, unit),
                             name=f"polar-session-unit-{unit.group_id}-{unit.sample_pos}",
                         )
                         task.add_done_callback(lambda _: wakeup.set())
