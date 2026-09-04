@@ -6,10 +6,16 @@ import pytest
 
 
 class _FakeResponse:
-    def __init__(self, *, json_data: dict | None = None, status_code: int = 200):
+    def __init__(
+        self,
+        *,
+        json_data: dict | None = None,
+        text_data: str | None = None,
+        status_code: int = 200,
+    ):
         self._json_data = json_data or {}
         self.status_code = status_code
-        self.text = str(self._json_data)
+        self.text = text_data if text_data is not None else str(self._json_data)
 
     async def aclose(self):
         return None
@@ -59,6 +65,33 @@ def _load_proxy_module():
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.unit
+def test_collect_backend_metrics_labels_and_merges_pd_engines():
+    mod = _load_proxy_module()
+    metric = """# HELP vllm:request_queue_time_seconds Queue time.
+# TYPE vllm:request_queue_time_seconds histogram
+vllm:request_queue_time_seconds_bucket{model_name="demo",engine="0",le="1"} 2
+vllm:request_queue_time_seconds_count{model_name="demo",engine="0"} 2
+"""
+    prefill = _FakeAsyncClient(get_responses=[_FakeResponse(text_data=metric)])
+    decode = _FakeAsyncClient(get_responses=[_FakeResponse(text_data=metric)])
+    state = mod.ProxyState(
+        [{"client": prefill, "url": "http://127.0.0.1:15000"}],
+        [{"client": decode, "url": "http://127.0.0.1:15111"}],
+    )
+
+    import asyncio
+
+    payload = asyncio.run(mod._collect_backend_metrics(state))
+
+    assert payload.count("# HELP vllm:request_queue_time_seconds") == 1
+    assert 'polar_pd_backend_up{pd_role="prefill",pd_backend="prefill-0@127.0.0.1:15000"} 1' in payload
+    assert 'polar_pd_backend_up{pd_role="decode",pd_backend="decode-0@127.0.0.1:15111"} 1' in payload
+    assert 'pd_role="prefill"' in payload
+    assert 'pd_role="decode"' in payload
+    assert 'pd_backend="prefill-0@127.0.0.1:15000"' in payload
 
 
 @pytest.mark.unit

@@ -23,10 +23,11 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -42,6 +43,95 @@ except ImportError:
 # 会话亲和 map(LRU)容量上限:decode 落点记这里,超限淘汰最久未用的老 session。
 # 远大于并发 session 数即可(一场 run 累计几千 session,被淘汰的都是早已结束的)。
 DECODE_AFFINITY_MAP_MAX = int(os.environ.get("PD_MOONCAKE_DECODE_AFFINITY_MAP_MAX", "8192"))
+METRICS_SCRAPE_TIMEOUT_SECONDS = float(
+    os.environ.get("PD_MOONCAKE_METRICS_SCRAPE_TIMEOUT_SECONDS", "3")
+)
+
+
+def _prometheus_label_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _inject_prometheus_labels(line: str, labels: dict[str, str]) -> str:
+    """Attach backend identity to one Prometheus sample without parsing its value."""
+    if not line or line.startswith("#"):
+        return line
+    sample, separator, value = line.partition(" ")
+    if not separator:
+        return line
+    rendered = ",".join(
+        f'{key}="{_prometheus_label_value(label_value)}"'
+        for key, label_value in labels.items()
+    )
+    if "{" in sample and sample.endswith("}"):
+        metric, existing = sample.split("{", 1)
+        existing = existing[:-1]
+        sample = f"{metric}{{{existing},{rendered}}}"
+    else:
+        sample = f"{sample}{{{rendered}}}"
+    return f"{sample}{separator}{value}"
+
+
+async def _fetch_backend_metrics(
+    client_info: dict[str, Any],
+    *,
+    role: str,
+    index: int,
+) -> tuple[list[str], str | None]:
+    url = str(client_info["url"])
+    authority = urlparse(url).netloc or url
+    labels = {
+        "pd_role": role,
+        "pd_backend": f"{role}-{index}@{authority}",
+    }
+    try:
+        response = await asyncio.wait_for(
+            client_info["client"].get("/metrics"),
+            timeout=METRICS_SCRAPE_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return [
+            _inject_prometheus_labels(line, labels)
+            for line in response.text.splitlines()
+        ], None
+    except Exception as exc:
+        logger.warning("Failed to scrape %s backend metrics from %s: %s", role, url, exc)
+        return [], str(exc)
+
+
+async def _collect_backend_metrics(state: ProxyState) -> str:
+    backends = [
+        (client_info, "prefill", index)
+        for index, client_info in enumerate(state.prefill_clients)
+    ] + [
+        (client_info, "decode", index)
+        for index, client_info in enumerate(state.decode_clients)
+    ]
+    results = await asyncio.gather(*(
+        _fetch_backend_metrics(client_info, role=role, index=index)
+        for client_info, role, index in backends
+    ))
+
+    output = [
+        "# HELP polar_pd_backend_up Whether the PD proxy could scrape a backend metrics endpoint.",
+        "# TYPE polar_pd_backend_up gauge",
+    ]
+    metadata_seen: set[str] = set()
+    for (client_info, role, index), (lines, error) in zip(backends, results, strict=True):
+        authority = urlparse(str(client_info["url"])).netloc or str(client_info["url"])
+        identity = _prometheus_label_value(f"{role}-{index}@{authority}")
+        output.append(
+            f'polar_pd_backend_up{{pd_role="{role}",pd_backend="{identity}"}} '
+            f'{0 if error else 1}'
+        )
+        for line in lines:
+            if line.startswith(("# HELP ", "# TYPE ", "# UNIT ")):
+                if line in metadata_seen:
+                    continue
+                metadata_seen.add(line)
+            if line:
+                output.append(line)
+    return "\n".join(output) + "\n"
 
 
 @dataclass
@@ -756,6 +846,14 @@ async def ready():
         "last_preflight_error": status.last_error,
         "last_success_at": status.last_success_at,
     }
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics() -> PlainTextResponse:
+    """Fan in native Prometheus metrics from every prefill and decode engine."""
+    assert proxy_state is not None
+    payload = await _collect_backend_metrics(proxy_state)
+    return PlainTextResponse(payload, media_type="text/plain; version=0.0.4")
 
 
 if __name__ == "__main__":
