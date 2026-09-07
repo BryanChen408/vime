@@ -2072,10 +2072,7 @@ class AsyncPolarRolloutWorker:
         callback_server, callback_task = await self._start_callback_listener()
         timeout = None if self.config.request_timeout is None else httpx.Timeout(self.config.request_timeout)
         try:
-            async with (
-                httpx.AsyncClient(timeout=timeout) as result_client,
-                httpx.AsyncClient(timeout=timeout) as release_client,
-            ):
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 while self._running:
                     done = [t for t in active if t.done()]
                     for t in done:
@@ -2166,7 +2163,10 @@ class AsyncPolarRolloutWorker:
         callback_server, callback_task = await self._start_callback_listener()
         timeout = None if self.config.request_timeout is None else httpx.Timeout(self.config.request_timeout)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with (
+                httpx.AsyncClient(timeout=timeout) as result_client,
+                httpx.AsyncClient(timeout=timeout) as release_client,
+            ):
                 while self._running:
                     await self._apply_pending_session_pool_policy_cutoff(
                         active,

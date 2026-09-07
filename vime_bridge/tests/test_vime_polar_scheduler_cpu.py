@@ -241,3 +241,35 @@ def test_task_status_poll_has_bounded_timeout_and_retries():
         R._TASK_STATUS_POLL_TIMEOUT_SECONDS,
         R._TASK_STATUS_POLL_TIMEOUT_SECONDS,
     ]
+
+
+def test_scheduler_loops_open_clients_in_their_own_scope(monkeypatch):
+    opened = []
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            opened.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+    async def run_loop(mode):
+        worker = AsyncPolarRolloutWorker(_polar_args(scheduler_mode=mode),
+                                         _DummyDataSource())
+        worker._running = False
+
+        async def start_callback_listener():
+            return SimpleNamespace(should_exit=False), asyncio.create_task(asyncio.sleep(0))
+
+        monkeypatch.setattr(worker, "_start_callback_listener", start_callback_listener)
+        await getattr(worker, f"_async_{mode}_loop")()
+
+    monkeypatch.setattr(R.httpx, "AsyncClient", Client)
+    asyncio.run(run_loop("group"))
+    assert len(opened) == 1
+    opened.clear()
+    asyncio.run(run_loop("session_pool"))
+    assert len(opened) == 2
