@@ -16,6 +16,7 @@
 #   按用户要求额外对齐:数据集、ROLLOUT_NUM_GPUS_PER_ENGINE=4、RAY 端口 26460/28290、POLAR_ROLLOUT_URL:8180。
 #   本变体自有值保持:模型路径、seq 长度(131072)、wandb 开关块、RAY_TEMP_DIR 命名。
 set -ex
+set -o pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 VIME_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"
@@ -44,7 +45,7 @@ export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/x86_64-linux/devlib:${LD_LIBRARY_PA
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64:${LD_LIBRARY_PATH}"
 export LD_LIBRARY_PATH="${CANN_TOOLKIT_ROOT}/opp/lib64/plugin/opskernel:${LD_LIBRARY_PATH}"
 export PYTHONPATH="${CANN_TOOLKIT_ROOT}/python/site-packages:${PYTHONPATH}"
-export VLLM_VERSION=0.23.0  # Force version check to treat as 0.23.0
+export VLLM_VERSION=0.21.0  # Force version check to treat as 0.23.0
 
 for required_dir in "${CANN_BIN_DIR}" "${CANN_LIB_DIR}" "${CANN_PYTHON_SITE_PACKAGES}"; do
    if [ ! -e "${required_dir}" ]; then
@@ -145,7 +146,7 @@ export TP_SOCKET_IFNAME="${SOCKET_IFNAME}"
 export HCCL_IF_IP="${CURRENT_IP}"
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8180}
-LOG_FILE=${LOG_FILE:-/home/docker/logs/train_${RUN_ID}.log}
+LOG_FILE=${LOG_FILE:-/mnt/pipeline-data/train_log/train_${RUN_ID}.log}
 USE_WANDB=${USE_WANDB:-0}   # 默认关(本机无 API key,与 pd 脚本对齐);可 USE_WANDB=1 显式开启
 WANDB_MODE=${WANDB_MODE:-online}
 WANDB_PROJECT=${WANDB_PROJECT:-qwen36-rollout-only}
@@ -216,7 +217,9 @@ ROLLOUT_ARGS=(
    --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-4}"
    --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN:-32768}"
    --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN:-262144}"
-   --rollout-temperature 0.7
+   --rollout-temperature "${ROLLOUT_TEMPERATURE:-0.7}"
+   --rollout-top-p "${ROLLOUT_TOP_P:-1.0}"
+   --rollout-top-k "${ROLLOUT_TOP_K:--1}"
    --global-batch-size "${GLOBAL_BATCH_SIZE:-32}"
    --save-debug-rollout-data "${POLAR_OUTPUT_DIR}/vime_debug_rollout_${RUN_ID}_{rollout_id}.pt"
    --save-debug-train-data "${POLAR_OUTPUT_DIR}/vime_debug_train_${RUN_ID}_rollout_{rollout_id}_{rank}.pt"
@@ -257,10 +260,10 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.001
-   --kl-loss-type low_var_kl
-   --entropy-coef 0.00
+   # This entry always uses --debug-rollout-only. KL training is skipped;
+   # enabling it here would unnecessarily require a reference checkpoint.
+   --kl-coef 0
+   --entropy-coef "${ENTROPY_COEF:-0.00}"
    --eps-clip 0.2
    --use-tis
 )
@@ -291,10 +294,15 @@ VLLM_ARGS=(
    --vllm-max-model-len "${VLLM_MAX_MODEL_LEN:-262144}"
    --vllm-enable-sleep-mode
    --vllm-compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}'
-   --vllm-speculative-config '{"method":"mtp","num_speculative_tokens":3}'
    --no-offload-train
    --no-offload-rollout
 )
+
+# Text-only Megatron exports do not contain the original vision tower.
+# Reuse vLLM's native loading mode, opt-in for callers of this shared script.
+if [ "${VLLM_LANGUAGE_MODEL_ONLY:-0}" = "1" ]; then
+   VLLM_ARGS+=(--vllm-language-model-only)
+fi
 
 MISC_ARGS=(
    --attention-dropout 0.0
