@@ -21,5 +21,5 @@ roles:
   polar_reserved:
     - {node: 80.48.5.64, devices: "0-7"}
 rollout:
-  num_gpus_per_engine: 8                 # 14 个 TP2 引擎(8 共卡驻留 8×70G=560G + 6 专用)
+  num_gpus_per_engine: 4                 # 14 个 TP2 引擎(8 共卡驻留 8×70G=560G + 6 专用)
   # vllm_dp_size: 14                   # 仅 FEAT_DP_EXTERNAL_LB=1 时需要 == 引擎数

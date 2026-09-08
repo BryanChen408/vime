@@ -16,7 +16,6 @@ import logging
 import os
 from argparse import Namespace
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import contextmanager
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -32,10 +31,8 @@ from vime.utils.distributed_utils import get_gloo_group
 
 from .hf_weight_iterator_base import HfWeightIteratorBase
 from .update_weight_from_distributed import (
-    _begin_vllm_draft_weight_update_session,
     _begin_vllm_weight_update_session,
     _end_vllm_weight_update_session,
-    _sync_mtp_draft_enabled,
     connect_rollout_engines_from_distributed,
     disconnect_rollout_engines_from_distributed,
     post_process_weights,
@@ -323,10 +320,35 @@ class UpdateWeightFromTensor:
                 )
         dist.barrier(group=get_gloo_group())
 
+        # vLLM #39212: enter weight-update mode on each slot leader.
+        if self._ipc_engine is not None and rank == self._ipc_gather_src:
+            ray.get(self._ipc_engine.start_weight_update.remote(is_checkpoint_format=True))
+        if self.use_distribute and self.distributed_rollout_engines:
+            _begin_vllm_weight_update_session(self.distributed_rollout_engines)
+        dist.barrier(group=get_gloo_group())
+
         megatron_local_weights = self.weights_getter()
-        self._sync_weight_update_phase(megatron_local_weights, draft=False)
-        if _sync_mtp_draft_enabled(self.args):
-            self._sync_weight_update_phase(megatron_local_weights, draft=True)
+
+        for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
+            refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
+            ray.get(refs)
+            # Free GPU tensors so the caching allocator can reuse the blocks,
+            # then release CUDA IPC cache entries whose consumers (vLLM engines)
+            # have already closed their IPC handles.
+            del long_lived_tensors, hf_named_tensors
+            _device_module().ipc_collect()
+
+        dist.barrier(group=get_gloo_group())
+        # After the barrier all engines have returned, so every rank's last-chunk
+        # IPC handles are now released by the consumers.  Clean them up.
+        _device_module().ipc_collect()
+
+        # vLLM #39212: exit weight-update mode.
+        if self.use_distribute and self.distributed_rollout_engines:
+            _end_vllm_weight_update_session(self.distributed_rollout_engines)
+        if self._ipc_engine is not None and rank == self._ipc_gather_src:
+            ray.get(self._ipc_engine.finish_weight_update.remote())
+        dist.barrier(group=get_gloo_group())
 
         # int4/fp4 post_process
         if rank == 0:
@@ -338,56 +360,6 @@ class UpdateWeightFromTensor:
                 )
             ray.get([engine.continue_generation.remote() for engine in all_engines])
         dist.barrier(group=get_gloo_group())
-
-    def _sync_weight_update_phase(self, megatron_local_weights: Mapping[str, torch.Tensor], *, draft: bool) -> None:
-        rank = dist.get_rank()
-        role = "draft" if draft else "target"
-        if rank == 0:
-            logger.info(
-                "[MTP-WEIGHT-SYNC] phase=%s event=start version=%d ipc_engines=%d distributed_engines=%d",
-                role,
-                self.weight_version,
-                len(self.rollout_engines),
-                len(self.distributed_rollout_engines),
-            )
-        ipc_started = False
-        distributed_started = False
-        try:
-            if self._ipc_engine is not None and rank == self._ipc_gather_src:
-                if draft:
-                    ray.get(self._ipc_engine.start_draft_weight_update.remote())
-                else:
-                    ray.get(self._ipc_engine.start_weight_update.remote(is_checkpoint_format=True))
-                ipc_started = True
-
-            if self.use_distribute and self.distributed_rollout_engines:
-                begin_session = (
-                    _begin_vllm_draft_weight_update_session if draft else _begin_vllm_weight_update_session
-                )
-                begin_session(self.distributed_rollout_engines)
-                distributed_started = True
-            dist.barrier(group=get_gloo_group())
-
-            for hf_named_tensors in self._hf_weight_iterator.get_hf_weight_chunks(megatron_local_weights):
-                refs, long_lived_tensors = self._send_hf_params(hf_named_tensors)
-                ray.get(refs)
-                del long_lived_tensors, hf_named_tensors
-                _device_module().ipc_collect()
-
-            dist.barrier(group=get_gloo_group())
-            _device_module().ipc_collect()
-            if rank == 0:
-                logger.info(
-                    "[MTP-WEIGHT-SYNC] phase=%s event=complete version=%d",
-                    role,
-                    self.weight_version,
-                )
-        finally:
-            if distributed_started:
-                _end_vllm_weight_update_session(self.distributed_rollout_engines)
-            if ipc_started:
-                ray.get(self._ipc_engine.finish_weight_update.remote())
-            dist.barrier(group=get_gloo_group())
 
     def _send_hf_params(self, hf_named_tensors) -> tuple[list[ObjectRef], Any]:
         all_refs = []
@@ -485,9 +457,8 @@ class _VLLMHijack:
             from vllm_ascend.worker.worker import NPUWorker
         except Exception:
             NPUWorker = None
-        if NPUWorker is not None and not getattr(NPUWorker, "_vime_weight_update_patched", False):
+        if NPUWorker is not None and not getattr(NPUWorker, "_vime_start_patched", False):
             _orig_start = NPUWorker.start_weight_update
-            _orig_finish = NPUWorker.finish_weight_update
 
             def _vime_start_weight_update(self, is_checkpoint_format: bool = True, _orig=_orig_start):
                 model = self.model_runner.model
@@ -499,97 +470,10 @@ class _VLLMHijack:
                         len(patched),
                         ", ".join(sorted(patched)[:10]),
                     )
-                result = _orig(self, is_checkpoint_format)
-                _set_vllm_weight_update_target(self, model, self.model_config, role="target")
-                return result
-
-            def _vime_update_weights(self, update_info: dict):
-                self._check_weight_transfer_engine()
-                if not self._weight_update_active:
-                    raise RuntimeError("start_weight_update must be called before update_weights.")
-
-                typed_update_info = self.weight_transfer_engine.parse_update_info(update_info)
-                model = _selected_vllm_weight_update_model(self)
-                with torch.device(self.device):
-                    if self._is_checkpoint_format:
-                        _restore_fused_moe_weight_loaders(model)
-                        self.weight_transfer_engine.receive_weights(
-                            typed_update_info,
-                            load_weights=lambda weights: model.load_weights(weights=iter(weights)),
-                        )
-                    else:
-                        def load_weights_direct(weights):
-                            with torch.no_grad():
-                                for name, weight in weights:
-                                    model.get_parameter(name).copy_(weight)
-
-                        self.weight_transfer_engine.receive_weights(
-                            typed_update_info,
-                            load_weights=load_weights_direct,
-                        )
-                _device_module().synchronize()
-
-            def _vime_finish_weight_update(self, _orig=_orig_finish):
-                try:
-                    with _use_selected_vllm_weight_update_target(self):
-                        return _orig(self)
-                finally:
-                    _clear_vllm_weight_update_target(self)
+                return _orig(self, is_checkpoint_format)
 
             NPUWorker.start_weight_update = _vime_start_weight_update
-            NPUWorker.update_weights = _vime_update_weights
-            NPUWorker.finish_weight_update = _vime_finish_weight_update
-            NPUWorker._vime_weight_update_patched = True  # type: ignore[attr-defined]
-
-
-def _set_vllm_weight_update_target(worker: Any, model: Any, model_config: Any, *, role: str) -> None:
-    worker._vime_weight_update_model = model
-    worker._vime_weight_update_model_config = model_config
-    worker._vime_weight_update_role = role
-
-
-def _selected_vllm_weight_update_model(worker: Any) -> Any:
-    selected = getattr(worker, "_vime_weight_update_model", None)
-    return worker.model_runner.model if selected is None else selected
-
-
-def _clear_vllm_weight_update_target(worker: Any) -> None:
-    worker._vime_weight_update_model = None
-    worker._vime_weight_update_model_config = None
-    worker._vime_weight_update_role = None
-
-
-def _get_vllm_draft_weight_update_target(worker: Any) -> tuple[Any, Any]:
-    drafter = getattr(worker.model_runner, "drafter", None)
-    draft_model = getattr(drafter, "model", None)
-    if draft_model is None:
-        raise RuntimeError("MTP draft weight update requested, but no draft model is configured")
-
-    speculative_config = getattr(worker.vllm_config, "speculative_config", None)
-    draft_model_config = getattr(speculative_config, "draft_model_config", None)
-    if draft_model_config is None:
-        raise RuntimeError("MTP draft weight update requested, but no draft model config is configured")
-    return draft_model, draft_model_config
-
-
-@contextmanager
-def _use_selected_vllm_weight_update_target(worker: Any):
-    """Temporarily expose the selected target through vllm-ascend's native fields."""
-    selected_model = getattr(worker, "_vime_weight_update_model", None)
-    selected_config = getattr(worker, "_vime_weight_update_model_config", None)
-    if selected_model is None or selected_config is None:
-        yield
-        return
-
-    original_model = worker.model_runner.model
-    original_config = worker.model_config
-    worker.model_runner.model = selected_model
-    worker.model_config = selected_config
-    try:
-        yield
-    finally:
-        worker.model_runner.model = original_model
-        worker.model_config = original_config
+            NPUWorker._vime_start_patched = True  # type: ignore[attr-defined]
 
 
 def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
@@ -604,7 +488,7 @@ def _copy_vllm_param_attrs(src: torch.Tensor, dst: torch.Tensor) -> None:
         {
             "data", "dtype", "device", "grad", "grad_fn", "layout",
             "name", "names", "ndim", "output_nr", "requires_grad",
-            "retains_grad", "shape", "size", "T", "H", "mT", "mH",
+            "retains_grad", "shape", "size",
         }
     )
     for key in dir(src):
@@ -647,7 +531,7 @@ def _capture_vllm_param_attrs(model) -> dict[str, dict[str, object]]:
         {
             "data", "dtype", "device", "grad", "grad_fn", "layout",
             "name", "names", "ndim", "output_nr", "requires_grad",
-            "retains_grad", "shape", "size", "T", "H", "mT", "mH",
+            "retains_grad", "shape", "size",
         }
     )
     captured: dict[str, dict[str, object]] = {}
@@ -713,149 +597,12 @@ def _restore_vllm_param_attrs(model, captured: dict[str, dict[str, object]] | No
     return patched
 
 
-def _is_transposed_fused_moe_parameter(module: Any, parameter_name: str, parameter: Any) -> bool:
-    """Return whether an Ascend fused-MoE parameter uses runtime layout.
-
-    vLLM checkpoints use ``[experts, intermediate, hidden]`` for ``w13`` and
-    ``[experts, hidden, intermediate]`` for ``w2``.  Ascend's unquantized MoE
-    kernel stores both matrices with the final two dimensions exchanged.  The
-    runtime shape is the only reliable signal after ``process_weights_after_loading``
-    has replaced the Parameter object.
-    """
-    if getattr(parameter, "ndim", 0) != 3:
-        return False
-    quant_method = getattr(module, "quant_method", None)
-    if getattr(type(quant_method), "__name__", "") != "AscendUnquantizedFusedMoEMethod":
-        return False
-    moe_config = getattr(module, "moe_config", None)
-    hidden_size = getattr(moe_config, "hidden_dim", None)
-    if hidden_size is None:
-        return False
-    shape = tuple(parameter.shape)
-    if parameter_name == "w13_weight":
-        return shape[-2] == hidden_size and shape[-1] != hidden_size
-    if parameter_name == "w2_weight":
-        return shape[-1] == hidden_size and shape[-2] != hidden_size
-    return False
-
-
-def _make_transposed_fused_moe_loader(loader: Callable) -> Callable:
-    """Adapt canonical expert matrices to Ascend's transposed runtime layout."""
-    if getattr(loader, "_vime_transposed_moe_loader", False):
-        return loader
-
-    from functools import wraps
-
-    @wraps(loader)
-    def transposed_loader(param, loaded_weight, *args, **kwargs):
-        shard_id = kwargs.get("shard_id")
-        if shard_id is None and len(args) >= 2:
-            # Bound FusedMoE.weight_loader(..., weight_name, shard_id, ...).
-            shard_id = args[1]
-        weight_name = kwargs.get("weight_name")
-        if weight_name is None and args:
-            weight_name = args[0]
-        # Only unquantized expert matrices need this conversion.  Scales and
-        # auxiliary tensors have their own layouts and must pass through.
-        if (
-            shard_id in ("w1", "w2", "w3")
-            and isinstance(loaded_weight, torch.Tensor)
-            and loaded_weight.ndim >= 2
-            and not (isinstance(weight_name, str) and any(x in weight_name for x in ("scale", "zero", "offset")))
-        ):
-            loaded_weight = loaded_weight.transpose(-1, -2).contiguous()
-        return loader(param, loaded_weight, *args, **kwargs)
-
-    transposed_loader._vime_transposed_moe_loader = True  # type: ignore[attr-defined]
-    return transposed_loader
-
-
-def _restore_fused_moe_weight_loaders(model: Any) -> int:
-    """Restore loaders lost when fused-MoE parameters are replaced.
-
-    ``process_weights_after_loading`` can replace ``w13_weight`` and
-    ``w2_weight`` with fresh ``Parameter`` objects. The replacement keeps the
-    data but drops vLLM's custom ``weight_loader`` attribute. Reuse the owning
-    FusedMoE loader so TP/EP shard and expert routing semantics remain intact;
-    a generic default loader could silently write the wrong shard. When the
-    replacement is in Ascend's runtime-transposed layout, install the small
-    adapter that transposes each canonical expert matrix and marks the loader
-    so vLLM flips its sharding dimension as well.
-    """
-    modules = getattr(model, "modules", None)
-    if not callable(modules):
-        return 0
-
-    from vllm.model_executor.utils import set_weight_attrs
-
-    patched = 0
-    for module in modules():
-        loader = getattr(module, "weight_loader", None)
-        if not callable(loader):
-            continue
-        for parameter_name in ("w13_weight", "w2_weight"):
-            parameter = getattr(module, parameter_name, None)
-            if parameter is None:
-                continue
-            is_transposed = _is_transposed_fused_moe_parameter(module, parameter_name, parameter)
-            if not is_transposed and hasattr(parameter, "weight_loader"):
-                continue
-            parameter_loader = _make_transposed_fused_moe_loader(loader) if is_transposed else loader
-            try:
-                if is_transposed and getattr(parameter, "_vime_transposed_moe_loader", False):
-                    continue
-                # ``set_weight_attrs`` intentionally rejects overwrites.  A
-                # previous reload may have reattached the raw owner loader,
-                # so remove only the two layout markers before installing the
-                # runtime-layout-aware loader.
-                if is_transposed:
-                    for attr in ("weight_loader", "is_transposed"):
-                        if hasattr(parameter, attr):
-                            delattr(parameter, attr)
-                attrs = {"weight_loader": parameter_loader}
-                if is_transposed:
-                    attrs["is_transposed"] = True
-                    attrs["_vime_transposed_moe_loader"] = True
-                set_weight_attrs(parameter, attrs)
-            except (AssertionError, AttributeError, TypeError, RuntimeError):
-                # A repeated reload may attach it between the check and set.
-                continue
-            patched += 1
-    return patched
-
-
 class vLLMColocateWorkerExtension:
     """vLLM ``--worker-extension-cls`` entry for colocated IPC weight sync."""
 
     def __new__(cls, **kwargs):
         _VLLMHijack.hijack()
         return super().__new__(cls)
-
-    def start_draft_weight_update(self) -> None:
-        """Start a checkpoint-format update against the speculative draft."""
-        self._check_weight_transfer_engine()
-        if self._weight_update_active:
-            raise RuntimeError(
-                "start_draft_weight_update called while a weight update is already active. "
-                "Call finish_weight_update first."
-            )
-        self._check_nz_disabled()
-
-        model, model_config = _get_vllm_draft_weight_update_target(self)
-        _capture_vllm_param_attrs(model)
-        _restore_vllm_param_attrs(model)
-
-        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
-
-        try:
-            with torch.device(self.device):
-                initialize_layerwise_reload(model)
-            self._is_checkpoint_format = True
-            self._weight_update_active = True
-            _set_vllm_weight_update_target(self, model, model_config, role="draft")
-        except Exception:
-            _clear_vllm_weight_update_target(self)
-            raise
 
     # ── Three-phase weight update protocol ────────────────────────────────────
     # Mirrors SkyRL's NewInferenceWorkerWrap. Callable via /collective_rpc from
@@ -928,10 +675,9 @@ class vLLMColocateWorkerExtension:
         # Load weights into the model.
         from vllm.config import set_current_vllm_config
 
-        model = _selected_vllm_weight_update_model(self)
+        model = self.model_runner.model
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             if self._is_checkpoint_format:
-                _restore_fused_moe_weight_loaders(model)
                 model.load_weights(weights=iter(weights))
             else:
                 for name, weight in weights:

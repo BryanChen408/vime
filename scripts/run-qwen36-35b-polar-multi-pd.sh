@@ -243,7 +243,7 @@ CKPT_ARGS=(
    --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
    --save-hf "${SAVE_HF:-/workspace/Qwen3.6-35B-A3B_vime_polar/rollout_{rollout_id}}"
-   --save-interval 25
+   --save-interval 5
    --no-save-optim
    --megatron-to-hf-mode raw
    # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
@@ -330,7 +330,7 @@ POLAR_ARGS=(
    --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
    --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
    --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
-   --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-14400}"
+   --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-21600}"
    --rollout-scheduler-mode session_pool
    --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
    --rollout-release-on-postrun
@@ -381,7 +381,7 @@ fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam
-   --lr 2e-6
+   --lr 3e-6
    --lr-decay-style constant
    --weight-decay 0.1
    --adam-beta1 0.9
