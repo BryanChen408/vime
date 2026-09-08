@@ -78,7 +78,19 @@ def session_result_to_samples(
         for trace in traces
     )
     samples: list[Any] = []
+    skipped_main_chains = 0
+    # 主链不训(t3a 复刻语义):builder 按 system 指纹给每条 trace 打了
+    # chain_role(main=主调度链/子代理独立会话=sub)。主链只做读题/派发/复核,
+    # 广播分挂给它是相关噪声样本,且其行为是流程文档写死的规则,无可学内容。
+    # 仅当显式开启(默认关,t2a 行为逐字不变)时跳过 chain_role=="main" 的 trace。
+    mask_main_chain = os.environ.get("POLAR_T3A_MASK_MAIN_CHAIN") == "1"
     for trace_index, trace in enumerate(traces):
+        if (
+            mask_main_chain
+            and (getattr(trace, "metadata", None) or {}).get("chain_role") == "main"
+        ):
+            skipped_main_chains += 1
+            continue
         sample = _build_sample(
             Sample=Sample,
             result=result,
@@ -92,6 +104,13 @@ def session_result_to_samples(
         )
         if sample is not None:
             samples.append(sample)
+
+    if skipped_main_chains:
+        logger.info(
+            "Session %s: skipped %d main-chain trace(s) per POLAR_T3A_MASK_MAIN_CHAIN",
+            result.session_id,
+            skipped_main_chains,
+        )
 
     if samples:
         return samples
