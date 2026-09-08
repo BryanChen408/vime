@@ -137,6 +137,7 @@ def build_batch(
     group_keys: dict[int, list[tuple[int, int]]],
     group_std: dict[int, float],
     response_len: list[int],
+    excluded_keys: set[tuple[int, int]] | None = None,
 ) -> list[list[float] | None]:
     """Return, per sample, a per-response-token additive advantage list (len =
     response_len[i]) or None (no spans / disabled -> trajectory-level fallback).
@@ -144,7 +145,8 @@ def build_batch(
     Scores/R are aggregated per TRAJECTORY across all its traces (a 2-trace
     session's events all live in the work chain while the opening segment
     lives on trace0); the per-token terms are computed PER TRACE from that
-    trace's own spans and coordinates — traces never share a term.
+    trace's own spans and coordinates — traces never share a term. Excluded
+    trajectories contribute neither an output term nor a baseline member.
     """
     n = len(samples)
     if not enabled():
@@ -152,6 +154,7 @@ def build_batch(
 
     gamma = _gamma()
     w = _w_process()
+    excluded_keys = excluded_keys or set()
 
     spans_by_sample: list[list[tuple[int, int, int, float | None]]] = [
         attempt_spans(s) for s in samples
@@ -161,6 +164,8 @@ def build_batch(
     traj_positions: dict[tuple[int, int], set[int]] = {}
     for i, sample in enumerate(samples):
         key = key_by_sample[i]
+        if key in excluded_keys:
+            continue
         if key not in traj_group:
             traj_group[key] = int(sample.group_index) if sample.group_index is not None else -1
         scores = traj_scores.setdefault(key, {})
@@ -210,6 +215,8 @@ def build_batch(
         if not spans or rlen <= 0:
             continue
         key = key_by_sample[i]
+        if key in excluded_keys:
+            continue
         g = traj_group[key]
         std = max(float(group_std.get(g, 1.0)), _STD_FLOOR)
         term = [0.0] * rlen

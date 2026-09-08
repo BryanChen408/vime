@@ -133,7 +133,12 @@ def _write_attempt_advantage(
             len(s.loss_mask) if getattr(s, "loss_mask", None) is not None else 0 for s in samples
         ]
         terms = attempt_credit.build_batch(
-            samples, key_by_sample, group_keys, group_std, response_len
+            samples,
+            key_by_sample,
+            group_keys,
+            group_std,
+            response_len,
+            excluded_keys={key for key, failed in traj_failed.items() if failed},
         )
         for i, sample in enumerate(samples):
             if terms[i] is None:

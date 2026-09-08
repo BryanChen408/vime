@@ -30,10 +30,10 @@ class _Sample:
         self.loss_mask = [1] * rlen
 
 
-def _batch(monkeypatch, samples, keys, groups, std, rlens=None):
+def _batch(monkeypatch, samples, keys, groups, std, rlens=None, excluded_keys=None):
     monkeypatch.setenv("POLAR_ATTEMPT_CREDIT", "1")
     rlens = rlens or [len(s.loss_mask) for s in samples]
-    return ac.build_batch(samples, keys, groups, std, rlens)
+    return ac.build_batch(samples, keys, groups, std, rlens, excluded_keys)
 
 
 class TestDeltaBest:
@@ -52,6 +52,26 @@ class TestDeltaBest:
 
 
 class TestBuildBatch:
+    def test_excluded_trajectory_neither_gets_credit_nor_enters_baseline(self, monkeypatch):
+        samples = [
+            _Sample(0, 0, [[0, 1, 0, 0.3]], 1),
+            _Sample(0, 1, [[0, 1, 0, 0.6]], 1),
+            _Sample(0, 2, [[0, 1, 0, 0.9]], 1),
+            _Sample(0, 3, [[0, 1, 0, 1.0]], 1),
+        ]
+        keys = [(0, i) for i in range(4)]
+        terms = _batch(
+            monkeypatch,
+            samples,
+            keys,
+            {0: keys},
+            {0: 0.2},
+            excluded_keys={(0, 3)},
+        )
+
+        assert terms[0] == [0.3 * (0.3 - 0.75) / 0.2]
+        assert terms[3] is None
+
     def test_two_trace_trajectory_full_coverage(self, monkeypatch):
         """trace0 (opening segment) and the work chain each get their own term;
         TRLOO fires at the opening position -1 as designed (trace0 在场)."""
