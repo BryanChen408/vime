@@ -559,7 +559,7 @@ def test_release_memory_occupation_flushes_then_posts_sleep(vllm_engine, monkeyp
     def fake_post(url, *, params=None, timeout=30, json=None):
         calls.append(url)
         assert params == {"level": 2}
-        assert timeout == 30
+        assert timeout == 120
         assert json is None
         return _MockResponse(json_data={"ok": True, "sleep_mode": True})
 

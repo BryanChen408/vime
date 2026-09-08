@@ -214,6 +214,7 @@ def _make_dummy_nccl_engine(*, send_seen: list[dict] | None = None, init_seen: l
 def _patch_nccl_on_module(
     monkeypatch, upw, *, send_seen: list[dict] | None = None, init_seen: list[dict] | None = None
 ):
+    monkeypatch.setattr(upw, "is_npu", lambda: False)
     dummy_engine, dummy_args = _make_dummy_nccl_engine(send_seen=send_seen, init_seen=init_seen)
     monkeypatch.setattr(upw, "NCCLWeightTransferEngine", dummy_engine)
     monkeypatch.setattr(upw, "NCCLTrainerSendWeightsArgs", dummy_args)
