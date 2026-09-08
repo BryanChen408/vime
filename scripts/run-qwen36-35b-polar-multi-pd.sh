@@ -243,7 +243,7 @@ CKPT_ARGS=(
    --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
    --save-hf "${SAVE_HF:-/workspace/Qwen3.6-35B-A3B_vime_polar/rollout_{rollout_id}}"
-   --save-interval 5
+   --save-interval 25
    --no-save-optim
    --megatron-to-hf-mode raw
    # FEAT_OPT2=1 → --optimization-level 2(对齐 slime 默认,激活 MindSpeed level-2 fusion,含 moe-permute
