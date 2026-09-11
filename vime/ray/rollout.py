@@ -32,6 +32,7 @@ from vime.utils.misc import Box, group_by, load_function
 from vime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
+from .engine_roles import EngineRoleError, resolve_engine_roles
 from .rollout_validation import validate_server_group_gpu_indices
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 from vime.utils.common import is_npu
@@ -40,6 +41,19 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _colocation_by_gpu_slot(args) -> dict[int, bool]:
+    """Return the engine colocation verdict keyed by rollout GPU slot."""
+    cached = getattr(args, "_colocation_by_gpu_slot_cache", None)
+    if cached is None:
+        cached = {role.gpu_slot: role.colocated for role in resolve_engine_roles(args)}
+        try:
+            args._colocation_by_gpu_slot_cache = cached
+        except Exception:  # pragma: no cover - frozen namespaces stay uncached
+            pass
+    return cached
+
 
 # [ITEM 1 / DP #4 B+] 存活的 Python LB proxy 子进程句柄(随 run 生命周期,避免被 GC)。
 _LB_PROXY_PROCS: list = []
@@ -125,6 +139,10 @@ class ServerGroup:
             gpu_index = self.gpu_offset + i * num_gpu_per_engine
             base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
+            # rank_offset and gpu_offset advance independently across PD groups,
+            # so engine index cannot be used as a topology key.
+            engine_colocated = _colocation_by_gpu_slot(self.args).get(gpu_index)
+
             scheduling_strategy = PlacementGroupSchedulingStrategy(
                 placement_group=pg,
                 placement_group_capture_child_tasks=True,
@@ -146,6 +164,7 @@ class ServerGroup:
                 base_gpu_id=base_gpu_id,
                 vllm_overrides=self.vllm_overrides,
                 num_gpus_per_engine=self.num_gpus_per_engine,
+                colocated=engine_colocated,
             )
 
             rollout_engines.append((global_rank, rollout_engine))
@@ -196,20 +215,25 @@ class ServerGroup:
         if not self.needs_offload:
             return []
         spec = getattr(self.args, "resource_layout_spec", None)
-        if spec is None or not getattr(spec, "rollout_has_share", False):
-            return list(range(len(self.all_engines)))
-        # 共卡段约定写在 rollout 列表最前且连续(资源布局校验保证),故共享槽位
-        # 就是前 rollout_shared_num_gpus 个。判定必须跟**实际共享卡数**比,而不是
-        # megatron_num_gpus —— 两者在 HCCL 排他约束下会不同(权重同步域不允许
-        # trainer rank 0 与引擎 rank 同卡,共卡段须剔除 actor 首卡,见
-        # resource_layout.hybrid56cola64infer.yaml 注释)。
-        shared_num_gpus = spec.rollout_shared_num_gpus
+        colocation = _colocation_by_gpu_slot(self.args)
         per_engine = min(self.num_gpus_per_engine, self.args.num_gpus_per_node)
-        return [
-            i
-            for i in range(len(self.all_engines))
-            if self.gpu_offset + i * per_engine < shared_num_gpus
-        ]
+        verdicts = [colocation.get(self.gpu_offset + i * per_engine) for i in range(len(self.all_engines))]
+        if any(verdict is None for verdict in verdicts):
+            if spec is not None and getattr(spec, "rollout_has_share", False):
+                missing = [
+                    self.gpu_offset + i * per_engine
+                    for i, verdict in enumerate(verdicts)
+                    if verdict is None
+                ]
+                raise EngineRoleError(
+                    f"engine roles do not cover hybrid rollout GPU slots {missing}; "
+                    "cannot safely choose the offload subset"
+                )
+            # Heterogeneous PD groups can use a different per-engine width from
+            # args.rollout_num_gpus_per_engine. They are disaggregated and retain
+            # the existing group-level offload behavior.
+            return list(range(len(self.all_engines)))
+        return [i for i, colocated in enumerate(verdicts) if colocated]
 
     def offload(self):
         """Fire release_memory_occupation on offloading engines (non-blocking).

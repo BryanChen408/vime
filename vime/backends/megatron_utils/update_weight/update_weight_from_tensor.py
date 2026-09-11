@@ -159,6 +159,66 @@ def count_colocated_engines(
     return colocate_engine_nums
 
 
+def _resolve_colocated_engine_count(
+    args, engine_gpu_offsets: Sequence[int], engine_gpu_counts: Sequence[int]
+) -> int:
+    """Resolve the IPC-engine prefix from physical engine roles."""
+    from vime.ray.engine_roles import (
+        EngineRole,
+        EngineRoleError,
+        colocated_prefix_count,
+        resolve_engine_roles,
+    )
+
+    total_actor_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    spec = getattr(args, "resource_layout_spec", None)
+    hybrid = spec is not None and getattr(spec, "rollout_has_share", False)
+    try:
+        colocation = {role.gpu_slot: role.colocated for role in resolve_engine_roles(args)}
+    except EngineRoleError:
+        if hybrid:
+            raise
+        logger.warning("engine role resolution failed; falling back to the legacy slot-range heuristic")
+        return count_colocated_engines(engine_gpu_offsets, engine_gpu_counts, total_actor_gpus)
+
+    verdicts = [colocation.get(offset) for offset in engine_gpu_offsets]
+    if any(verdict is None for verdict in verdicts):
+        missing = [offset for offset, verdict in zip(engine_gpu_offsets, verdicts, strict=True) if verdict is None]
+        if hybrid:
+            raise EngineRoleError(
+                f"engine roles do not cover hybrid rollout GPU slots {missing}; "
+                "cannot safely split IPC and distributed weight sync"
+            )
+        logger.info(
+            "engine roles do not cover GPU slots %s (heterogeneous per-group engine sizes); "
+            "falling back to the legacy slot-range heuristic",
+            missing,
+        )
+        return count_colocated_engines(engine_gpu_offsets, engine_gpu_counts, total_actor_gpus)
+
+    roles = tuple(
+        EngineRole(index=i, gpu_slot=offset, placement=(), colocated=bool(verdict))
+        for i, (offset, verdict) in enumerate(zip(engine_gpu_offsets, verdicts, strict=True))
+    )
+    return colocated_prefix_count(roles)
+
+
+def _actor_ranks_by_gpu_slot(args) -> dict[int, tuple[int, ...]]:
+    """Return actor ranks for each colocated rollout engine GPU slot."""
+    from vime.ray.engine_roles import EngineRoleError, resolve_engine_roles
+
+    spec = getattr(args, "resource_layout_spec", None)
+    hybrid = spec is not None and getattr(spec, "rollout_has_share", False)
+    try:
+        roles = resolve_engine_roles(args)
+    except EngineRoleError:
+        if hybrid:
+            raise
+        logger.warning("engine role resolution failed; falling back to slot-as-rank IPC groups")
+        return {}
+    return {role.gpu_slot: role.actor_ranks for role in roles if role.colocated}
+
+
 class UpdateWeightFromTensor:
     """
     Update rollout engines from tensor dict:
@@ -232,9 +292,9 @@ class UpdateWeightFromTensor:
                 engine_gpu_offsets.append(offset)
                 offset += c
 
-        # Compute colocated engine count: engines whose GPUs fall within actor GPU range.
-        total_actor_gpus = self.args.actor_num_nodes * self.args.actor_num_gpus_per_node
-        colocate_engine_nums = count_colocated_engines(engine_gpu_offsets, engine_gpu_counts, total_actor_gpus)
+        colocate_engine_nums = _resolve_colocated_engine_count(
+            self.args, engine_gpu_offsets, engine_gpu_counts
+        )
 
         self.use_distribute = len(rollout_engines) > colocate_engine_nums
 
@@ -263,21 +323,27 @@ class UpdateWeightFromTensor:
         colocate_gpu_offsets = engine_gpu_offsets[:colocate_engine_nums]
         colocate_gpu_counts = engine_gpu_counts[:colocate_engine_nums]
 
+        ranks_by_slot = _actor_ranks_by_gpu_slot(self.args)
+
+        def _actor_ranks_for(i: int) -> list[int]:
+            ranks = ranks_by_slot.get(colocate_gpu_offsets[i])
+            if ranks:
+                return list(ranks)
+            return list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
+
         # Create IPC Gloo gather groups (only on first call; partitioning is
         # fixed across reconnects).
         if self._ipc_gather_group is None:
             for i in range(colocate_engine_nums):
-                group_ranks = list(range(colocate_gpu_offsets[i], colocate_gpu_offsets[i] + colocate_gpu_counts[i]))
+                group_ranks = _actor_ranks_for(i)
                 new_group = dist.new_group(ranks=group_ranks, backend="gloo")
                 if dist.get_rank() in group_ranks:
                     self._ipc_gather_group = new_group
-                    self._ipc_gather_src = colocate_gpu_offsets[i]
+                    self._ipc_gather_src = min(group_ranks)
 
         # Map training ranks to colocated engine actors.
         for i, engine in enumerate(self.rollout_engines):
-            start = colocate_gpu_offsets[i]
-            end = start + colocate_gpu_counts[i]
-            if start <= dist.get_rank() < end:
+            if dist.get_rank() in _actor_ranks_for(i):
                 self._ipc_engine = engine
 
         # vLLM #39212: one-time IPC transfer-engine init on each colocated engine.

@@ -91,9 +91,26 @@ def _fake_server_group(*, needs_offload, has_share, shared_num_gpus, n_engines=1
     g.all_engines = [object() for _ in range(n_engines)]
     g.num_gpus_per_engine = per_engine
     g.gpu_offset = 0
-    spec = types.SimpleNamespace(rollout_has_share=has_share, rollout_shared_num_gpus=shared_num_gpus)
+    rollout_num_gpus = n_engines * per_engine
+    spec = None
+    if has_share:
+        spec = types.SimpleNamespace(
+            actor=[types.SimpleNamespace(node="actor", devices=list(range(16)))],
+            rollout=[
+                types.SimpleNamespace(node="actor", devices=list(range(shared_num_gpus))),
+                types.SimpleNamespace(
+                    node="dedicated",
+                    devices=list(range(shared_num_gpus, rollout_num_gpus)),
+                ),
+            ],
+            rollout_has_share=True,
+            rollout_shared_num_gpus=shared_num_gpus,
+        )
     g.args = types.SimpleNamespace(
         resource_layout_spec=spec,
+        rollout_num_gpus=rollout_num_gpus,
+        rollout_num_gpus_per_engine=per_engine,
+        colocate=not has_share,
         actor_num_nodes=1,
         actor_num_gpus_per_node=16,
         num_gpus_per_node=16,
@@ -357,7 +374,12 @@ def test_ipc_borrowed_tensor_without_clone_is_corrupted():
 
 
 # ─── 6. serve 名固定别名 + 按引擎 util 分叉(20260824 两颗实锤雷) ─────────────
-def _minimal_server_args(host: str, model_path: str = "/models/Qwen-x-bf16", hybrid: bool = True):
+def _minimal_server_args(
+    host: str,
+    model_path: str = "/models/Qwen-x-bf16",
+    hybrid: bool = True,
+    colocated: bool | None = None,
+):
     """build_vllm_cmd_and_env 的最小输入:hybrid share 布局,actor 在 .56。"""
     from vime.backends.vllm_utils.vllm_engine import VllmEngineTopology
 
@@ -375,6 +397,7 @@ def _minimal_server_args(host: str, model_path: str = "/models/Qwen-x-bf16", hyb
     )
     return {
         "args": args,
+        "colocated": colocated if colocated is not None else (host == "80.48.5.56"),
         "topology": VllmEngineTopology(
             nnodes=1, node_rank=0, local_num_gpus=2, tensor_parallel_size=2, pipeline_parallel_size=1
         ),
