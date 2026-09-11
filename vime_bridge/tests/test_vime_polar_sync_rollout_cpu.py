@@ -76,6 +76,15 @@ class FakeDataSource:
         return out
 
 
+class RequeueDataSource(FakeDataSource):
+    def __init__(self, exhaust_after: int | None = None):
+        super().__init__(exhaust_after=exhaust_after)
+        self.requeued: list[list[object]] = []
+
+    def add_samples(self, samples):
+        self.requeued.extend(samples)
+
+
 @pytest.fixture
 def stub_output(monkeypatch):
     """Stub the training-output type and metric helpers (they need slime types)."""
@@ -84,18 +93,32 @@ def stub_output(monkeypatch):
     monkeypatch.setattr(R, "_extract_sample_reward", lambda s, key: 1.0)
 
 
-def _script_groups(monkeypatch, script):
-    """Drive ``_run_sync_train_group`` from a list: True=accept, False=reject, 'raise'=error."""
+def _script_groups(monkeypatch, script, seconds=None):
+    """Drive sync groups from scripted verdicts and optional fake latencies."""
     seq = iter(script)
+    durations = iter(seconds) if seconds is not None else None
 
-    async def fake_group(*, client, args, config, rollout_id, group, group_id):
+    async def fake_group(*, client, args, config, rollout_id, group, group_id, handle=None):
         verdict = next(seq)
+        elapsed = next(durations) if durations is not None else 0.0
         await asyncio.sleep(0)
+        if handle is not None:
+            handle.task_ids.append(f"task-{group_id}")
         if verdict == "raise":
             raise RuntimeError("injected transport failure")
         if verdict:
-            return R._SyncGroupOutcome(group=group, accepted=True, samples=[SimpleNamespace(i=group_id)])
-        return R._SyncGroupOutcome(group=group, accepted=False, rejection_reason="injected reject")
+            return R._SyncGroupOutcome(
+                group=group,
+                accepted=True,
+                samples=[SimpleNamespace(i=group_id)],
+                elapsed=elapsed,
+            )
+        return R._SyncGroupOutcome(
+            group=group,
+            accepted=False,
+            rejection_reason="injected reject",
+            elapsed=elapsed,
+        )
 
     monkeypatch.setattr(R, "_run_sync_train_group", fake_group)
 
@@ -228,12 +251,89 @@ def test_policy_version_always_equals_rollout_id(monkeypatch, stub_output):
         assert metadata["rollout_step"] == rollout_id
 
 
+def test_submit_reports_server_task_id_before_terminal_result():
+    events = []
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def post(self, *args, **kwargs):
+            del args, kwargs
+            return Response({"task_id": "server-task-id"})
+
+        async def get(self, *args, **kwargs):
+            del args, kwargs
+            events.append("poll")
+            return Response(
+                {
+                    "task_id": "server-task-id",
+                    "status": "completed",
+                    "total_sessions": 0,
+                    "completed_sessions": 0,
+                    "results": [],
+                }
+            )
+
+    result = asyncio.run(
+        R._submit_and_wait_for_task(
+            Client(),
+            "http://polar",
+            {"task_id": "planned-task-id"},
+            poll_interval=0,
+            on_task_id=lambda task_id: events.append(("task_id", task_id)),
+        )
+    )
+
+    assert result.task_id == "server-task-id"
+    assert events == [("task_id", "server-task-id"), "poll"]
+
+
 # --------------------------------------------------------------------------
-# 6. the oversubscribe seam refuses to silently leak in-flight sessions
+# 6. oversubscribe cancellation and group requeue
 # --------------------------------------------------------------------------
-def test_oversubscribe_above_one_is_rejected(stub_output):
-    with pytest.raises(NotImplementedError, match="oversubscribe"):
-        asyncio.run(R._run_sync_train_rollout(_args(rollout_sync_oversubscribe_factor=1.5), 0, FakeDataSource()))
+def test_oversubscribe_requires_group_requeue_capability(stub_output):
+    with pytest.raises(R.PolarRolloutSchedulerError, match="add_samples"):
+        asyncio.run(
+            R._run_sync_train_rollout(
+                _args(rollout_sync_oversubscribe_factor=1.5),
+                0,
+                FakeDataSource(),
+            )
+        )
+
+
+def test_read_only_rollout_data_source_is_not_treated_as_requeue_capable():
+    def inherited_read_only_add_samples(self, samples):
+        raise RuntimeError("read only")
+
+    inherited_read_only_add_samples.__module__ = "vime.rollout.data_source"
+    inherited_read_only_add_samples.__qualname__ = "RolloutDataSource.add_samples"
+    source_type = type(
+        "RolloutDataSourceChild",
+        (),
+        {"add_samples": inherited_read_only_add_samples},
+    )
+
+    assert not R._supports_sync_requeue(source_type())
+
+
+def test_oversubscribe_factor_is_capped(stub_output):
+    with pytest.raises(ValueError, match="<= 1.50"):
+        asyncio.run(
+            R._run_sync_train_rollout(
+                _args(rollout_sync_oversubscribe_factor=1.51),
+                0,
+                RequeueDataSource(),
+            )
+        )
 
 
 def test_oversubscribe_below_one_is_rejected(stub_output):
@@ -258,6 +358,266 @@ def test_abort_inflight_refuses_to_drop_live_work():
             task.cancel()
 
     asyncio.run(_run())
+
+
+class _CancelResponse:
+    def __init__(self, payload, error: Exception | None = None):
+        self.payload = payload
+        self.error = error
+
+    def raise_for_status(self):
+        if self.error is not None:
+            raise self.error
+
+    def json(self):
+        return self.payload
+
+
+class _CancelClient:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    async def post(self, url, params=None):
+        self.calls.append((url, params))
+        return self.response
+
+
+def test_abort_inflight_cancels_tasks_and_requeues_nonselected_groups():
+    async def _run():
+        surplus = R._SyncGroupHandle(group=["surplus"], group_id=1)
+        surplus.outcome = R._SyncGroupOutcome(group=surplus.group, accepted=True)
+        pending = R._SyncGroupHandle(
+            group=["pending"],
+            group_id=2,
+            task_ids=["task-pending", "task-pending"],
+        )
+        surplus_task = asyncio.create_task(asyncio.sleep(0))
+        await surplus_task
+        pending_task = asyncio.create_task(asyncio.sleep(60))
+        source = RequeueDataSource()
+        client = _CancelClient(
+            _CancelResponse({"all_cancelled": True, "cancelled_sessions": 2})
+        )
+        try:
+            stats = await R._abort_inflight(
+                {pending_task},
+                _args(),
+                data_source=source,
+                handles={surplus_task: surplus, pending_task: pending},
+                client=client,
+                rollout_server_url="http://polar",
+            )
+        finally:
+            pending_task.cancel()
+            await asyncio.gather(pending_task, return_exceptions=True)
+
+        assert stats == R._AbortStats(
+            aborted_groups=1,
+            aborted_sessions=2,
+            requeued_groups=2,
+        )
+        assert source.requeued == [["surplus"], ["pending"]]
+        assert client.calls == [
+            (
+                "http://polar/rollout/task/task-pending/cancel",
+                {"reason": "sync_oversubscribe_abort"},
+            )
+        ]
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        _CancelResponse({"all_cancelled": False, "cancelled_sessions": 0}),
+        _CancelResponse({}, RuntimeError("gateway cancellation unavailable")),
+    ],
+)
+def test_abort_inflight_requires_positive_cancel_ack_before_requeue(response):
+    async def _run():
+        handle = R._SyncGroupHandle(
+            group=["pending"],
+            group_id=0,
+            task_ids=["task-pending"],
+        )
+        task = asyncio.create_task(asyncio.sleep(60))
+        source = RequeueDataSource()
+        try:
+            with pytest.raises(R.PolarRolloutSchedulerError, match="did not converge"):
+                await R._abort_inflight(
+                    {task},
+                    _args(),
+                    data_source=source,
+                    handles={task: handle},
+                    client=_CancelClient(response),
+                    rollout_server_url="http://polar",
+                )
+            assert source.requeued == []
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(_run())
+
+
+def test_abort_inflight_fails_closed_when_requeue_fails():
+    class FailingRequeueSource:
+        def add_samples(self, groups):
+            raise RuntimeError(f"cannot requeue {len(groups)} group")
+
+    async def _run():
+        handle = R._SyncGroupHandle(
+            group=["pending"],
+            group_id=0,
+            task_ids=["task-pending"],
+        )
+        task = asyncio.create_task(asyncio.sleep(60))
+        try:
+            with pytest.raises(R.PolarRolloutSchedulerError, match="requeue failed"):
+                await R._abort_inflight(
+                    {task},
+                    _args(),
+                    data_source=FailingRequeueSource(),
+                    handles={task: handle},
+                    client=_CancelClient(
+                        _CancelResponse(
+                            {"all_cancelled": True, "cancelled_sessions": 1}
+                        )
+                    ),
+                    rollout_server_url="http://polar",
+                )
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(_run())
+
+
+def test_oversubscribe_selects_first_groups_and_requeues_surplus(monkeypatch, stub_output):
+    _script_groups(monkeypatch, [True, True, True])
+    source = RequeueDataSource()
+    captured = {}
+
+    async def fake_abort(
+        pending,
+        args,
+        *,
+        data_source,
+        handles=None,
+        client=None,
+        rollout_server_url=None,
+    ):
+        del pending, args, client, rollout_server_url
+        captured["handles"] = handles
+        for handle in handles.values():
+            data_source.add_samples([handle.group])
+        return R._AbortStats(aborted_groups=1, aborted_sessions=2, requeued_groups=1)
+
+    monkeypatch.setattr(R, "_abort_inflight", fake_abort)
+    output = asyncio.run(
+        R._run_sync_train_rollout(
+            _args(rollout_batch_size=2, rollout_sync_oversubscribe_factor=1.5),
+            0,
+            source,
+        )
+    )
+
+    assert len(output.samples) == 2
+    assert output.metrics["polar/sync/submitted_groups"] == 3
+    assert output.metrics["polar/sync/requeued_groups"] == 1
+    assert len(source.requeued) == 1
+    assert source.requeued[0][0].group_index == 3
+    assert len(captured["handles"]) == 1
+
+
+def test_oversubscribe_cancels_live_group_before_return(monkeypatch, stub_output):
+    clients = []
+    locally_cancelled = []
+
+    class Client(_CancelClient):
+        def __init__(self, *, timeout):
+            del timeout
+            super().__init__(
+                _CancelResponse({"all_cancelled": True, "cancelled_sessions": 1})
+            )
+            clients.append(self)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            del args
+            return None
+
+    async def fake_group(*, group, group_id, handle, **kwargs):
+        del kwargs
+        handle.task_ids.append(f"task-{group_id}")
+        if group_id < 2:
+            await asyncio.sleep(0)
+            return R._SyncGroupOutcome(
+                group=group,
+                accepted=True,
+                samples=[SimpleNamespace(i=group_id)],
+                task_result=SimpleNamespace(status="completed"),
+            )
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            locally_cancelled.append(group_id)
+            raise
+
+    monkeypatch.setattr(R.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(R, "_run_sync_train_group", fake_group)
+    source = RequeueDataSource()
+
+    output = asyncio.run(
+        R._run_sync_train_rollout(
+            _args(rollout_batch_size=2, rollout_sync_oversubscribe_factor=1.5),
+            0,
+            source,
+        )
+    )
+
+    assert len(output.samples) == 2
+    assert output.metrics["polar/sync/aborted_groups"] == 1
+    assert output.metrics["polar/sync/aborted_sessions"] == 1
+    assert output.metrics["polar/sync/requeued_groups"] == 1
+    assert locally_cancelled == [2]
+    assert source.requeued[0][0].group_index == 3
+    assert clients[0].calls == [
+        (
+            "http://polar.invalid:8080/rollout/task/task-2/cancel",
+            {"reason": "sync_oversubscribe_abort"},
+        )
+    ]
+
+
+def test_oversubscribe_cleans_up_before_reporting_insufficient_batch(
+    monkeypatch,
+    stub_output,
+):
+    _script_groups(monkeypatch, [True, False, False])
+    source = RequeueDataSource()
+    cleanup_calls = []
+
+    async def fake_abort(*args, **kwargs):
+        cleanup_calls.append((args, kwargs))
+        return R._AbortStats(requeued_groups=2)
+
+    monkeypatch.setattr(R, "_abort_inflight", fake_abort)
+
+    with pytest.raises(R.PolarRolloutSchedulerError, match="only 1/2"):
+        asyncio.run(
+            R._run_sync_train_rollout(
+                _args(rollout_batch_size=2, rollout_sync_oversubscribe_factor=1.5),
+                0,
+                source,
+            )
+        )
+
+    assert len(cleanup_calls) == 1
 
 
 def test_durable_transition_fails_before_any_sync_side_effect(monkeypatch):
@@ -373,6 +733,48 @@ def test_sync_entrypoint_delegates_eval_to_the_existing_batch():
 def test_async_entrypoint_still_uses_the_worker():
     src = inspect.getsource(R.generate_rollout_polar_async)
     assert "async_worker" in src, "the async path must still be driven by the background worker"
+
+
+# --------------------------------------------------------------------------
+# 8b. latency spread: the cost side of strict synchronous collection
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("seconds", "expect_max", "expect_median", "expect_tail"),
+    [
+        ([10.0, 10.0, 10.0, 10.0], 10.0, 10.0, 1.0),
+        ([5.0, 5.0, 5.0, 60.0], 60.0, 5.0, 12.0),
+    ],
+)
+def test_group_latency_spread_is_reported(
+    monkeypatch,
+    stub_output,
+    seconds,
+    expect_max,
+    expect_median,
+    expect_tail,
+):
+    _script_groups(monkeypatch, [True] * len(seconds), seconds=seconds)
+    output = asyncio.run(
+        R._run_sync_train_rollout(
+            _args(rollout_batch_size=len(seconds)),
+            3,
+            FakeDataSource(),
+        )
+    )
+
+    assert output.metrics["polar/sync/group_seconds_max"] == expect_max
+    assert output.metrics["polar/sync/group_seconds_median"] == expect_median
+    assert output.metrics["polar/sync/tail_ratio"] == pytest.approx(expect_tail)
+
+
+def test_rejected_groups_count_toward_the_latency_spread():
+    metrics = R._sync_group_latency_metrics([1.0, 2.0, 99.0])
+    assert metrics["polar/sync/group_seconds_max"] == 99.0
+    assert metrics["polar/sync/group_seconds_min"] == 1.0
+
+
+def test_latency_metrics_are_absent_when_no_group_completed():
+    assert R._sync_group_latency_metrics([]) == {}
 
 
 if __name__ == "__main__":
