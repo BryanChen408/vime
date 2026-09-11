@@ -21,7 +21,6 @@ from torch import nn
 
 from vime.backends.megatron_utils.update_weight.update_weight_from_tensor import (
     count_colocated_engines,
-    vLLMColocateWorkerExtension,
 )
 
 
@@ -414,6 +413,32 @@ def _minimal_server_args(
 def _flag_value(cmd, flag):
     assert flag in cmd, f"{flag} 不在 cmd 里: {cmd}"
     return cmd[cmd.index(flag) + 1]
+
+
+def test_explicit_role_drives_backend_on_same_host():
+    from vime.backends.vllm_utils.vllm_engine import build_vllm_cmd_and_env
+
+    colocated_cmd, _ = build_vllm_cmd_and_env(
+        _minimal_server_args("80.48.5.56", colocated=True)
+    )
+    dedicated_cmd, _ = build_vllm_cmd_and_env(
+        _minimal_server_args("80.48.5.56", colocated=False)
+    )
+
+    assert _flag_value(colocated_cmd, "--weight-transfer-config") == '{"backend":"npu_ipc"}'
+    assert _flag_value(dedicated_cmd, "--weight-transfer-config") == '{"backend":"nccl"}'
+    assert "--worker-extension-cls" in colocated_cmd
+    assert "--worker-extension-cls" not in dedicated_cmd
+
+
+def test_hybrid_layout_requires_explicit_colocation_role():
+    from vime.backends.vllm_utils.vllm_engine import build_vllm_cmd_and_env
+
+    server_args = _minimal_server_args("80.48.5.56")
+    server_args.pop("colocated")
+
+    with pytest.raises(ValueError, match="colocation role to be passed explicitly"):
+        build_vllm_cmd_and_env(server_args)
 
 
 def test_served_model_name_alias_decouples_model_dir():

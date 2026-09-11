@@ -31,7 +31,7 @@ Colocation is a set relation — every ``(node, device)`` an engine occupies als
 belongs to the actor — and no single scalar can express it losslessly. This
 module computes that relation once; every consumer reads the result.
 
-See ``docs/design/colocate_topology_robustness_plan.md``.
+See section 3.2 of ``docs/design/a3pd_remote_topic_integration_plan.md``.
 """
 
 from __future__ import annotations
