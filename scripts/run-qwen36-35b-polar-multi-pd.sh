@@ -281,20 +281,6 @@ ROLLOUT_ARGS=(
    --rollout-seed "${ROLLOUT_SEED:-42}"
 )
 
-# Online MTP is opt-in so this shared launcher keeps its non-MTP baseline.
-# The sync MTP entrypoint sets FEAT_MTP=1 and FEAT_MTP_TRAIN=1; callers can
-# override the layer count or loss scale without reconstructing VIME_EXTRA_ARGS.
-MTP_ARGS=()
-if [ "${FEAT_MTP:-0}" = "1" ]; then
-   MTP_ARGS+=(--mtp-num-layers "${MTP_NUM_LAYERS:-1}")
-   if [ "${FEAT_MTP_TRAIN:-1}" = "1" ]; then
-      MTP_ARGS+=(
-         --enable-mtp-training
-         --mtp-loss-scaling-factor "${MTP_LOSS_SCALING_FACTOR:-0.2}"
-      )
-   fi
-fi
-
 # 权重更新时是否等 polar 的 in-flight session 排空。
 #   分离部署(异步):等 —— 生成与训练重叠,等一下就能把整组收完,不浪费。
 #   colocate(同步):不等 —— 引擎整个训练步都 sleep,等 session 纯粹是让训练干等;
@@ -425,12 +411,6 @@ VLLM_ARGS=(
    --vllm-mm-processor-cache-gb 0
 )
 
-# Pass speculative decoding as a single JSON argument. Keep this opt-in so
-# non-MTP runs retain the existing vLLM configuration.
-if [ -n "${VLLM_SPEC_CONFIG:-}" ]; then
-   VLLM_ARGS+=(--vllm-speculative-config "${VLLM_SPEC_CONFIG}")
-fi
-
 # ─── rollout 侧 PD 分离(拓扑对齐 run-qwen36-35b-polar-minimal-single-rollout-only-pd.sh)───
 # 卡怎么切由 ${VLLM_PD_CONFIG} 的 server_groups 决定(prefill 4 / decode 12,per_engine=4),
 # 其总卡数必须 == layout 里 rollout 的卡数(16),否则 rollout_validation.py 拦。
@@ -438,7 +418,6 @@ if [ "${FEAT_PD_DISAGG:-1}" = "1" ]; then
    VLLM_ARGS+=(
       --vllm-config "${VLLM_PD_CONFIG}"
       --disaggregation-backend "${PD_BACKEND:-mooncake}"
-      # --vllm-speculative-config "${VLLM_SPEC_CONFIG:-{\"method\":\"mtp\",\"num_speculative_tokens\":1}}"
    )
    FEAT_ROLLOUT_EP=${FEAT_ROLLOUT_EP:-1}       # PD 参考脚本开着 EP(经下面的 EP 闸门统一加 flag)
    FEAT_PREFIX_CACHE=${FEAT_PREFIX_CACHE:-1}   # 同参考脚本;yaml 里 P/D 两组也各自置 true
@@ -664,7 +643,7 @@ PY
          python3 "${TRAIN_ENTRY}" \
             ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
             ${TOPO_ARGS[@]} ${MODEL_ARGS[@]} ${ROLLOUT_ARGS[@]} ${POLAR_ARGS[@]} \
-            ${OPTIMIZER_ARGS[@]} ${GRPO_ARGS[@]} ${MTP_ARGS[@]} ${PERF_ARGS[@]} ${VLLM_ARGS[@]} \
+            ${OPTIMIZER_ARGS[@]} ${GRPO_ARGS[@]} ${PERF_ARGS[@]} ${VLLM_ARGS[@]} \
             ${MISC_ARGS[@]} ${CKPT_ARGS[@]} \
             2>&1 | tee "${LOG_FILE}"
          break
