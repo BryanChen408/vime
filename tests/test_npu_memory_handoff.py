@@ -177,7 +177,7 @@ def test_driver_brackets_rollout_weights_and_kv_with_actor_handoff(monkeypatch):
     actor = SimpleNamespace(
         prepare_memory_handoff=lambda: events.append("prepare_actor"),
         finish_memory_handoff=lambda: events.append("finish_actor"),
-        probe_memory=lambda tag: None,
+        probe_memory=lambda tag: events.append(f"probe:{tag}"),
     )
     rollout = SimpleNamespace(
         onload_weights=_RemoteCall("onload_weights", events),
@@ -192,8 +192,10 @@ def test_driver_brackets_rollout_weights_and_kv_with_actor_handoff(monkeypatch):
         "prepare_actor",
         "onload_weights",
         "wait:onload_weights-ref",
+        "probe:rollout 7 after onload_weights",
         "onload_kv",
         "wait:onload_kv-ref",
+        "probe:rollout 7 after onload_kv",
         "finish_actor",
     ]
 
@@ -203,7 +205,7 @@ def test_driver_does_not_restore_actor_allocator_when_kv_wake_fails(monkeypatch)
     args = SimpleNamespace(offload_rollout=True)
     actor = SimpleNamespace(
         finish_memory_handoff=lambda: events.append("finish_actor"),
-        probe_memory=lambda tag: None,
+        probe_memory=lambda tag: events.append(f"probe:{tag}"),
     )
     rollout = SimpleNamespace(onload_kv=_RemoteCall("onload_kv", events))
 
