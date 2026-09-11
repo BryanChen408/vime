@@ -237,6 +237,17 @@ def _apply_vllm_overrides(args, server_args: dict[str, Any], vllm_overrides: dic
         if normalized == "model_path":
             server_args["model_path"] = value
             continue
+        if normalized == "additional_config":
+            # Per-group YAML additional_config must land on THIS engine, not the
+            # shared args object (whose _vllm_raw_values forwarding would re-emit
+            # the *global* --vllm-additional-config and silently drop this one).
+            if not isinstance(value, dict):
+                logger.warning("vllm_overrides: additional_config must be a dict, got %r (rank=%s)", type(value).__name__, rank)
+                continue
+            merged = dict(server_args.get("additional_config") or {})
+            merged.update(value)
+            server_args["additional_config"] = merged
+            continue
         if normalized.startswith("disaggregation"):
             logger.debug("vllm_overrides: skipping unsupported key %s (rank=%s)", key, rank)
             continue
@@ -610,6 +621,30 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
     _rp = os.environ.get("VLLM_REASONING_PARSER")
     if _rp and "--reasoning-parser" not in cmd:
         cmd += ["--reasoning-parser", _rp]
+    # Merge global --vllm-additional-config with per-group YAML additional_config,
+    # per-group winning shared keys.  Emitted BEFORE _forward_vllm_cli_args so its
+    # `fixed` check sees --additional-config and does not re-emit the global one.
+    _global_raw = getattr(args, "vllm_additional_config", None)
+    _global_dict: dict = {}
+    if isinstance(_global_raw, dict):
+        _global_dict = dict(_global_raw)
+    elif isinstance(_global_raw, str) and _global_raw.strip():
+        try:
+            import json as _json
+
+            _parsed = _json.loads(_global_raw)
+            if isinstance(_parsed, dict):
+                _global_dict = _parsed
+        except Exception:
+            logger.warning("could not parse global --vllm-additional-config as JSON: %r", _global_raw[:200])
+    _per_group = server_args.get("additional_config") or {}
+    _merged_additional = dict(_global_dict)
+    _merged_additional.update(_per_group)
+    if _merged_additional and "--additional-config" not in cmd:
+        import json as _json
+
+        cmd += ["--additional-config", _json.dumps(_merged_additional)]
+
     _forward_vllm_cli_args(args, cmd)
 
     # 4) served-model-name 固定别名(20260824 no_completions 根因实锤):
@@ -1386,4 +1421,10 @@ def _compute_server_args(
         "data_parallel_rpc_port": data_parallel_rpc_port,
     }
     _apply_vllm_overrides(args, server_args, vllm_overrides, rank)
+    logger.warning(
+        "[ADDCFG] rank=%s args.vllm_additional_config=%s server_args.additional_config=%s",
+        rank,
+        getattr(args, "vllm_additional_config", None),
+        server_args.get("additional_config"),
+    )
     return server_args
