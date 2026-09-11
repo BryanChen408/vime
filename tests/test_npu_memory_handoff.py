@@ -177,6 +177,7 @@ def test_driver_brackets_rollout_weights_and_kv_with_actor_handoff(monkeypatch):
     actor = SimpleNamespace(
         prepare_memory_handoff=lambda: events.append("prepare_actor"),
         finish_memory_handoff=lambda: events.append("finish_actor"),
+        probe_memory=lambda tag: None,
     )
     rollout = SimpleNamespace(
         onload_weights=_RemoteCall("onload_weights", events),
@@ -184,8 +185,8 @@ def test_driver_brackets_rollout_weights_and_kv_with_actor_handoff(monkeypatch):
     )
     monkeypatch.setattr(train_driver.ray, "get", lambda ref: events.append(f"wait:{ref}"))
 
-    train_driver._prepare_rollout_memory_handoff(args, actor, rollout)
-    train_driver._finish_rollout_memory_handoff(args, actor, rollout)
+    train_driver._prepare_rollout_memory_handoff(args, actor, rollout, "rollout 7")
+    train_driver._finish_rollout_memory_handoff(args, actor, rollout, "rollout 7")
 
     assert events == [
         "prepare_actor",
@@ -200,7 +201,10 @@ def test_driver_brackets_rollout_weights_and_kv_with_actor_handoff(monkeypatch):
 def test_driver_does_not_restore_actor_allocator_when_kv_wake_fails(monkeypatch):
     events = []
     args = SimpleNamespace(offload_rollout=True)
-    actor = SimpleNamespace(finish_memory_handoff=lambda: events.append("finish_actor"))
+    actor = SimpleNamespace(
+        finish_memory_handoff=lambda: events.append("finish_actor"),
+        probe_memory=lambda tag: None,
+    )
     rollout = SimpleNamespace(onload_kv=_RemoteCall("onload_kv", events))
 
     def fail_wait(ref):
@@ -209,7 +213,7 @@ def test_driver_does_not_restore_actor_allocator_when_kv_wake_fails(monkeypatch)
     monkeypatch.setattr(train_driver.ray, "get", fail_wait)
 
     with pytest.raises(RuntimeError, match="KV wake failed"):
-        train_driver._finish_rollout_memory_handoff(args, actor, rollout)
+        train_driver._finish_rollout_memory_handoff(args, actor, rollout, "rollout 7")
 
     assert events == ["onload_kv"]
 

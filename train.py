@@ -11,19 +11,23 @@ from vime.utils.misc import should_run_periodic_action
 logger = logging.getLogger(__name__)
 
 
-def _prepare_rollout_memory_handoff(args, actor_model, rollout_manager) -> None:
+def _prepare_rollout_memory_handoff(args, actor_model, rollout_manager, tag) -> None:
     """Quiesce colocated trainer allocators before restoring rollout weights."""
     if not args.offload_rollout:
         return
     actor_model.prepare_memory_handoff()
     ray.get(rollout_manager.onload_weights.remote())
+    # The rollout weight shell is resident here, but KV has not returned yet.
+    actor_model.probe_memory(f"{tag} after onload_weights")
 
 
-def _finish_rollout_memory_handoff(args, actor_model, rollout_manager) -> None:
+def _finish_rollout_memory_handoff(args, actor_model, rollout_manager, tag) -> None:
     """Restore rollout KV first, then return trainer allocators to train mode."""
     if not args.offload_rollout:
         return
     ray.get(rollout_manager.onload_kv.remote())
+    # Read while the handoff allocator policy is still active.
+    actor_model.probe_memory(f"{tag} after onload_kv")
     actor_model.finish_memory_handoff()
 
 
@@ -67,7 +71,12 @@ def train(args):
         # 必须让它空 —— 权重壳 35G+workspace 4G+trainer ~10G ≈ 50G,余量 11G+;
         # KV 重映射只是同步后一次 ~1.4G 小额申请,放在 clear_memory 之后做。
         # (此前"KV 先醒"把 KV 塞进同步窗口 → 顶格 OOM,141406/142800 实锤,回正。)
-        _prepare_rollout_memory_handoff(args, actor_model, rollout_manager)
+        _prepare_rollout_memory_handoff(
+            args,
+            actor_model,
+            rollout_manager,
+            "startup",
+        )
 
         # Always push actor weights to rollout once weights are loaded.
         actor_model.update_weights()
@@ -81,7 +90,12 @@ def train(args):
             ray.get(rollout_manager.check_weights.remote(action="compare"))
 
         # 同步完成后醒 KV(与每步同序:权重壳 → 同步 → KV)。
-        _finish_rollout_memory_handoff(args, actor_model, rollout_manager)
+        _finish_rollout_memory_handoff(
+            args,
+            actor_model,
+            rollout_manager,
+            "startup",
+        )
 
         if durable_polar_boundary:
             ray.get(
@@ -137,6 +151,7 @@ def train(args):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        actor_model.probe_memory(f"rollout {rollout_id} after generate")
 
         # offload_rollout puts the engines to sleep for the whole training step, so from
         # here until onload_kv below there is nothing serving inference. Rollout functions
@@ -157,6 +172,9 @@ def train(args):
                 )
             if args.offload_rollout:
                 ray.get(rollout_manager.offload.remote())
+                actor_model.probe_memory(
+                    f"rollout {rollout_id} after rollout offload"
+                )
 
             actor_trains_this_step = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
 
@@ -169,13 +187,22 @@ def train(args):
             else:
                 ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
+            actor_model.probe_memory(f"rollout {rollout_id} after train")
+
             if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
                 save(rollout_id)
 
             offload_train(actor_trains_this_step)
+            actor_model.probe_memory(f"rollout {rollout_id} after train offload")
             # 同步窗口 KV 不驻留(定案,见文件头注):只醒权重壳做同步。
-            _prepare_rollout_memory_handoff(args, actor_model, rollout_manager)
+            _prepare_rollout_memory_handoff(
+                args,
+                actor_model,
+                rollout_manager,
+                f"rollout {rollout_id}",
+            )
             actor_model.update_weights()
+            actor_model.probe_memory(f"rollout {rollout_id} after update_weights")
             # Advance policy version so off-policy staleness tracking (vime_bridge) stays
             # live; a frozen version makes staleness grow without bound and drops every
             # group as stale (see vime_bridge/rollout.py drain_completed ->
@@ -186,7 +213,12 @@ def train(args):
                 )
             if args.offload_rollout:
                 # 同步完成 + clear_memory 之后,才醒 KV(此时空闲最足,重映射最稳)。
-                _finish_rollout_memory_handoff(args, actor_model, rollout_manager)
+                _finish_rollout_memory_handoff(
+                    args,
+                    actor_model,
+                    rollout_manager,
+                    f"rollout {rollout_id}",
+                )
                 # Resume only after train, weight sync, KV restore, and an all-engine
                 # weight-version proof succeeded.
                 ray.get(rollout_manager.finish_policy_update.remote(next_policy_version))

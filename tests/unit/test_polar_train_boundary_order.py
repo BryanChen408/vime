@@ -38,6 +38,9 @@ def test_initial_polar_bootstrap_precedes_first_weight_mutation(monkeypatch) -> 
         def finish_memory_handoff(self):
             calls.append(("finish_memory", (), {}))
 
+        def probe_memory(self, tag):
+            del tag
+
     monkeypatch.setattr(train_module.ray, "get", lambda value: value)
     monkeypatch.setattr(
         train_module,
