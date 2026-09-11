@@ -1,0 +1,12 @@
+# 单机 .52 async 分卡 smoke layout：Polar 使用 0-3，训练 4-11，专用 rollout 12-15。
+# 不含 share 段，供 train_async.py 验证无共卡的 persistent/session-pool 路径；
+# 同步共卡场景使用 resource_layout.single52_hybrid_colocate.yaml 或 homo layout。
+roles:
+  actor:
+    - {node: 80.48.5.52, devices: "4-11"}
+  rollout:
+    - {node: 80.48.5.52, devices: "12-15"}
+  polar_reserved:
+    - {node: 80.48.5.52, devices: "0-3"}
+rollout:
+  num_gpus_per_engine: 2
