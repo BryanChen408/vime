@@ -206,3 +206,6 @@ output/
 core
 core.*
 core_*
+
+# Ascend runtime exception dumps and generated probe binaries
+extra-info/data-dump/
