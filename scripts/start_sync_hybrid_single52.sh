@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# 单机 16 卡(.52)异构共卡同步 smoke。
+#
+# 这个入口只提供一个可复现的资源布局和较小 batch；模式开关仍由共享 runner
+# 处理。默认 sync factor=1.0、durable off、显存探针 on，便于先验证 rollout ->
+# offload -> train -> weight update -> wake 的完整边界；可用环境变量逐项覆盖。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+
+export CURRENT_IP="${CURRENT_IP:-80.48.5.52}"
+export MASTER_ADDR="${MASTER_ADDR:-${CURRENT_IP}}"
+export NNODES="${NNODES:-1}"
+export NPUS_PER_NODE="${NPUS_PER_NODE:-12}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-4,5,6,7,8,9,10,11,12,13,14,15}"
+export SOCKET_IFNAME="${SOCKET_IFNAME:-ens1f3}"
+export ACTOR_NUM_NODES="${ACTOR_NUM_NODES:-1}"
+export ACTOR_NUM_GPUS_PER_NODE="${ACTOR_NUM_GPUS_PER_NODE:-8}"
+export TRAIN_ENTRY="${TRAIN_ENTRY:-train.py}"
+export FEAT_OFFLOAD="${FEAT_OFFLOAD:-1}"
+export FEAT_SYNC_ROLLOUT="${FEAT_SYNC_ROLLOUT:-1}"
+export POLAR_SYNC_OVERSUBSCRIBE_FACTOR="${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0}"
+export POLAR_POLICY_TRANSITION_ENABLED="${POLAR_POLICY_TRANSITION_ENABLED:-0}"
+export RESOURCE_LAYOUT="${RESOURCE_LAYOUT:-${SCRIPT_DIR}/resource_layout.single52_hybrid_colocate.yaml}"
+export ROLLOUT_NODE_IP="${ROLLOUT_NODE_IP:-${CURRENT_IP}}"
+export ROLLOUT_NUM_GPUS="${ROLLOUT_NUM_GPUS:-12}"
+export ROLLOUT_NUM_GPUS_PER_ENGINE="${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}"
+export FEAT_PD_DISAGG="${FEAT_PD_DISAGG:-0}"
+export VLLM_SERVED_MODEL_NAME="${VLLM_SERVED_MODEL_NAME:-/home/docker/Qwen3.6-35B-A3B}"
+export VLLM_GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-0.70}"
+export VLLM_GPU_MEM_UTIL_DEDICATED="${VLLM_GPU_MEM_UTIL_DEDICATED:-0.85}"
+export MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-32768}"
+export SEQ_LENGTH="${SEQ_LENGTH:-131072}"
+export ROLLOUT_MAX_CONTEXT_LEN="${ROLLOUT_MAX_CONTEXT_LEN:-131072}"
+export VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-131072}"
+export VIME_MEM_PROBE="${VIME_MEM_PROBE:-1}"
+export TP="${TP:-2}"
+export PP="${PP:-1}"
+export CP="${CP:-4}"
+export EP="${EP:-8}"
+export POLAR_ROLLOUT_URL="${POLAR_ROLLOUT_URL:-http://${CURRENT_IP}:8080}"
+export VLLM_ROUTER_PORT="${VLLM_ROUTER_PORT:-8001}"
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4}"
+export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
+export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-16}"
+export NUM_ROLLOUT="${NUM_ROLLOUT:-2}"
+export FEAT_LB_PROXY="${FEAT_LB_PROXY:-1}"
+export FEAT_PREFIX_CACHE="${FEAT_PREFIX_CACHE:-1}"
+export FEAT_MULTISTREAM_SHARED_EXPERT="${FEAT_MULTISTREAM_SHARED_EXPERT:-1}"
+export FEAT_ROLLOUT_EP="${FEAT_ROLLOUT_EP:-0}"
+export OPERATOR_DATA_ROOT="${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}"
+export OPERATOR_TASK_JSONL="${OPERATOR_TASK_JSONL:-${OPERATOR_DATA_ROOT}/operator_tasks.16.jsonl}"
+
+exec bash "${SCRIPT_DIR}/run-qwen36-35b-polar-multi-pd.sh"

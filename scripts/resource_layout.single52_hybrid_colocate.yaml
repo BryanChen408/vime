@@ -1,0 +1,18 @@
+# 单机 16 卡(.52)异构共卡：共卡 rollout + 专用 rollout。
+#
+# 物理卡位：0-3 为 Polar agent/judge（不进 Ray）；4-11 为 actor，且承载
+# 4 个共卡 TP2 engine；12-15 为 2 个专用 TP2 engine。共卡 engine 走
+# NPU IPC 并在训练窗口 sleep，专用 engine 走 HCCL 并保持常驻。
+# shared rollout entries 必须排在 dedicated entries 之前，和 engine_roles 的
+# prefix 约束一致；两段拆开以保证 TP2 配对不跨 HCCS 域。
+roles:
+  actor:
+    - {node: 80.48.5.52, devices: "4-11"}
+  rollout:
+    - {node: 80.48.5.52, devices: "4-7", share: actor}
+    - {node: 80.48.5.52, devices: "8-11", share: actor}
+    - {node: 80.48.5.52, devices: "12-15"}
+  polar_reserved:
+    - {node: 80.48.5.52, devices: "0-3"}
+rollout:
+  num_gpus_per_engine: 2

@@ -4,15 +4,17 @@
 # 与 start_pd.sh(异步分离)/ start_cola.sh(纯 colocate)的差异:
 #   * 入口 train.py(同步循环:收齐 → 训练 → 权重同步 → 再收),TRAIN_ENTRY 直切。
 #   * 布局 resource_layout.hybrid56cola64infer.yaml:
-#       .56 16 卡 = 训练 + 8 个 TP2 引擎(共卡分时);.64 4-15 = 6 个 TP2 引擎(纯推理)。
+#       .56 16 卡 = 训练 + 4 个 TP4 引擎(共卡分时);.64 8-15 = 2 个 TP4 引擎(纯推理)。
 #   * 权重同步走混合更新器(UpdateWeightFromTensor):.56 共卡引擎 NPU IPC 直传(不进
-#     HCCL 域,规避同域同卡约束);.64 引擎 HCCL 广播(world=1+12,与异步 PD 同构)。
+#     HCCL 域,规避同域同卡约束);.64 引擎 HCCL 广播(world=1+8,与异步 PD 同构)。
 #   * FEAT_OFFLOAD=1:训推双侧 offload(训练窗口全部引擎 sleep;.56 引擎靠 needs_offload
 #     命中,.64 引擎不重叠不 sleep、常驻 —— 但网关被 prepare_policy_update 暂停,语义仍是同步)。
+#   * FEAT_SYNC_ROLLOUT=1:使用 one-shot sync rollout。runner 默认仍为 async/session_pool，
+#     这样其他启动入口不会改变；本脚本明确选择 train.py + sync + durable 组合。
 #
 # 前置(.64 手工):
 #   1) polar 推理端点 → http://80.48.5.56:8011;
-#   2) polar 卡池 "0-15" 改为 "0-3"(或按实际剩余);
+#   2) polar 卡池 "0-15" 改为 "0-7"(或按实际剩余);
 #   3) .64 先跑 start_pd_worker.sh 加入 Ray(同 pd 流程);老的分离部署进程先清干净。
 #
 # 内存账(61G/卡,按引擎分叉:共卡 VLLM_GPU_MEM_UTIL=0.70,专用 DEDICATED=0.85):
@@ -22,7 +24,7 @@
 #     ⚠ 全局 0.85 物理不可能:引擎自身 51.85G + trainer 9.8G > 60.95G 总量,
 #       KV 唤醒必 aclrtMallocPhysical OOM(20260824-203413 实锤,8 台共卡引擎全灭)。
 #   专用 .64(整卡独占,无 trainer):0.85 对齐 PD 基线 → KV 16.5G/引擎,
-#     256K 并发 6.2x,长上下文 session 主要由这 6 台承接。
+#     256K 并发 6.2x,长上下文 session 主要由这 2 台承接。
 #   权重同步:共卡引擎醒(权重壳 35.3G,KV 不驻留)+ trainer ~10G+瞬时 ≈ 47G ✓;
 #     同步窗口安全由「KV 移出同步窗口」结构保证(权重壳→同步→再醒 KV,0aab9283)。
 #   host 预算:level=2 驻留归零,训练 host ~1010G + plasma 200G + 基线 ~150G ≈ 1.35T / 2T,
@@ -61,13 +63,12 @@ POLAR_TRAJECTORY_PG_FLOOR=0.05 \
 POLAR_ATTEMPT_W=0.1 \
 POLAR_T3A_MASK_MAIN_CHAIN=0 \
 POLAR_ROLLOUT_URL=http://80.48.5.64:8180 \
+FEAT_SYNC_ROLLOUT=1 \
+POLAR_SYNC_OVERSUBSCRIBE_FACTOR=1.0 \
 POLAR_POLICY_TRANSITION_ENABLED=1 \
-POLAR_DRAIN_SESSIONS=0 \
-POLAR_MAX_OFF_POLICY_STEPS=0 \
 VLLM_ROUTER_PORT=8011 \
 FEAT_TRAIN_EXPANDABLE=1 \
 VIME_EMPTY_CACHE_PER_STEP=1 \
-POLAR_MAX_ACTIVE_SESSIONS=64 \
 TRANSFORMERS_VERBOSITY=error \
 HCCL_INTER_HCCS_DISABLE=false \
 HCCL_INTRA_ROCE_ENABLE=1 \

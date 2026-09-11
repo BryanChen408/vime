@@ -1,20 +1,18 @@
 #!/bin/bash
-# vime + polar 算子 RL 启动(qwen3.6-35B-A3B / NPU)—— **双机:.56 训练 8 卡 + .57 rollout 16 卡 PD**。
+# vime + polar 算子 RL 启动(qwen3.6-35B-A3B / NPU)。物理卡位不在脚本中重复推导，
+# 由 RESOURCE_LAYOUT 和最终 engine_roles 共同决定；默认布局是 .56 actor + .64 rollout。
 #
-# 卡位(单一真源 = ${RESOURCE_LAYOUT},见 resource_layout.dual56train57infer_pd.yaml):
-#   80.48.5.56  0-7   actor 训练(同 HCCS 域,免 EI0013)
-#   80.48.5.56  8-15  polar agent/judge(宿主机子容器,**不进 ray**)
-#   80.48.5.57  0-15  rollout PD:prefill 4 卡(tp4×1)+ decode 12 卡(tp4×3)
+# 卡位(单一真源 = ${RESOURCE_LAYOUT},见 resource_layout.dual56train57infer_pd.yaml)。
+# layout 的 actor、rollout、polar_reserved 和 num_gpus_per_engine 会在启动时校验；
+# 共卡布局中的 share: actor 段必须排在专用段之前。
 #
 # 前置:宿主机(.56)先起 polar,且 profile 里
-#   sglang_router_url: http://80.48.5.57:8001    ← proxy 起在 **rollout 节点**,不是 head。
+#   sglang_router_url: http://80.48.5.64:8001    ← proxy 起在 **rollout 节点**,不是 head。
 #     原因:layout 路径下 create_rollout_manager(placement_group.py:317)把 RolloutManager 钉在
-#     rollout 首个 bundle → 它进程内起的 PD proxy 也就落在 .57。
+#     rollout 首个 bundle → 它进程内起的 PD proxy 也就落在 .64。
 #   npu_pool: "8,9,10,11,12,13,14,15"            ← 避开 actor 的 0-7
 #
-# 启动(两台跑同一个脚本,靠 CURRENT_IP==MASTER_ADDR 分角色;NPUS_PER_NODE/可见卡按角色自动填):
-#   head@56:   SOCKET_IFNAME=ens1f3 bash scripts/run-qwen36-35b-polar-minimal.sh
-#   worker@57: CURRENT_IP=80.48.5.57 SOCKET_IFNAME=<57网卡> bash scripts/run-qwen36-35b-polar-minimal.sh
+# 启动(两台跑同一个脚本,靠 CURRENT_IP==MASTER_ADDR 分角色;NPUS_PER_NODE/可见卡按角色自动填)。
 #
 # 单机回退:NNODES=1 RESOURCE_LAYOUT=scripts/resource_layout.single52.yaml 并显式给
 #   NPUS_PER_NODE / ASCEND_RT_VISIBLE_DEVICES / FEAT_PD_DISAGG=0。
@@ -64,8 +62,8 @@ done
 
 # ─── 运行标识 / 多节点 ───
 RUN_ID=${RUN_ID:-qwen36_polar_$(date +%Y%m%d-%H%M%S)}
-MASTER_ADDR=${MASTER_ADDR:-80.48.5.59}
-ROLLOUT_NODE_IP=${ROLLOUT_NODE_IP:-80.48.5.56}   # 引擎+proxy 所在节点;须与 layout 的 rollout node 一致
+MASTER_ADDR=${MASTER_ADDR:-80.48.5.56}
+ROLLOUT_NODE_IP=${ROLLOUT_NODE_IP:-80.48.5.64}   # 引擎+proxy 所在节点;须与 layout 的 rollout node 一致
 CURRENT_IP=${CURRENT_IP:-}
 SOCKET_IFNAME=${SOCKET_IFNAME:-data0.172}
 NNODES=${NNODES:-2}
@@ -79,9 +77,9 @@ RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_qwen36_vime_polar}
 # 每节点卡数(16)—— 端口分配器靠它反推 node_index,所以这里不必也不该再传 --num-gpus-per-node。
 RESOURCE_LAYOUT=${RESOURCE_LAYOUT:-${VIME_ROOT}/scripts/resource_layout.dual56train57infer_pd.yaml}
 ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
-ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-8}
-ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-16}
-ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-4}
+ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-16}
+ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-8}
+ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}
 
 # ─── colocate(训推同卡、同步 train.py)───
 # FEAT_COLOCATE=1 时:
@@ -99,6 +97,39 @@ if [ "${FEAT_COLOCATE}" = "1" ]; then
    ROLLOUT_NODE_IP="${MASTER_ADDR}"        # 引擎与 actor 同节点,metrics/proxy 发现目标随之回到本机
 fi
 
+# ─── 训推模式闸门 ───
+# async 是默认基线；同步 rollout 只在 train.py 中有明确的 zero-inflight 边界。
+# durable policy transition 同样依赖 train.py 的 prepare/finish 事务，train_async.py
+# 会重叠生成和权重变更，因此在启动前直接拒绝这个组合，避免 Ray 建好后才失败。
+FEAT_SYNC_ROLLOUT=${FEAT_SYNC_ROLLOUT:-0}
+case "${FEAT_SYNC_ROLLOUT}" in
+   0|1) ;;
+   *) echo "[launcher][FATAL] FEAT_SYNC_ROLLOUT must be 0 or 1, got ${FEAT_SYNC_ROLLOUT}" >&2; exit 1 ;;
+esac
+if [ "${FEAT_COLOCATE}" = "1" ] && [ "${FEAT_SYNC_ROLLOUT}" != "1" ]; then
+   echo "[launcher][FATAL] FEAT_COLOCATE=1 requires FEAT_SYNC_ROLLOUT=1" >&2
+   exit 1
+fi
+if [ "${FEAT_SYNC_ROLLOUT}" = "1" ] && [ "${TRAIN_ENTRY}" != "train.py" ]; then
+   echo "[launcher][FATAL] synchronous Polar rollout requires TRAIN_ENTRY=train.py" >&2
+   exit 1
+fi
+POLAR_POLICY_TRANSITION_ENABLED=${POLAR_POLICY_TRANSITION_ENABLED:-0}
+case "${POLAR_POLICY_TRANSITION_ENABLED}" in
+   0|1) ;;
+   *) echo "[launcher][FATAL] POLAR_POLICY_TRANSITION_ENABLED must be 0 or 1, got ${POLAR_POLICY_TRANSITION_ENABLED}" >&2; exit 1 ;;
+esac
+if [ "${POLAR_POLICY_TRANSITION_ENABLED}" = "1" ]; then
+   if [ "${TRAIN_ENTRY}" != "train.py" ]; then
+      echo "[launcher][FATAL] durable Polar transitions require TRAIN_ENTRY=train.py" >&2
+      exit 1
+   fi
+   if [ "${FEAT_OFFLOAD:-0}" != "1" ] && [ "${FEAT_COLOCATE}" != "1" ]; then
+      echo "[launcher][FATAL] durable Polar transitions require FEAT_OFFLOAD=1" >&2
+      exit 1
+   fi
+fi
+
 # ─── polar 数据 / 端点 ───
 POLAR_OUTPUT_DIR=${POLAR_OUTPUT_DIR:-output/polar_bridge}
 OPERATOR_DATA_ROOT=${OPERATOR_DATA_ROOT:-/home/docker/datasets/op_assets_cudallm_filtered189}
@@ -107,7 +138,8 @@ OPERATOR_TASKS_DIR=${OPERATOR_TASKS_DIR:-${OPERATOR_DATA_ROOT}/op_tasks}
 VLLM_ROUTER_PORT=${VLLM_ROUTER_PORT:-8001}    # polar profile 的推理端点指向它
 # PD proxy bind 在 RolloutManager 所在节点 = rollout 节点(见文件头说明),不是 head。
 VLLM_ROUTER_IP=${VLLM_ROUTER_IP:-${ROLLOUT_NODE_IP}}
-# rollout 侧 PD 拓扑:复用 PD 参考脚本那份 yaml(prefill 4 + decode 12,per_engine=4,共 16 卡)
+# rollout 侧 PD 拓扑由 VLLM_PD_CONFIG 的 server_groups 决定；它必须与
+# RESOURCE_LAYOUT 中的 rollout 物理卡数和引擎宽度一致。
 VLLM_PD_CONFIG=${VLLM_PD_CONFIG:-}
 FEAT_PD_DISAGG=${FEAT_PD_DISAGG:-1}
 
@@ -202,16 +234,16 @@ export VIME_HOST_IP=${VIME_HOST_IP:-${CURRENT_IP}}
 # ─── 按角色定 ray 注册卡数与可见卡(与 layout 的 devices 必须对得上)───
 # Ascend 要求 ASCEND_RT_VISIBLE_DEVICES 升序(乱序 → torch_npu 见 0 卡)。
 if [ "${MASTER_ADDR}" = "${CURRENT_IP}" ]; then
-   NODE_ROLE=head                                  # 训练节点:只暴露 0-7,8-15 留给宿主机 polar
-   NPUS_PER_NODE=${NPUS_PER_NODE:-8}
+   NODE_ROLE=head                                  # 训练节点:默认布局使用 16 卡 actor
+   NPUS_PER_NODE=${NPUS_PER_NODE:-${ACTOR_NUM_GPUS_PER_NODE}}
    export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 else
    NODE_ROLE=worker                                # rollout 节点:16 卡全给引擎
    NPUS_PER_NODE=${NPUS_PER_NODE:-16}
-   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11}
+   export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 fi
 echo "[topo] role=${NODE_ROLE} ip=${CURRENT_IP} if=${SOCKET_IFNAME} npus=${NPUS_PER_NODE} devices=${ASCEND_RT_VISIBLE_DEVICES}"
-echo "[topo] actor=8卡@${MASTER_ADDR}  rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT_NODE_IP}(PD 1P3D tp4)  proxy=${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}"
+echo "[topo] actor=${ACTOR_NUM_NODES}x${ACTOR_NUM_GPUS_PER_NODE}卡@${MASTER_ADDR} rollout=${ROLLOUT_NUM_GPUS}卡@${ROLLOUT_NODE_IP} per_engine=${ROLLOUT_NUM_GPUS_PER_ENGINE} proxy=${VLLM_ROUTER_IP}:${VLLM_ROUTER_PORT}"
 
 POLAR_ROLLOUT_URL=${POLAR_ROLLOUT_URL:-http://${MASTER_ADDR}:8080}
 LOG_FILE=${LOG_FILE:-/mnt/pipeline-data/train_log/train_${RUN_ID}.log}
@@ -258,9 +290,46 @@ TOPO_ARGS=(
    --rollout-num-gpus-per-engine ${ROLLOUT_NUM_GPUS_PER_ENGINE}
 )
 
+# 训练入口和 rollout 函数必须成对选择：同步入口一次性等待每个 group 到终态，
+# 返回时没有跨步 session；异步入口继续复用远端 session_pool/persistent worker。
+if [ "${FEAT_SYNC_ROLLOUT}" = "1" ]; then
+   ROLLOUT_FN=vime_bridge.rollout.generate_rollout_polar_sync
+   SYNC_FACTOR=${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0}
+   python3 - "${SYNC_FACTOR}" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except (TypeError, ValueError):
+    raise SystemExit("[launcher][FATAL] POLAR_SYNC_OVERSUBSCRIBE_FACTOR must be numeric")
+if not math.isfinite(value) or value < 1.0 or value > 1.5:
+    raise SystemExit(
+        "[launcher][FATAL] POLAR_SYNC_OVERSUBSCRIBE_FACTOR must be in [1.0, 1.5]"
+    )
+PY
+   SCHED_ARGS=(--rollout-sync-oversubscribe-factor "${SYNC_FACTOR}")
+else
+   ROLLOUT_FN=vime_bridge.rollout.generate_rollout_polar_async
+   SCHED_ARGS=(
+      --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
+      --rollout-scheduler-mode session_pool
+      --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
+      --rollout-release-on-postrun
+   )
+fi
+
+# TIS 校正的是 vLLM logprob 与 Megatron 重算 logprob 的数值失配，与同步/异步
+# staleness 无关。默认两条路径都开启；仅 POLAR_DISABLE_TIS=1 才关闭。
+if [ "${POLAR_DISABLE_TIS:-0}" = "1" ]; then
+   TIS_ARGS=()
+else
+   TIS_ARGS=(--use-tis)
+fi
+
 ROLLOUT_ARGS=(
-   --rollout-function-path vime_bridge.rollout.generate_rollout_polar_async
-   --eval-function-path vime_bridge.rollout.generate_rollout_polar_async
+   --rollout-function-path "${ROLLOUT_FN}"
+   --eval-function-path "${ROLLOUT_FN}"
    --prompt-data "${OPERATOR_TASK_JSONL}"
    --input-key prompt
    --label-key label
@@ -281,32 +350,29 @@ ROLLOUT_ARGS=(
    --rollout-seed "${ROLLOUT_SEED:-42}"
 )
 
-# 权重更新时是否等 polar 的 in-flight session 排空。
-#   分离部署(异步):等 —— 生成与训练重叠,等一下就能把整组收完,不浪费。
-#   colocate(同步):不等 —— 引擎整个训练步都 sleep,等 session 纯粹是让训练干等;
-#     在跑的 session 直接放弃,交给 version-span guard 在 resume 时拒绝跨界续跑。
-#   POLAR_DRAIN_SESSIONS 可显式覆盖(1=等 / 0=不等)。
-if [ "${POLAR_DRAIN_SESSIONS:-$([ "${FEAT_COLOCATE:-0}" = "1" ] && echo 0 || echo 1)}" = "1" ]; then
-   DRAIN_ARGS=(--polar-weight-update-drain-sessions)
+# session_pool 的 drain/staleness 只属于 async worker；sync 的 zero-inflight 契约
+# 不依赖这些参数。durable transition 两种模式都保留，sync 由事务层验证零在飞。
+if [ "${FEAT_SYNC_ROLLOUT}" = "1" ]; then
+   DRAIN_ARGS=()
+   STALENESS_ARGS=()
 else
-   DRAIN_ARGS=(--no-polar-weight-update-drain-sessions)
+   if [ "${POLAR_DRAIN_SESSIONS:-1}" = "1" ]; then
+      DRAIN_ARGS=(--polar-weight-update-drain-sessions)
+   else
+      DRAIN_ARGS=(--no-polar-weight-update-drain-sessions)
+   fi
+   POLAR_MAX_OFF_POLICY_STEPS=${POLAR_MAX_OFF_POLICY_STEPS:-}
+   if [ -n "${POLAR_MAX_OFF_POLICY_STEPS}" ]; then
+      STALENESS_ARGS=(--rollout-max-off-policy-steps "${POLAR_MAX_OFF_POLICY_STEPS}")
+   else
+      STALENESS_ARGS=()
+   fi
 fi
 
-if [ "${POLAR_POLICY_TRANSITION_ENABLED:-0}" = "1" ]; then
+if [ "${POLAR_POLICY_TRANSITION_ENABLED}" = "1" ]; then
    POLICY_TRANSITION_ARGS=(--polar-policy-transition-enabled)
 else
    POLICY_TRANSITION_ARGS=(--no-polar-policy-transition-enabled)
-fi
-
-# 跨权重更新的组要不要。默认(不传)沿用 max_async_level+update_weights_interval 的推导值,
-# 下限恒为 2 → 跨一次更新的 staleness=1 永远被接受,也就是混权轨迹会进训练集。
-# colocate 下 polar 侧没有 /admin/policy_version(version-span guard 会 404 降级),
-# 只能在这里丢:0 = 只收当轮生成的组,上一轮遗留的一律丢弃。
-POLAR_MAX_OFF_POLICY_STEPS=${POLAR_MAX_OFF_POLICY_STEPS:-$([ "${FEAT_COLOCATE:-0}" = "1" ] && echo 0 || echo "")}
-if [ -n "${POLAR_MAX_OFF_POLICY_STEPS}" ]; then
-   STALENESS_ARGS=(--rollout-max-off-policy-steps "${POLAR_MAX_OFF_POLICY_STEPS}")
-else
-   STALENESS_ARGS=()
 fi
 
 POLAR_ARGS=(
@@ -315,11 +381,8 @@ POLAR_ARGS=(
    --polar-reward-key score
    --polar-task-id-template "{args.polar_run_id}-polar-op-{rollout_id}-{sample.group_index}"
    --operator-tasks-dir "${OPERATOR_TASKS_DIR}"
-   --rollout-max-async-level "${POLAR_MAX_ASYNC_LEVEL:-1}"
    --rollout-request-timeout "${POLAR_ROLLOUT_REQUEST_TIMEOUT:-21600}"
-   --rollout-scheduler-mode session_pool
-   --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
-   --rollout-release-on-postrun
+   ${SCHED_ARGS[@]+"${SCHED_ARGS[@]}"}
    --rollout-min-complete-accept-fraction "${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-0.6}"
    --polar-policy-control-timeout "${POLAR_POLICY_CONTROL_TIMEOUT:-45}"
    ${DRAIN_ARGS[@]+"${DRAIN_ARGS[@]}"}
@@ -356,7 +419,7 @@ GRPO_ARGS=(
    #--kl-loss-type low_var_kl
    --entropy-coef 0.001
    --eps-clip 0.2
-   --use-tis
+   ${TIS_ARGS[@]+"${TIS_ARGS[@]}"}
 )
 # 共卡混合专属:同步期 trainer 与引擎同卡,512MB bucket 的 all_gather+IPC 瞬时块
 # 顶穿卡余量(20260824-142800 实锤 rank13 free 0.03G OOM),256MB 砍半。
@@ -412,8 +475,8 @@ VLLM_ARGS=(
 )
 
 # ─── rollout 侧 PD 分离(拓扑对齐 run-qwen36-35b-polar-minimal-single-rollout-only-pd.sh)───
-# 卡怎么切由 ${VLLM_PD_CONFIG} 的 server_groups 决定(prefill 4 / decode 12,per_engine=4),
-# 其总卡数必须 == layout 里 rollout 的卡数(16),否则 rollout_validation.py 拦。
+# 卡怎么切由 ${VLLM_PD_CONFIG} 的 server_groups 决定，其总卡数必须 == layout
+# 里 rollout 的卡数，否则 rollout_validation.py 会拒绝启动。
 if [ "${FEAT_PD_DISAGG:-1}" = "1" ]; then
    VLLM_ARGS+=(
       --vllm-config "${VLLM_PD_CONFIG}"
@@ -510,7 +573,7 @@ if [ "${PROFILE_OP:-0}" = "1" ]; then
    VLLM_ARGS+=(--vllm-profiler-config "${_PROF_JSON}")
    echo "[profile-op] ON dir=${PROFILE_DIR} max_iters=${PROFILE_MAX_ITERS:-20} rpc_timeout=${VLLM_RPC_TIMEOUT}" >&2
 fi
-echo "[feat] async=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
+echo "[feat] rollout_mode=$([ "${FEAT_SYNC_ROLLOUT}" = "1" ] && echo sync || echo async) sync_factor=${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0} tis=$([ "${POLAR_DISABLE_TIS:-0}" = "1" ] && echo off || echo on) durable=${POLAR_POLICY_TRANSITION_ENABLED} mem_probe=${VIME_MEM_PROBE:-0} async_sched=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
 
 # ─── 清本节点 rollout 卡残留(只清 $ASCEND_RT_VISIBLE_DEVICES 钉的卡)───
 # 上个 run 异常结束后,vllm 栈(ray::VLLMEngine / vllm serve / EngineCore / Worker)
@@ -593,15 +656,15 @@ if layout is not None and getattr(layout, "rollout_has_share", False):
         if not item.share:
             want[item.node] = want.get(item.node, 0) + len(item.devices)
     for node, cnt in sorted(want.items()):
-        if npu.get(node, 0) != cnt:
-            errs.append(f"节点 {node} NPU={npu.get(node, 0)},期望 {cnt}(layout 专用卡;共卡段复用 actor 不另计)")
+        if npu.get(node, 0) < cnt:
+            errs.append(f"节点 {node} NPU={npu.get(node, 0)},至少需要 {cnt}(layout 专用卡;共卡段复用 actor 不另计)")
     if not errs:
         print(f"[gate] OK(hybrid): {want}")
 else:
-    if npu.get(actor_ip, 0) != want_actor:
-        errs.append(f"训练节点 {actor_ip} NPU={npu.get(actor_ip, 0)},期望 {want_actor}")
-    if npu.get(rollout_ip, 0) != want_rollout:
-        errs.append(f"rollout 节点 {rollout_ip} NPU={npu.get(rollout_ip, 0)},期望 {want_rollout}")
+    if npu.get(actor_ip, 0) < want_actor:
+        errs.append(f"训练节点 {actor_ip} NPU={npu.get(actor_ip, 0)},至少需要 {want_actor}")
+    if npu.get(rollout_ip, 0) < want_rollout:
+        errs.append(f"rollout 节点 {rollout_ip} NPU={npu.get(rollout_ip, 0)},至少需要 {want_rollout}")
     if not errs:
         print(f"[gate] OK: actor {want_actor}卡@{actor_ip} + rollout {want_rollout}卡@{rollout_ip}")
 if errs:

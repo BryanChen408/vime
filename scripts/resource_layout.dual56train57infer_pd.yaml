@@ -2,12 +2,12 @@ roles:
   actor:
     - {node: 80.48.5.56, devices: "0-15"}
   rollout:
-    - {node: 80.48.5.64, devices: "4-15"}     # [2026-08-14] 12卡(4-15)→8卡(8-15):见下
+    - {node: 80.48.5.64, devices: "8-15"}     # 8 卡，完整落在同一 HCCS 域
   polar_reserved:
     - {node: 80.48.5.64, devices: "0-3"}
 rollout:
   num_gpus_per_engine: 2                 # 8 卡 → 4 个 tp2 engine(1P3D:P=8-9 / D=10-11,12-13,14-15)
-  vllm_dp_size: 6                        # external-LB DP 组大小 = 引擎数 = 8/2 = 4。
+  vllm_dp_size: 4                        # external-LB DP 组大小 = 引擎数 = 8/2 = 4。
                                          #   仅 FEAT_DP_EXTERNAL_LB=1 时生效;须 == 引擎数,否则 arguments.py 报错。
                                          #   改 num_gpus_per_engine 时此处同步改(如 TP4 → vllm_dp_size:2)。
 # [2026-08-14] 为什么从 4-15(12卡)缩到 8-15(8卡):

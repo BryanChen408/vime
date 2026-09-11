@@ -1,0 +1,14 @@
+# 单机 16 卡(.52)部分共卡 smoke layout。
+#
+# actor 使用 0-15，rollout 使用其中的 4-15，因此这是部分共卡而非真正同构；
+# Polar agent/judge 约定使用 0-3，不能在 layout 中声明为 polar_reserved，因其
+# 与 actor 重叠。rollout 的两个 shared entries 仍按 HCCS 域拆分，确保 engine_roles
+# 得到稳定的 actor ranks，IPC gather 不使用 rollout slot 代替 actor rank。
+roles:
+  actor:
+    - {node: 80.48.5.52, devices: "0-15"}
+  rollout:
+    - {node: 80.48.5.52, devices: "4-7", share: actor}
+    - {node: 80.48.5.52, devices: "8-15", share: actor}
+rollout:
+  num_gpus_per_engine: 2

@@ -1,14 +1,14 @@
 # 混合部署:.56 训推共卡 + .64 专用推理(同步 train.py 用)
 #
 # 拓扑(混合更新器:本机 IPC + 跨机 HCCL,2026-08-21 起):
-#   .56  16 卡  训练(TP2×CP8);rollout 窗口承载 8 个 TP2 引擎(共卡分时,训练窗口 sleep)
-#   .64  12 卡  6 个 TP2 引擎,纯推理(needs_offload=False,常驻不 sleep)
+#   .56  16 卡  训练 + 4 个 TP4 引擎(共卡分时,训练窗口 sleep)
+#   .64  8 卡   2 个 TP4 引擎,纯推理(needs_offload=False,常驻不 sleep)
 #   .64  0-3    polar 算子评测池(不进 Ray)
 #
 # 权重同步(UpdateWeightFromTensor 混合模式,slime 同款):
 #   .56 共卡引擎走 NPU IPC 直传,不进 HCCL 域 → HCCL "同域不同卡" 约束天然规避,
-#   卡 0 可用(HCCL 域 = trainer + 12 个 .64 rank,与异步 PD 同构)。
-#   share 段拆 0-7 / 8-15 两条是为 TP2 配对不跨 HCCS 域(配对按列表顺序两两切分)。
+#   卡 0 可用(HCCL 域 = trainer + 8 个 .64 rank,与异步 PD 同构)。
+#   share 段拆 0-7 / 8-15 两条是为 TP4 配对不跨 HCCS 域(配对按列表顺序切分)。
 #
 # 顺序约定(代码强制):共卡段(share=actor)必须写在 rollout 列表最前。
 roles:
@@ -17,9 +17,9 @@ roles:
   rollout:
     - {node: 80.48.5.56, devices: "0-7", share: actor}     # 4 台共卡引擎(HCCS 域 A)
     - {node: 80.48.5.56, devices: "8-15", share: actor}    # 4 台共卡引擎(HCCS 域 B)
-    - {node: 80.48.5.64, devices: "8-15"}                  # 6 台专用引擎,常驻
+    - {node: 80.48.5.64, devices: "8-15"}                  # 2 台专用引擎,常驻
   polar_reserved:
     - {node: 80.48.5.64, devices: "0-7"}
 rollout:
-  num_gpus_per_engine: 4                 # 14 个 TP2 引擎(8 共卡驻留 8×70G=560G + 6 专用)
-  # vllm_dp_size: 14                   # 仅 FEAT_DP_EXTERNAL_LB=1 时需要 == 引擎数
+  num_gpus_per_engine: 4                 # 共 6 个 TP4 引擎(4 共卡 + 2 专用)
+  # vllm_dp_size: 6                    # 仅 FEAT_DP_EXTERNAL_LB=1 时需要 == 引擎数
