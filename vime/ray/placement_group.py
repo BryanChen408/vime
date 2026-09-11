@@ -108,26 +108,36 @@ def _node_resource_keys_by_ip():
 
 
 def _build_layout_bundles(layout, device_name):
-    """Build PACK bundles that pin each ``(node, device)`` to its node via a tiny
-    ``node:<ip>: 0.001`` resource request (forces the bundle onto that node)."""
+    """Build PACK bundles that preserve the physical device ids in ``layout``.
+
+    Ray assigns accelerator ids inside a placement group from the bundles it
+    allocates, rather than from the node's global device numbering.  A sparse
+    layout such as ``4-11`` + ``12-15`` would therefore be renumbered to
+    ``0-11`` unless the lower, unused slots are represented too.  Reserve one
+    pinned bundle for every device from ``0`` through the largest id mentioned
+    on each node; role selectors below still return only the bundles named by
+    actor/critic/rollout.  ``polar_reserved`` participates in this padding so
+    the external Polar lease pool also keeps the same physical-id mapping.
+    """
     node_resource_keys = _node_resource_keys_by_ip()
-    bundles = []
-    # layout.critic 默认空 () → 不产生额外 bundle(共卡老路径);非空则为独立 critic 卡位建 bundle。
-    # rollout 的 share="actor" 段与 actor 共卡 —— 复用 actor 已建的 bundle,不再新建
-    # (否则同一张卡被申请两次,Ray 资源不可满足)。
-    for role in (layout.actor, layout.critic, layout.rollout):
+    max_device_by_node: dict[str, int] = {}
+    for role in (layout.actor, layout.critic, layout.rollout, getattr(layout, "polar_reserved", ())):
         for item in role:
-            if getattr(item, "share", None):
-                continue
-            node_resource_key = node_resource_keys.get(item.node)
-            if node_resource_key is None:
-                available = ", ".join(sorted(node_resource_keys)) or "<none>"
-                raise ValueError(
-                    f"Resource layout requested node {item.node!r}, but it is not an active Ray node. "
-                    f"Available Ray nodes: {available}"
-                )
-            for _ in item.devices:
-                bundles.append({device_name: 1, "CPU": 1, node_resource_key: 0.001})
+            max_device = max(item.devices, default=-1)
+            if max_device >= 0:
+                max_device_by_node[item.node] = max(max_device_by_node.get(item.node, -1), max_device)
+
+    bundles = []
+    for node in sorted(max_device_by_node):
+        node_resource_key = node_resource_keys.get(node)
+        if node_resource_key is None:
+            available = ", ".join(sorted(node_resource_keys)) or "<none>"
+            raise ValueError(
+                f"Resource layout requested node {node!r}, but it is not an active Ray node. "
+                f"Available Ray nodes: {available}"
+            )
+        for _device in range(max_device_by_node[node] + 1):
+            bundles.append({device_name: 1, "CPU": 1, node_resource_key: 0.001})
     return bundles
 
 
