@@ -102,6 +102,13 @@ def test_runner_is_shell_valid() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_save_hf_default_does_not_leak_parameter_expansion_brace() -> None:
+    source = _source_text(RUNNER)
+    assert "SAVE_HF='/workspace/Qwen3.6-35B-A3B_vime_polar/rollout_{rollout_id}'" in source
+    assert '--save-hf "${SAVE_HF}"' in source
+    assert '${SAVE_HF:-/workspace/Qwen3.6-35B-A3B_vime_polar/rollout_{rollout_id}}' not in source
+
+
 def test_async_is_the_default_and_keeps_session_pool() -> None:
     result = _evaluate_mode()
     assert result.returncode == 0, result.stderr

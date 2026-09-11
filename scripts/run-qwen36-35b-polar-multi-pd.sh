@@ -270,11 +270,14 @@ publish_observer_log_pointer() {
 }
 
 # ─── 参数分组 ───
+if [ -z "${SAVE_HF:-}" ]; then
+   SAVE_HF='/workspace/Qwen3.6-35B-A3B_vime_polar/rollout_{rollout_id}'
+fi
 CKPT_ARGS=(
    --hf-checkpoint ${HF_CKPT:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t-bf16}
    --ref-load ${REF_LOAD:-/home/docker/Qwen3.6-35B-A3B-agentical-ascendc-hf-4t_torch_dist}
    --save ${SAVE:-/workspace/Qwen3.6-35B-A3B_vime_polar}/
-   --save-hf "${SAVE_HF:-/workspace/Qwen3.6-35B-A3B_vime_polar/rollout_{rollout_id}}"
+   --save-hf "${SAVE_HF}"
    --save-interval 5
    --no-save-optim
    --megatron-to-hf-mode raw
