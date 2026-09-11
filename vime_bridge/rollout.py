@@ -52,6 +52,7 @@ _SYNC_MAX_SUBMIT_MULTIPLIER = 4
 _SYNC_MAX_OVERSUBSCRIBE_FACTOR = 1.5
 _SYNC_ABORT_REASON = "sync_oversubscribe_abort"
 _SYNC_ABORT_TIMEOUT_SECONDS = 30.0
+_SYNC_ROLLOUT_FUNCTION_PATH = "vime_bridge.rollout.generate_rollout_polar_sync"
 _LONGEST_TRACE_ARTIFACT_INTERVAL = 5  # dump longest trace every N rollouts
 _SESSION_POOL_RUN_RELEASE_STATUSES = frozenset({
     str(SessionStatus.POST_RUN),
@@ -552,7 +553,15 @@ def _policy_control_timeout(args: Any) -> float:
     return max(5.0, float(getattr(args, "polar_policy_control_timeout", 45.0)))
 
 
+def _uses_zero_inflight_sync_rollout(args: Any) -> bool:
+    """Return whether the configured rollout has no cross-step local state."""
+    path = str(getattr(args, "rollout_function_path", None) or "").strip()
+    return path == _SYNC_ROLLOUT_FUNCTION_PATH
+
+
 def _require_transactional_scheduler(args: Any) -> None:
+    if _uses_zero_inflight_sync_rollout(args):
+        return
     mode = (
         getattr(args, "rollout_scheduler_mode", None)
         or getattr(args, "polar_scheduler_mode", None)
@@ -560,8 +569,8 @@ def _require_transactional_scheduler(args: Any) -> None:
     )
     if str(mode).strip().lower() != "session_pool":
         raise PolarRolloutSchedulerError(
-            "Durable Polar policy transitions require rollout_scheduler_mode="
-            "session_pool; group mode has no local ready-queue epoch cutoff"
+            "Durable Polar policy transitions require rollout_scheduler_mode=session_pool "
+            "for asynchronous rollout; group mode has no local ready-queue epoch cutoff"
         )
 
 
@@ -3636,6 +3645,7 @@ async def _run_sync_train_group(
         group_id=group_id,
         policy_version=rollout_id,
         rollout_step=rollout_id,
+        policy_namespace=_task_policy_namespace(args),
     )
 
     async def submit_one(chunk: dict[str, Any]) -> TaskResult:
@@ -3742,13 +3752,6 @@ async def _run_sync_train_rollout(args: Any, rollout_id: int, data_source: Any) 
     state by the time this returns, so no Polar session is still generating and
     the rollout engine can be put to sleep safely.
     """
-    if _policy_transition_enabled(args):
-        raise PolarRolloutSchedulerError(
-            "Synchronous rollout does not yet support durable Polar policy transitions; "
-            "disable --polar-policy-transition-enabled until the zero-inflight "
-            "transition contract is installed"
-        )
-
     config = resolve_polar_slime_config(args)
     need = int(getattr(args, "rollout_batch_size", 1) or 1)
     if need <= 0:

@@ -48,6 +48,7 @@ def _args(**overrides):
         rollout_min_complete_accept_fraction=0.8,
         rollout_sync_oversubscribe_factor=1.0,
         polar_policy_transition_enabled=False,
+        rollout_function_path="vime_bridge.rollout.generate_rollout_polar_sync",
         rollout_batch_size=2,
         n_samples_per_prompt=2,
         hf_checkpoint="/tmp/ckpt",
@@ -221,7 +222,12 @@ def test_exhausted_data_source_raises(monkeypatch, stub_output):
 # --------------------------------------------------------------------------
 # 5. staleness is 0 by construction: policy_version is always the current step
 # --------------------------------------------------------------------------
-def test_policy_version_always_equals_rollout_id(monkeypatch, stub_output):
+@pytest.mark.parametrize("durable", [False, True])
+def test_policy_metadata_matches_sync_rollout_epoch(
+    monkeypatch,
+    stub_output,
+    durable,
+):
     seen: list[dict] = []
 
     async def capture(payload, *, max_sessions_per_task, submit_one):
@@ -243,12 +249,17 @@ def test_policy_version_always_equals_rollout_id(monkeypatch, stub_output):
     monkeypatch.setattr(R, "_low_complete_accept_fraction_rejection_reason", lambda *a, **k: None)
 
     rollout_id = 41
-    asyncio.run(R._run_sync_train_rollout(_args(), rollout_id, FakeDataSource()))
+    args = _args(polar_policy_transition_enabled=durable)
+    asyncio.run(R._run_sync_train_rollout(args, rollout_id, FakeDataSource()))
 
     assert seen, "no payload was submitted"
     for metadata in seen:
         assert metadata["policy_version"] == rollout_id
         assert metadata["rollout_step"] == rollout_id
+        if durable:
+            assert metadata["policy_namespace"] == R._policy_namespace(args)
+        else:
+            assert "policy_namespace" not in metadata
 
 
 def test_submit_reports_server_task_id_before_terminal_result():
@@ -532,7 +543,12 @@ def test_oversubscribe_selects_first_groups_and_requeues_surplus(monkeypatch, st
     assert len(captured["handles"]) == 1
 
 
-def test_oversubscribe_cancels_live_group_before_return(monkeypatch, stub_output):
+@pytest.mark.parametrize("durable", [False, True])
+def test_oversubscribe_cancels_live_group_before_return(
+    monkeypatch,
+    stub_output,
+    durable,
+):
     clients = []
     locally_cancelled = []
 
@@ -574,7 +590,11 @@ def test_oversubscribe_cancels_live_group_before_return(monkeypatch, stub_output
 
     output = asyncio.run(
         R._run_sync_train_rollout(
-            _args(rollout_batch_size=2, rollout_sync_oversubscribe_factor=1.5),
+            _args(
+                rollout_batch_size=2,
+                rollout_sync_oversubscribe_factor=1.5,
+                polar_policy_transition_enabled=durable,
+            ),
             0,
             source,
         )
@@ -620,25 +640,21 @@ def test_oversubscribe_cleans_up_before_reporting_insufficient_batch(
     assert len(cleanup_calls) == 1
 
 
-def test_durable_transition_fails_before_any_sync_side_effect(monkeypatch):
+def test_durable_transition_uses_zero_inflight_sync_collector(monkeypatch, stub_output):
+    _script_groups(monkeypatch, [True, True])
     source = FakeDataSource()
 
-    def unexpected_config_resolution(args):
-        del args
-        raise AssertionError("sync durable guard must run before config or HTTP setup")
-
-    monkeypatch.setattr(R, "resolve_polar_slime_config", unexpected_config_resolution)
-
-    with pytest.raises(R.PolarRolloutSchedulerError, match="does not yet support durable"):
-        asyncio.run(
-            R._run_sync_train_rollout(
-                _args(polar_policy_transition_enabled=True),
-                0,
-                source,
-            )
+    output = asyncio.run(
+        R._run_sync_train_rollout(
+            _args(polar_policy_transition_enabled=True),
+            0,
+            source,
         )
+    )
 
-    assert source.calls == []
+    assert len(output.samples) == 2
+    assert output.metrics["polar/sync/accepted_groups"] == 2
+    assert source.calls == [2]
 
 
 # --------------------------------------------------------------------------

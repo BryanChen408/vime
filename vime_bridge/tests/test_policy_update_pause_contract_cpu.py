@@ -20,6 +20,7 @@ def _args(**overrides):
         "polar_policy_control_timeout": 45.0,
         "polar_run_id": "test-run",
         "rollout_scheduler_mode": "session_pool",
+        "rollout_function_path": "vime_bridge.rollout.generate_rollout_polar_async",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -458,6 +459,43 @@ def test_transaction_rejects_group_scheduler_without_local_epoch_cutoff() -> Non
             ),
             0,
         )
+
+
+def test_sync_transaction_uses_zero_inflight_instead_of_worker_cutoff(
+    monkeypatch,
+) -> None:
+    args = _args(
+        polar_policy_transition_enabled=True,
+        rollout_scheduler_mode="group",
+        rollout_function_path="vime_bridge.rollout.generate_rollout_polar_sync",
+    )
+    calls = []
+    monkeypatch.setattr(rollout, "_global_async_worker", None)
+    monkeypatch.setattr(rollout, "_process_policy_transition", None)
+
+    def post(_args, path, *, json_payload, transition_id):
+        context = rollout._current_policy_transition()
+        assert context is not None
+        calls.append((path, dict(json_payload), transition_id))
+        return _transition_payload(context, "admission_closed")
+
+    monkeypatch.setattr(rollout, "_post_policy_control", post)
+    status = rollout.prepare_policy_update(
+        args,
+        6,
+        {"engine-000": "5", "engine-001": "5"},
+    )
+
+    assert status["all_paused"] is True
+    assert status["all_drained"] is False
+    assert calls[0][0] == "/rollout/admin/policy-transitions/begin"
+    assert calls[0][1] == {
+        "transition_id": calls[0][2],
+        "policy_namespace": rollout._policy_namespace(args),
+        "from_epoch": 5,
+        "to_epoch": 6,
+        "engine_versions": {"engine-000": "5", "engine-001": "5"},
+    }
 
 
 def test_bootstrap_closes_before_first_weight_evidence_and_commits_namespace(monkeypatch) -> None:
