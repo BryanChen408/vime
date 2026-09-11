@@ -28,7 +28,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from vime.utils import logging_utils
-from vime.utils.memory_utils import clear_memory
+from vime.utils.memory_utils import _log_npu_expandable, _log_npu_mem, clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -37,73 +37,6 @@ from .loss import loss_function
 from .model_provider import get_model_provider_func
 
 logger = logging.getLogger(__name__)
-
-
-def _log_npu_mem(tag: str, step_id: int = -1) -> None:
-    """[MEM PROBE] 实时 NPU 显存打印(env VIME_MEM_PROBE=1 开,默认关=零开销)。
-
-    区分 torch 池内 vs 池外(非-torch)占用——即 OOM 消息里 `total - torch_reserved` 那 ~24 GiB
-    torch 看不见的部分(CANN/HCCL/MindSpeed AscendC 算子 workspace)。
-      non_torch = device_used - torch_reserved
-    若 non_torch 很大 → 真·非-torch 占用(随 seq 长涨);若 device_used ≈ torch_reserved 却 OOM →
-    是设备级碎片(torch 要不到连续块),而非池外占用。用 mem_get_info() 拿设备级 free/total。
-    """
-    if os.environ.get("VIME_MEM_PROBE", "0") != "1":
-        return
-    npu = getattr(torch, "npu", None)
-    if npu is None or not npu.is_available():
-        return
-    try:
-        g = 1024 ** 3
-        reserved = npu.memory_reserved() / g
-        free, total = npu.mem_get_info()
-        dev_used = (total - free) / g
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        logger.info(
-            "[MEM %s] step=%d rank=%d torch_alloc=%.2f torch_reserved=%.2f max_reserved=%.2f "
-            "device_used=%.2f non_torch=%.2f dev_free=%.2f total=%.2f GiB",
-            tag, step_id, rank, npu.memory_allocated() / g, reserved, npu.max_memory_reserved() / g,
-            dev_used, dev_used - reserved, free / g, total / g,
-        )
-    except Exception as e:  # a probe must never break training
-        logger.warning("[MEM %s] probe failed: %s", tag, e)
-
-
-def _log_npu_expandable(tag: str, step_id: int = -1) -> None:
-    """[MEM PROBE] 证明 expandable_segments 是否**真激活**、覆盖范围、以及缓存空闲可归还比例。
-
-    torch_npu 的 memory_snapshot() 逐 segment 暴露 `is_expandable`——env 设了但静默回退成 False
-    (torch_npu 有 "expandable_segments setting failure, now change to False" 的兜底)时,这里会
-    如实显示 expandable=0。回答三问:
-      (1) PYTORCH_NPU_ALLOC_CONF 到底有没有进 actor 进程(env 转发验证);
-      (2) 分配器里多少 segment 真的 is_expandable(生效 + 覆盖 MindSpeed 全部分配的验证);
-      (3) cached_free(reserved−active)里多少落在**完全空闲**段 = empty_cache 保底能归还的量,
-          剩余是卡在半用段里的碎片(expandable 下仍可按页 unmap,但保守下界看 fully_free)。
-    默认关(VIME_MEM_PROBE=1 开);snapshot 有开销,仅探针开时调用。
-    """
-    if os.environ.get("VIME_MEM_PROBE", "0") != "1":
-        return
-    npu = getattr(torch, "npu", None)
-    if npu is None or not npu.is_available():
-        return
-    try:
-        g = 1024 ** 3
-        conf = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "<unset>")
-        segs = npu.memory_snapshot()
-        n = len(segs)
-        n_exp = sum(1 for s in segs if s.get("is_expandable"))
-        exp_res = sum(s["total_size"] for s in segs if s.get("is_expandable")) / g
-        leg_res = sum(s["total_size"] for s in segs if not s.get("is_expandable")) / g
-        cached_free = sum(s["total_size"] - s["active_size"] for s in segs) / g
-        fully_free = sum(s["total_size"] for s in segs if s["active_size"] == 0) / g
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        logger.info(
-            "[MEM-EXP %s] step=%d rank=%d conf=%s segs=%d expandable=%d exp_reserved=%.2f "
-            "legacy_reserved=%.2f cached_free=%.2f fully_free_seg=%.2f GiB",
-            tag, step_id, rank, conf, n, n_exp, exp_res, leg_res, cached_free, fully_free,
-        )
-    except Exception as e:  # a probe must never break training
-        logger.warning("[MEM-EXP %s] probe failed: %s", tag, e)
 
 
 def _disable_tqdm_for_non_main_rank() -> bool:

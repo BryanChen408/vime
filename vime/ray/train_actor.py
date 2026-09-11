@@ -13,9 +13,12 @@ from vime.ray.ray_actor import RayActor
 from vime.utils.distributed_utils import init_gloo_group
 from vime.utils.logging_utils import configure_logger
 from vime.utils.memory_utils import (
+    _log_npu_expandable,
+    _log_npu_mem,
     aggressive_empty_cache,
     clear_memory,
     expandable_segments_enabled,
+    mem_probe_enabled,
     print_memory,
     set_expandable_segments,
 )
@@ -110,6 +113,18 @@ class TrainRayActor(RayActor):
         print_memory("before TrainRayActor.clear_memory")
         clear_memory()
         print_memory("after TrainRayActor.clear_memory")
+
+    def probe_memory(self, tag: str):
+        """Record this rank's device and host memory at a hand-off point."""
+        if not mem_probe_enabled():
+            return None
+        try:
+            _log_npu_mem(f"handoff:{tag}")
+            _log_npu_expandable(f"handoff:{tag}")
+            return print_memory(f"handoff:{tag}")
+        except Exception as e:  # pragma: no cover - diagnostics must not break training
+            logger.warning("probe_memory(%s) failed: %s", tag, e)
+            return None
 
     def prepare_memory_handoff(self) -> None:
         """Prepare a colocated NPU actor allocator before rollout weights wake."""
