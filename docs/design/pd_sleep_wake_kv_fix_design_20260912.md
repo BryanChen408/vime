@@ -1,7 +1,7 @@
 # PD 分离 sleep/wake KV 传输失效(根因 B)修复设计方案
 
 日期:2026-09-12
-状态:探针验证完成,待评审后实施
+状态:方案A已实现(vllm-ascend-023@pr-11976 commit 7ec3f98e),待 E2E 验证
 关联文档:`pd_sync_precision_handoff_20260911.md`(整体问题背景)、`pd_sync_debug_handoff_20260910.md`(完整调试史)
 探针脚本:`tools/mooncake_sleep_wake_probe.py`(本仓库)
 
@@ -106,10 +106,14 @@ wake_up(改造):
 
 **vime(编排侧,三行量级):** 启动脚本/YAML 透传 `VIME_PD_FRESH_VA_ON_WAKE`;sleep/wake 编排不变;验证探针(`VIME_PD_SLEEP_WAKE_RELOAD_DIAG`、`VIME_PD_KV_XFER_HASH`)现成复用。
 
-### 2.3.1 VA 换新机制(两个候选,实施第一步先验)
+### 2.3.1 VA 换新机制(2026-09-12 已验证定稿)
 
-- **候选 a(倾向)**:KV 从 CaMem remap 语义剥离——sleep 时 connector 注销 + model_runner 释放 kv_caches 引用 + gc(free 回调连带释放 VA reservation);wake 时重跑 `initialize_kv_cache_tensors`(新 reserve → 必然新 VA)。语义最干净,先验证 `python_free_callback` 能正确释放 VA。
-- **候选 b**:KV 留在 CaMem 池但打"不 remap"标记,wake 时池内重新分配。改动更局部但 CaMem 语义更绕。
+~~候选 a(drop 引用自动释放 VA)~~ **已证伪**:CaMem 池从不在运行期调 my_free(`pointer_to_data` 只增不减,empty_cache 对池无效);且 my_free 内部是 unmap+freePhysical+releaseVA 三连,对已解映射 VA 二次 unmap 会崩——所以既不能靠 drop 引用释放 VA,也**绝不能**让已遗忘的张量走到 my_free。
+
+**定稿:遗忘式(sleep 遗忘 + wake 新池)**,探针 `/tmp/va_forget_probe.py` 两周期验证 PASS(每轮全新 VA、无崩溃、新张量可写):
+- sleep:connector 注销 KV 区域 → `allocator.sleep()` 照常 unmap+freePhysical(KV 物理页真释放)→ **把 KV 条目从 `allocator.pointer_to_data` 摘除**(CaMem 遗忘:防止 wake remap 旧 VA、防止下轮 sleep 二次 unmap)→ (可选)ctypes 调 `aclrtReleaseMemAddress(va)` 回收 VA 预留,消除每轮 VA 泄漏;
+- wake:`allocator.wake_up()` 只对剩余条目(weights)remap → **新开 `use_memory_pool("kv_cache")` 上下文重跑 `model_runner.initialize_kv_cache(kv_cache_config)`**——一次调用完成新 VA 分配 + attention backend 重建 + 引用重绑 + connector 注册(与 init 同路径同顺序,索引配对不变式天然满足)→ 旧池对象存入全局列表永不析构(防 my_free 二次 unmap);
+- 图:`CUDAGraphWrapper.clear_all_graphs()` + `capture_model()`。
 
 **开关语义**:`VIME_PD_FRESH_VA_ON_WAKE=1` 开新路径;默认关;与 `VIME_KV_SLEEP_PERSISTENT=1`(现 workaround)**互斥,同开即 assert**。另注意:P 引擎 prefill 不走 FULL_DECODE_ONLY 的 decode 图,图重捕获成本集中在 D 侧。
 
@@ -144,6 +148,18 @@ wake_up(改造):
 3. 生产形态 E2E:`start_sync_pd_single52.sh` 小批量(NUM_ROLLOUT=2),确认真实 session 输出正常、无 OOM、step 时间可接受。
 
 ---
+
+### 2.6 实施状态(2026-09-12)
+
+方案 A 已实现并提交:vllm-ascend-023 `pr-11976` @ `7ec3f98e`(6 文件 +278 行):
+- `envs.py`:`VIME_PD_FRESH_VA_ON_WAKE`(默认关,与 VIME_KV_SLEEP_PERSISTENT 互斥断言);
+- `worker.py`:sleep 时注销 KV 注册 + `forget_tag` 遗忘;wake 时 recreate_engine → clear_all_graphs → `reinitialize_kv_cache_fresh_va` → `capture_model`;
+- `model_runner_v1.py`:`reinitialize_kv_cache_fresh_va`(新池全新 VA + 重跑 initialize_kv_cache 全链重绑;旧张量/旧池入 retired 列表永不释放);
+- `mooncake_connector.py`:`register_kv_caches` 可重入(原地更新线程引用的容器,跳过重开线程);
+- `mooncake_transfer_engine.py`:`unregister_all`;
+- `camem.py`:`forget_tag`(摘条目 + 可选 aclrtReleaseMemAddress 回收 VA)。
+
+**已知遗留风险(E2E 验证重点)**:wake 时图重捕获发生在权重 reload 之前,模型权重是 remap 后的空页——图捕获只录结构不录值,预期无害,但若 dummy run 因垃圾权重触发异常,备选是把重捕获挪到权重 reload 完成之后。
 
 ## 3. 方案 B:HCCS 全联通环境(未来,如 A3 超节点)
 
