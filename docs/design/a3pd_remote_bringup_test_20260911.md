@@ -361,6 +361,24 @@ ROLLOUT_BATCH_SIZE=1, N_SAMPLES_PER_PROMPT=1, GLOBAL_BATCH_SIZE=1, NUM_ROLLOUT=1
   backend（单机应为 `.52:8001`，或提供可达的 `.56:8011` 服务）后，再以相同命令复测 policy
   version 1/2/3 的 begin--drain--commit--resume 全链路。本轮没有修改 Polar 配置。
 
+### 9.2 配置阻塞纠正（2026-09-12）
+
+- 上述 `.64/.56` 拓扑不是远端实现要求，而是 Polar rebase 后两层本机配置 stash 尚未重新应用。
+  已按原时间顺序恢复 `local Polar profile changes from c715646f`，再叠加
+  `pre-rebase tracked worktree`；两份原 stash 均保留，恢复内容留在 Polar 普通工作区，不进入
+  rebase 后的功能 commit。
+- 恢复后的 `profile.t2a.yaml` 使用 rollout `.52:8180`、gateway `.52:8200`、router
+  `.52:8001`、模型 `/home/docker/Qwen3.6-35B-A3B` 和 Polar NPU pool `[0,1,2,3]`；本机
+  task assets、asc-devkit 路径及 `max_turns=5` 同时恢复。远端新增的 `generation_max=15`、
+  `release_session_affinity=true`、新超时和工具策略保留。该配置与 VIME actor/rollout 使用
+  `4-15` 的 16 卡共卡拓扑互补，不再指向 `.56:8011`。
+- 第二层 stash 中的 `ascendc_eval_pipeline.sh` 与远端有真实重叠，已三方合并：保留本地增量构建、
+  候选固化、预算/优化门禁和错误分类，同时采用远端绝对 work-root 路径与严格 stateful detector
+  判据。YAML 关键字段断言、`bash -n`、`git diff --check` 均通过；Polar 相关的 budget、case stats、
+  error type、paths、Stop guard 定向回归结果为 **45 passed**。
+- 当前宿主 Polar 进程是在 stash 恢复前启动的，仍需再次重启以加载恢复后的 profile；因此本节只把
+  Stage 6 的外部配置阻塞改判为“已修正、待进程重载”，不提前宣称三版本 durable 全链路通过。
+
 ## 10. 阶段 7：连续 step 显存 probe
 
 - 启动日志：`/mnt/pipeline-data/train_log/train_a3pd_stage7_mem_probe_20260912.log`；Ray 临时目录：
