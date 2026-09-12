@@ -1,8 +1,8 @@
 # a3-pd 回迁特性真机分阶段验证记录
 
-状态：阶段性完成（Stage 6 等待宿主 Polar API 升级后重跑）  
+状态：阶段性完成（Stage 6 durable bootstrap 已通过；完整 E2E 受 Polar gateway 后端配置阻塞）
 日期：2026-09-11--2026-09-12（容器时间；Polar run 目录使用宿主机时间）  
-代码：`dev/a3pd-integrated`，基线 `bryan/a3-pd@b2503de2`，当前 HEAD `3a239e16`
+代码：`dev/a3pd-integrated`，基线 `bryan/a3-pd@b2503de2`，当前 HEAD `d31ea3b7`
 
 ## 1. 验证范围
 
@@ -31,7 +31,7 @@
 | 3 | 单机异构 engine-role 分流 | **通过** | actor/shared rollout `4-11`，dedicated rollout `12-15`；IPC/HCCL 双通路、role-selective sleep、两轮同步和 step 0 均完成，见 §6 |
 | 4 | 部分共卡跨节点 | 外部资源阻塞 | `.64` Polar gateway 当前有 12 个实例/64 个运行中 session，SSH 无凭据，不能安全复用为第二训练节点；见 §7 |
 | 5 | sync factor=1.25/1.5 | **通过** | factor=1.5 disaggregated canary 完成 cancel/requeue、训练 step 和最终同步，见 §8 |
-| 6 | durable transition 三个 policy version | 外部接口阻塞 | `.52:8180` 对 durable bootstrap/fail API 返回 404；见 §9 |
+| 6 | durable transition 三个 policy version | 部分通过/外部配置阻塞 | 重启后 durable bootstrap API 已上线并成功提交；完整 rollout 被 Polar gateway 后端 `.56:8011` 不可达阻塞，见 §9.1 |
 | 7 | `VIME_MEM_PROBE=1` 至少两个完整 step | **通过** | 两个 sync rollout、两个 train step、三次 policy version 推进和显存 handoff probe 完成，见 §10 |
 
 ## 3. 阶段 0：初始环境快照
@@ -318,6 +318,48 @@ ROLLOUT_BATCH_SIZE=1, N_SAMPLES_PER_PROMPT=1, GLOBAL_BATCH_SIZE=1, NUM_ROLLOUT=1
   policy-control 路由，不是 Polar 服务整体不可用，也不是 VIME 显存或 placement 失败。
 - 判定：**外部接口阻塞，代码路径未完成通过判定**。需要在宿主 Polar 部署包含 bootstrap/transition
   policy-control API 的版本后，用相同参数重跑；当前实现的 fail-closed 行为本身已被触发并保留在日志中。
+
+### 9.1 重启后的 durable 回归（2026-09-12 15:46--16:10 UTC）
+
+- Polar 重启后，`.52:8180/openapi.json` 已出现完整 durable 路由：
+  `policy/initialize`、`policy/bootstrap/begin`、`policy-transitions/*`、`policy/quiesce` 和
+  `policy_version`。对 `POST /rollout/admin/policy/bootstrap/begin` 的方法探测返回 `405 Allow: POST`，
+  不再是旧的 `404`，确认宿主服务已加载新版本。
+- 前两次启动只暴露了测试命令的资源注册错误：一次以 `NPUS_PER_NODE=12` 注册却要求 16 个逻辑
+  bundle，另一次以 `NPUS_PER_NODE=16` 配合可见卡 `4-15` 被 Ray 拒绝。两次均在模型业务初始化前
+  清理，没有修改代码。第三次改为注册逻辑卡 `0-15`，再用 layout 选择 actor `4-11`、rollout
+  `12-15`，placement 成功。
+- 第三次运行参数保持 `FEAT_SYNC_ROLLOUT=1`、`FEAT_OFFLOAD=1`、
+  `POLAR_POLICY_TRANSITION_ENABLED=1`、`NUM_ROLLOUT=3`、`CP=4`、`EP=8`，日志：
+  `/mnt/pipeline-data/train_log/train_a3pd_stage6_durable_retest_20260912c.log`，Ray 日志目录：
+  `/tmp/ray_a3pd_stage6_durable_retest_c`。两个 TP2 vLLM engine、8 卡 actor、LB proxy 均完成启动；
+  actor rank 0 的 offload 从约 `30.14GiB` 空闲提升到 `49.73GiB`，释放 2 个 flat buffer、
+  `20070.4MiB`。
+- 首次同步的 `254/254` 个权重 fragment 全部返回 HTTP 200，pause/resume 也均为 200。随后 Polar
+  成功提交 durable bootstrap transition：
+  `bootstrap-32d33e780ead2aba-0-to-0`，`phase=serving`、`verified_policy_epoch=0`、
+  `engine_versions={engine-000:1,engine-001:1}`、`engine_abort_confirmed=true`、`last_error=null`。
+  这部分证明 VIME 的 durable bootstrap 调用链与新 Polar API 已实际闭环。
+- 权重同步完成后，VIME 尝试向 `POST /rollout/admin/policy_version?version=1` 发布下一版本时收到
+  `502 Bad Gateway`。最新 Polar run
+  `/home/c00937190/polar/output/ascend_operator/runs/polar_20260912_233241` 的
+  `run_artifacts/effective_topology.yaml` 明确记录 `rollout_server_url=.64:8180`、
+  `gateway public_url=.64:8200`、`inference base_url=.56:8011`；同一时刻 Polar 返回的 gateway node 配置也是
+  `base_url=http://80.48.5.56:8011`，而本次 VIME 启动的 router/LB 是 `80.48.5.52:8001`；从容器对
+  `.56:8011` 的 HTTP 探测也只能得到代理层 `504`，无法建立有效 inference 请求。因此首个
+  rollout 一直没有得到可训练结果，未进入 `step 0`。
+- 为避免继续无限等待，16:09 UTC 主动中止该测试。随后 Polar 状态恢复为
+  `all_reachable=true, all_drained=true, inflight=0, active_generations=0`，但 manager 中本轮 4 个
+  `a3pd_stage6_durable_retest_20260912c-polar-op-0-*` task 仍为 `running`。随后逐个调用精确 task cancel
+  清理；4 个 task 均返回 `status=cancelled, all_cancelled=true, cancelled_sessions=4,
+  failed_sessions=0`，没有操作其他任务。确认 `/tasks?status=running` 为空后，再以本轮 namespace/epoch
+  调用 durable `policy/quiesce`；transition 最终为 `phase=quiesced`、`admission_closed=true`、
+  `serving=false`，gateway `paused=true, drained=true, inflight=0`。该中止不是 VIME 代码崩溃，也不是
+  durable bootstrap 事务失败，且测试退出后的 policy 状态已按协议关闭。
+- 判定：**durable bootstrap/首轮权重同步通过；完整“三版本 + rollout + train step”仍被外部
+  gateway profile/backend 地址阻塞**。需要让重启后的 Polar 使用与本轮 VIME 相同的 inference
+  backend（单机应为 `.52:8001`，或提供可达的 `.56:8011` 服务）后，再以相同命令复测 policy
+  version 1/2/3 的 begin--drain--commit--resume 全链路。本轮没有修改 Polar 配置。
 
 ## 10. 阶段 7：连续 step 显存 probe
 
