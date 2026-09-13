@@ -1184,11 +1184,21 @@ def _resume_gateway_generation(args: Any) -> None:
     rollout_url = _resolve_rollout_url(args)
     if rollout_url:
         request_timeout = float(getattr(args, "polar_gateway_control_timeout", 30.0))
-        payload = _control_post_json(
-            f"{rollout_url}/rollout/admin/inference/resume",
-            action="rollout gateway resume",
-            timeout=max(request_timeout, 5.0),
-        )
+        try:
+            payload = _control_post_json(
+                f"{rollout_url}/rollout/admin/inference/resume",
+                action="rollout gateway resume",
+                timeout=max(request_timeout, 5.0),
+            )
+        except PolarRolloutSchedulerError as exc:
+            # A freshly (re)started gateway that was never paused answers the
+            # resume with 409 Conflict (wrapped as 502 by the rollout server's
+            # fan-out).  "Not paused" is exactly the goal state of a resume, so
+            # accept it instead of dying at the rollout entry.
+            if "409" in str(exc):
+                logger.warning("Polar gateway already running (409 on resume); continuing: %s", exc)
+                return
+            raise
         if not _all_gateway_nodes_ok(
             payload, "all_resumed", lambda response: response.get("paused") is False
         ):
