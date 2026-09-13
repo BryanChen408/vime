@@ -176,6 +176,25 @@ def test_build_vllm_subprocess_env_no_batch_invariant_by_default(vllm_args, monk
 
 
 @pytest.mark.unit
+def test_build_vllm_subprocess_env_allows_long_model_len_when_enabled(vllm_args, monkeypatch):
+    monkeypatch.delenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", raising=False)
+    vllm_args.vllm_allow_long_max_model_len = True
+
+    env = mod.build_vllm_subprocess_env({"args": vllm_args, "visible_devices": "0"})
+
+    assert env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] == "1"
+
+
+@pytest.mark.unit
+def test_build_vllm_subprocess_env_does_not_enable_long_model_len_by_default(vllm_args, monkeypatch):
+    monkeypatch.delenv("VLLM_ALLOW_LONG_MAX_MODEL_LEN", raising=False)
+
+    env = mod.build_vllm_subprocess_env({"args": vllm_args, "visible_devices": "0"})
+
+    assert "VLLM_ALLOW_LONG_MAX_MODEL_LEN" not in env
+
+
+@pytest.mark.unit
 def test_build_vllm_cmd_adds_sleep_mode_only_for_offload_rollout(vllm_args):
     vllm_args.offload_rollout = True
     server_args = mod._compute_server_args(vllm_args, rank=0, dist_init_addr=None, host="127.0.0.1", port=8000)

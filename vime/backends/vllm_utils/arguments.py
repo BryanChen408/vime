@@ -206,6 +206,12 @@ def add_vllm_arguments(parser):
         ),
     )
     parser.add_argument(
+        "--vllm-allow-long-max-model-len",
+        action="store_true",
+        default=False,
+        help="Allow vLLM to use a max model length above the checkpoint's declared limit.",
+    )
+    parser.add_argument(
         "--vllm-tool-call-parser",
         dest="vllm_tool_call_parser",
         type=str,
@@ -372,6 +378,7 @@ _VIME_ORCHESTRATION_DESTS = frozenset(
         "router_policy",
         "vllm_server_concurrency",
         "vllm_enable_deterministic_inference",
+        "vllm_allow_long_max_model_len",
         "vllm_weight_sync_packed",
         "vllm_tool_call_parser",
         "vllm_config",

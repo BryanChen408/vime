@@ -82,6 +82,41 @@ def make_allgather_cp_args(**overrides):
     return types.SimpleNamespace(**values)
 
 
+def make_yarn_args(**overrides):
+    rope_parameters = {
+        "rope_type": "yarn",
+        "rope_theta": 10000000,
+        "partial_rotary_factor": 0.25,
+        "factor": 4.0,
+        "original_max_position_embeddings": 262144,
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "mscale": 1.0,
+        "mscale_all_dim": 0.0,
+        "truncate": True,
+    }
+    values = dict(
+        position_embedding_type="yarn",
+        rotary_base=10000000,
+        rotary_percent=0.25,
+        rotary_scaling_factor=4.0,
+        yarn_original_max_position_embeddings=262144,
+        yarn_beta_fast=32.0,
+        yarn_beta_slow=1.0,
+        mscale=1.0,
+        mscale_all_dim=0.0,
+        yarn_correction_range_round_to_int=True,
+        vllm_hf_overrides={"text_config": {"rope_parameters": rope_parameters}},
+        vllm_allow_long_max_model_len=True,
+        seq_length=131072,
+        max_position_embeddings=131072,
+        rollout_max_context_len=131072,
+        vllm_max_model_len=131072,
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
 @pytest.mark.unit
 def test_hf_validate_all_moe_skips_dense_intermediate_size(monkeypatch):
     module = load_arguments_module(monkeypatch)
@@ -137,6 +172,60 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
     args = make_allgather_cp_args(context_parallel_size=1)
 
     module._validate_allgather_cp_supported(args)
+
+
+@pytest.mark.unit
+def test_yarn_training_and_rollout_fingerprints_match(monkeypatch, caplog):
+    module = load_arguments_module(monkeypatch)
+
+    with caplog.at_level("INFO"):
+        module._validate_yarn_consistency(make_yarn_args())
+
+    assert "Resolved matched YaRN fingerprint" in caplog.text
+
+
+@pytest.mark.unit
+def test_yarn_fingerprint_mismatch_is_rejected(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_yarn_args()
+    args.vllm_hf_overrides["text_config"]["rope_parameters"]["factor"] = 8.0
+
+    with pytest.raises(ValueError, match=r"fingerprint mismatch: factor: training=4\.0, rollout=8\.0"):
+        module._validate_yarn_consistency(args)
+
+
+@pytest.mark.unit
+def test_yarn_requires_both_training_and_rollout(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_yarn_args(position_embedding_type="rope")
+
+    with pytest.raises(ValueError, match="must be enabled on both training and rollout"):
+        module._validate_yarn_consistency(args)
+
+
+@pytest.mark.unit
+def test_yarn_requires_explicit_vllm_long_length_gate(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_yarn_args(vllm_allow_long_max_model_len=False)
+
+    with pytest.raises(ValueError, match="--vllm-allow-long-max-model-len"):
+        module._validate_yarn_consistency(args)
+
+
+@pytest.mark.unit
+def test_yarn_capacity_mismatch_is_rejected(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_yarn_args(vllm_max_model_len=270000)
+
+    with pytest.raises(ValueError, match="capacity mismatch"):
+        module._validate_yarn_consistency(args)
+
+
+@pytest.mark.unit
+def test_default_rope_does_not_require_yarn_rollout_fields(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+
+    module._validate_yarn_consistency(types.SimpleNamespace(position_embedding_type="rope"))
 
 
 if __name__ == "__main__":

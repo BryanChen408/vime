@@ -459,7 +459,7 @@ VLLM_ARGS=(
    --rollout-backend vllm
    --qwen-gdn-backend npu
    --model-name qwen3_5moeforconditionalgeneration
-   --vllm-hf-overrides '{"architectures":["Qwen3_5MoeForConditionalGeneration"]}'
+   --vllm-hf-overrides "${QWEN36_VLLM_HF_OVERRIDES}"
    --vllm-router-ip "${VLLM_ROUTER_IP}"
    --vllm-router-port "${VLLM_ROUTER_PORT}"
    --vllm-weight-sync-mode native
@@ -505,6 +505,7 @@ MISC_ARGS=(
 )
 
 # ─── 特性开关(默认全 OFF = baseline 逐位不变)───
+[ "${FEAT_YARN}" = "1" ] && VLLM_ARGS+=(--vllm-allow-long-max-model-len)
 [ "${FEAT_ASYNC_SCHED:-0}" = "1" ] && VLLM_ARGS+=(--vllm-async-scheduling)
 EP_ON=0
 # FEAT_CROSS_DP_EP=1:跨 DP EP —— DP(external-LB)+ EP 同开,EP world=dp×tp。vLLM 自动 flatten
@@ -576,7 +577,7 @@ if [ "${PROFILE_OP:-0}" = "1" ]; then
    VLLM_ARGS+=(--vllm-profiler-config "${_PROF_JSON}")
    echo "[profile-op] ON dir=${PROFILE_DIR} max_iters=${PROFILE_MAX_ITERS:-20} rpc_timeout=${VLLM_RPC_TIMEOUT}" >&2
 fi
-echo "[feat] rollout_mode=$([ "${FEAT_SYNC_ROLLOUT}" = "1" ] && echo sync || echo async) sync_factor=${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0} tis=$([ "${POLAR_DISABLE_TIS:-0}" = "1" ] && echo off || echo on) durable=${POLAR_POLICY_TRANSITION_ENABLED} mem_probe=${VIME_MEM_PROBE:-0} async_sched=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
+echo "[feat] rollout_mode=$([ "${FEAT_SYNC_ROLLOUT}" = "1" ] && echo sync || echo async) sync_factor=${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0} tis=$([ "${POLAR_DISABLE_TIS:-0}" = "1" ] && echo off || echo on) durable=${POLAR_POLICY_TRANSITION_ENABLED} yarn=${FEAT_YARN} mem_probe=${VIME_MEM_PROBE:-0} async_sched=${FEAT_ASYNC_SCHED:-0} flashcomm1=${FEAT_FLASHCOMM1:-0} ep=${EP_ON} prefix_cache=${FEAT_PREFIX_CACHE:-0} multistream=${FEAT_MULTISTREAM_SHARED_EXPERT:-0} static_kernel=${FEAT_STATIC_KERNEL:-0} hccl_aiv=${FEAT_HCCL_AIV:-0} lb_proxy=${FEAT_LB_PROXY:-0} dp_external_lb=${FEAT_DP_EXTERNAL_LB:-0} balance_sched=${FEAT_BALANCE_SCHED:-0} train_expandable=${FEAT_TRAIN_EXPANDABLE:-0} vllm_keep_expandable=${VIME_VLLM_KEEP_EXPANDABLE:-0} opt2=${FEAT_OPT2:-0} cross_dp_ep=${FEAT_CROSS_DP_EP:-0}"
 
 # ─── 清本节点 rollout 卡残留(只清 $ASCEND_RT_VISIBLE_DEVICES 钉的卡)───
 # 上个 run 异常结束后,vllm 栈(ray::VLLMEngine / vllm serve / EngineCore / Worker)

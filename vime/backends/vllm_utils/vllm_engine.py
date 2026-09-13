@@ -475,6 +475,8 @@ def build_vllm_subprocess_env(server_args: dict[str, Any]) -> dict[str, str]:
     env.setdefault("VLLM_SERVER_DEV_MODE", "1")
     if getattr(args, "vllm_enable_deterministic_inference", False):
         env["VLLM_BATCH_INVARIANT"] = "1"
+    if getattr(args, "vllm_allow_long_max_model_len", False):
+        env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
     if getattr(args, "colocate", False):
         import vime
 

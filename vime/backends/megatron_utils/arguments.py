@@ -1,4 +1,5 @@
 import ast
+import json
 import logging
 
 from megatron.training.arguments import parse_args as _megatron_parse_args
@@ -73,6 +74,7 @@ def validate_args(args):
     """Run megatron's own validate_args plus vime-specific megatron validations."""
 
     _megatron_validate_args(args)
+    _validate_yarn_consistency(args)
 
     # always use varlen
     args.variable_seq_lengths = True
@@ -88,6 +90,98 @@ def validate_args(args):
             "decoder_first_pipeline_num_layers and decoder_last_pipeline_num_layers should be None when "
             "pipeline_model_parallel_size is 1."
         )
+
+
+_YARN_FINGERPRINT_FIELDS = (
+    ("rope_theta", "rotary_base", 10_000.0),
+    ("partial_rotary_factor", "rotary_percent", 1.0),
+    ("factor", "rotary_scaling_factor", 1.0),
+    ("original_max_position_embeddings", "yarn_original_max_position_embeddings", 4096),
+    ("beta_fast", "yarn_beta_fast", 32.0),
+    ("beta_slow", "yarn_beta_slow", 1.0),
+    ("mscale", "mscale", 1.0),
+    ("mscale_all_dim", "mscale_all_dim", 0.0),
+    ("truncate", "yarn_correction_range_round_to_int", True),
+)
+
+
+def _resolved_training_yarn_fingerprint(args):
+    fingerprint = {"rope_type": getattr(args, "position_embedding_type", None)}
+    for rope_key, arg_name, default in _YARN_FINGERPRINT_FIELDS:
+        value = getattr(args, arg_name, None)
+        fingerprint[rope_key] = default if value is None else value
+    return fingerprint
+
+
+def _rollout_yarn_fingerprint(args):
+    overrides = getattr(args, "vllm_hf_overrides", None)
+    if isinstance(overrides, str):
+        try:
+            overrides = json.loads(overrides)
+        except json.JSONDecodeError as exc:
+            raise ValueError("--vllm-hf-overrides must be valid JSON when YaRN is enabled") from exc
+    if not isinstance(overrides, dict):
+        return None
+
+    text_config = overrides.get("text_config")
+    if not isinstance(text_config, dict):
+        return None
+    rope_parameters = text_config.get("rope_parameters")
+    if not isinstance(rope_parameters, dict):
+        return None
+    return rope_parameters
+
+
+def _validate_yarn_consistency(args):
+    """Fail before actor creation when training and rollout YaRN settings diverge."""
+    training = _resolved_training_yarn_fingerprint(args)
+    rollout = _rollout_yarn_fingerprint(args)
+    training_enabled = training["rope_type"] == "yarn"
+    rollout_enabled = rollout is not None and rollout.get("rope_type", rollout.get("type")) == "yarn"
+
+    if not training_enabled and not rollout_enabled:
+        return
+    if training_enabled != rollout_enabled:
+        raise ValueError(
+            "YaRN must be enabled on both training and rollout; "
+            f"training rope_type={training['rope_type']!r}, rollout rope_type="
+            f"{None if rollout is None else rollout.get('rope_type', rollout.get('type'))!r}"
+        )
+    if not getattr(args, "vllm_allow_long_max_model_len", False):
+        raise ValueError("YaRN rollout requires --vllm-allow-long-max-model-len")
+
+    missing = [key for key in training if key not in rollout]
+    if missing:
+        raise ValueError(f"YaRN rollout fingerprint is missing fields: {', '.join(missing)}")
+
+    mismatches = {
+        key: (training[key], rollout[key])
+        for key in training
+        if training[key] != rollout[key]
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}: training={training_value!r}, rollout={rollout_value!r}"
+            for key, (training_value, rollout_value) in mismatches.items()
+        )
+        raise ValueError(f"Training/rollout YaRN fingerprint mismatch: {details}")
+
+    capacities = {
+        "seq_length": getattr(args, "seq_length", None),
+        "max_position_embeddings": getattr(args, "max_position_embeddings", None),
+        "rollout_max_context_len": getattr(args, "rollout_max_context_len", None),
+        "vllm_max_model_len": getattr(args, "vllm_max_model_len", None),
+    }
+    if any(value is None for value in capacities.values()):
+        raise ValueError(f"YaRN requires explicit training/rollout capacity fields: {capacities}")
+    if len(set(capacities.values())) != 1:
+        raise ValueError(f"YaRN training/rollout capacity mismatch: {capacities}")
+
+    logger.info(
+        "Resolved matched YaRN fingerprint: %s; capacity: %s",
+        json.dumps(training, sort_keys=True),
+        json.dumps(capacities, sort_keys=True),
+    )
 
 
 def _hf_validate_args(args, hf_config):

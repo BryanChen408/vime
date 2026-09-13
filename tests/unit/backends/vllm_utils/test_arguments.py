@@ -198,6 +198,17 @@ def test_add_vllm_arguments_registers_disaggregation_backend(args_mod, monkeypat
 
 
 @pytest.mark.unit
+def test_add_vllm_arguments_registers_long_model_len_gate(args_mod, monkeypatch):
+    monkeypatch.setattr(args_mod.AsyncEngineArgs, "add_cli_args", lambda parser: parser)
+    parser = argparse.ArgumentParser(add_help=False)
+    args_mod.add_vllm_arguments(parser)
+
+    assert parser.parse_args([]).vllm_allow_long_max_model_len is False
+    assert parser.parse_args(["--vllm-allow-long-max-model-len"]).vllm_allow_long_max_model_len is True
+    assert "vllm_allow_long_max_model_len" in args_mod._VIME_ORCHESTRATION_DESTS
+
+
+@pytest.mark.unit
 def test_validate_args_records_pp_dp_but_no_global_tp(args_mod):
     # validate_args records pp/dp on the namespace but must not precompute a global TP, even when
     # pp>1 and dp>1. Per-engine TP = gpus_per_engine // (pp * dp) is resolved at launch time.

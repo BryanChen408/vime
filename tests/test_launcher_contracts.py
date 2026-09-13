@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -13,6 +14,7 @@ from vime.ray.resource_layout import load_resource_layout
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = REPO_ROOT / "scripts" / "run-qwen36-35b-polar-multi-pd.sh"
+MODEL_SCRIPT = REPO_ROOT / "scripts" / "models" / "qwen3.5-35B-A3B.sh"
 SYNC_HYBRID = REPO_ROOT / "scripts" / "start_sync_hybrid.sh"
 SYNC_SINGLE52 = REPO_ROOT / "scripts" / "start_sync_hybrid_single52.sh"
 SYNC_HOMO_SINGLE52 = REPO_ROOT / "scripts" / "start_sync_homo_single52.sh"
@@ -96,6 +98,28 @@ printf 'ok\\n'
 
 def _stdout_fields(result: subprocess.CompletedProcess[str]) -> dict[str, str]:
     return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+
+def _evaluate_yarn_model(*, enabled: str) -> subprocess.CompletedProcess[str]:
+    env = _shell_env()
+    for name in tuple(env):
+        if name == "FEAT_YARN" or name.startswith("YARN_"):
+            env.pop(name)
+    env["FEAT_YARN"] = enabled
+    script = """
+set -e
+source "$1"
+printf 'ARG=%s\n' "${MODEL_ARGS[@]}"
+printf 'HF_OVERRIDES=%s\n' "${QWEN36_VLLM_HF_OVERRIDES}"
+"""
+    return subprocess.run(
+        ["bash", "-c", script, "bash", str(MODEL_SCRIPT)],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def test_runner_is_shell_valid() -> None:
@@ -214,11 +238,55 @@ def test_single52_launchers_preserve_proven_sync_contracts() -> None:
     assert "resource_layout.single52_homo_colocate.yaml" in homo
 
 
-def test_launchers_do_not_reintroduce_online_mtp_or_yarn() -> None:
+def test_launchers_do_not_reintroduce_online_mtp_and_keep_yarn_opt_in() -> None:
     source = "\n".join(
         _source_text(path) for path in (RUNNER, SYNC_HYBRID, SYNC_SINGLE52, SYNC_HOMO_SINGLE52)
     )
-    assert re.search(r"(?i)\bmtp\b|yarn|rope_parameters", source) is None
+    assert re.search(r"(?i)\bmtp\b", source) is None
+    assert "FEAT_YARN=1" not in _source_text(SYNC_HYBRID)
+    assert "FEAT_YARN=1" not in _source_text(SYNC_SINGLE52)
+    assert "FEAT_YARN=1" not in _source_text(SYNC_HOMO_SINGLE52)
+
+
+def test_qwen36_model_defaults_to_standard_rope() -> None:
+    result = _evaluate_yarn_model(enabled="0")
+    assert result.returncode == 0, result.stderr
+    args = [line.removeprefix("ARG=") for line in result.stdout.splitlines() if line.startswith("ARG=")]
+    overrides = json.loads(_stdout_fields(result)["HF_OVERRIDES"])
+
+    assert args[args.index("--position-embedding-type") + 1] == "rope"
+    assert args[args.index("--rotary-percent") + 1] == "0.25"
+    assert not any("yarn" in arg.lower() for arg in args)
+    assert overrides == {"architectures": ["Qwen3_5MoeForConditionalGeneration"]}
+
+
+def test_qwen36_yarn_uses_one_fingerprint_for_training_and_rollout() -> None:
+    result = _evaluate_yarn_model(enabled="1")
+    assert result.returncode == 0, result.stderr
+    args = [line.removeprefix("ARG=") for line in result.stdout.splitlines() if line.startswith("ARG=")]
+    overrides = json.loads(_stdout_fields(result)["HF_OVERRIDES"])
+    rope = overrides["text_config"]["rope_parameters"]
+
+    assert args[args.index("--position-embedding-type") + 1] == rope["rope_type"] == "yarn"
+    assert float(args[args.index("--rotary-base") + 1]) == rope["rope_theta"] == 10000000
+    assert float(args[args.index("--rotary-percent") + 1]) == rope["partial_rotary_factor"] == 0.25
+    assert float(args[args.index("--rotary-scaling-factor") + 1]) == rope["factor"] == 4.0
+    assert (
+        int(args[args.index("--yarn-original-max-position-embeddings") + 1])
+        == rope["original_max_position_embeddings"]
+        == 262144
+    )
+    assert rope["truncate"] is True
+    assert "--yarn-correction-range-round-to-int" in args
+    assert '--vllm-hf-overrides "${QWEN36_VLLM_HF_OVERRIDES}"' in _source_text(RUNNER)
+    assert "--vllm-allow-long-max-model-len" in _source_text(RUNNER)
+
+
+def test_qwen36_yarn_rejects_invalid_boolean_gate() -> None:
+    result = _evaluate_yarn_model(enabled="invalid")
+
+    assert result.returncode != 0
+    assert "FEAT_YARN must be 0 or 1" in result.stderr
 
 
 @pytest.mark.parametrize(
