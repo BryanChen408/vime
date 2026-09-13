@@ -1,7 +1,7 @@
 # a3-pd 回迁特性真机分阶段验证记录
 
-状态：阶段性完成（Stage 6 durable bootstrap 已通过；完整 E2E 受 Polar gateway 后端配置阻塞）
-日期：2026-09-11--2026-09-12（容器时间；Polar run 目录使用宿主机时间）  
+状态：阶段性完成（Stage 6 durable 三轮闭环已通过；version-span 旁路存在非致命 502 噪声）
+日期：2026-09-11--2026-09-13（容器时间；Polar run 目录使用宿主机时间）  
 代码：`dev/a3pd-integrated`，基线 `bryan/a3-pd@b2503de2`，当前 HEAD `d31ea3b7`
 
 ## 1. 验证范围
@@ -31,7 +31,7 @@
 | 3 | 单机异构 engine-role 分流 | **通过** | actor/shared rollout `4-11`，dedicated rollout `12-15`；IPC/HCCL 双通路、role-selective sleep、两轮同步和 step 0 均完成，见 §6 |
 | 4 | 部分共卡跨节点 | 外部资源阻塞 | `.64` Polar gateway 当前有 12 个实例/64 个运行中 session，SSH 无凭据，不能安全复用为第二训练节点；见 §7 |
 | 5 | sync factor=1.25/1.5 | **通过** | factor=1.5 disaggregated canary 完成 cancel/requeue、训练 step 和最终同步，见 §8 |
-| 6 | durable transition 三个 policy version | 部分通过/外部配置阻塞 | 重启后 durable bootstrap API 已上线并成功提交；完整 rollout 被 Polar gateway 后端 `.56:8011` 不可达阻塞，见 §9.1 |
+| 6 | durable transition 三个 policy version | **通过（旁路有告警）** | Polar profile 恢复并重启后，bootstrap、`0→1→2→3` transition、三轮 rollout/train 和最终同步均完成；旧 `policy_version` 旁路调用返回 502，但不影响 durable 控制面，见 §9.3 |
 | 7 | `VIME_MEM_PROBE=1` 至少两个完整 step | **通过** | 两个 sync rollout、两个 train step、三次 policy version 推进和显存 handoff probe 完成，见 §10 |
 
 ## 3. 阶段 0：初始环境快照
@@ -378,6 +378,43 @@ ROLLOUT_BATCH_SIZE=1, N_SAMPLES_PER_PROMPT=1, GLOBAL_BATCH_SIZE=1, NUM_ROLLOUT=1
   error type、paths、Stop guard 定向回归结果为 **45 passed**。
 - 当前宿主 Polar 进程是在 stash 恢复前启动的，仍需再次重启以加载恢复后的 profile；因此本节只把
   Stage 6 的外部配置阻塞改判为“已修正、待进程重载”，不提前宣称三版本 durable 全链路通过。
+
+### 9.3 profile 重载后的 durable 三轮回归（2026-09-13 02:54--03:30 UTC）
+
+- 用户重启 Polar 后，最新有效拓扑为
+  `/home/c00937190/polar/output/ascend_operator/runs/polar_20260913_024611/run_artifacts/effective_topology.yaml`：
+  rollout `http://80.48.5.52:8180`、gateway `http://80.48.5.52:8200`、inference
+  `http://80.48.5.52:8001`，Polar lease pool `0,1,2,3`，模型 alias
+  `/home/docker/Qwen3.6-35B-A3B`，`max_turns=5`。与 VIME 本轮 actor `4-11`、rollout `12-15`
+  的布局一致；三个 health endpoint 在 router 启动后均正常。
+- 运行日志：`/mnt/pipeline-data/train_log/train_a3pd_stage6_durable_retest_20260913b.log`；
+  Ray 临时目录 `/tmp/ray_s6d13`；命令使用 `FEAT_SYNC_ROLLOUT=1`、`FEAT_OFFLOAD=1`、
+  `POLAR_POLICY_TRANSITION_ENABLED=1`、`CP=4`、`EP=8`、`NUM_ROLLOUT=3`，disaggregated
+  actor `4-11` + 两个 TP2 rollout engine（`12-13`、`14-15`）。进程最终 `runner_exit=0`。
+- 首轮启动与 durable bootstrap 完整通过：8 个 actor rank 加入 HCCL，两个 engine 完成
+  `init_weight_transfer_engine`；首轮 `254/254` fragment 更新成功，bootstrap transition 为
+  `phase=serving`、`verified_policy_epoch=0`、engine versions `1/1`、`engine_abort_confirmed=true`。
+- 三个 rollout/train 周期均完成：
+  `rollout 0/1/2` 分别收集 `4/4` groups，`submitted=4`、`rejected=0`、success rate `1.0`；
+  每轮均在切换前 abort in-flight generation、切换后恢复服务。训练 step `0/1/2` 指标均为有限值，
+  `train/tis` 分别为 `1.000257`、`0.999925`、`0.999999`，无 NaN/OOM；显存 handoff 的
+  offload/onload 在三轮中持续成功。
+- durable policy transition 连续提交并验证：
+  `update 0→1`（engine `1→2`）、`1→2`（`2→3`）、`2→3`（`3→4`），每次均为
+  `phase=serving`、`verified_policy_epoch` 与目标 epoch 相同、`inflight=0`、
+  `all_acknowledged=true`、`all_fenced=true`、`engine_abort_confirmed=true`，gateway base URL
+  始终为 `.52:8001`。这正面覆盖了原先因 `.56:8011` 配置阻塞而缺失的三版本闭环。
+- 每次 weight-sync 后仍有一条 `version_span.py` 的 best-effort 旁路调用：
+  `POST /rollout/admin/policy_version?version=2/3/4` 返回 `502 Bad Gateway`。该调用在
+  `update_weight_from_distributed.py` 中只记录 warning 并继续 `resume`；随后 durable transition
+  通过其自身 gateway 控制 API 提交并验证，下一轮 rollout 全部成功。因此它是兼容旧 guard 的
+  非致命噪声，不改变本次 durable 主路径通过结论；若要消除日志噪声，后续应让 version-span
+  旁路识别 durable 控制面或由 Polar rollout server 提供兼容的 `policy_version` fan-out 响应。
+- 运行结束后 VIME/Ray/vLLM 进程正常退出，Polar 未被停止或重启；模型训练 checkpoint/debug
+  rollout/train 产物均保留在运行目录，未纳入 Git。
+- 判定：**Stage 6 durable 三轮 policy transition + rollout + train 闭环通过**。剩余工作仅为
+  version-span 旁路 502 的接口收敛/降噪，以及真正启用 YaRN 后的独立长上下文验证；不再是当前
+  拓扑或 durable 控制面阻塞。
 
 ## 10. 阶段 7：连续 step 显存 probe
 
