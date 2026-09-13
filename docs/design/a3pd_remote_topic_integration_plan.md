@@ -308,6 +308,21 @@ sync 使用同一模块的 policy hook 是既有设计，不应为了隔离而�
 “先保留”表示以远端为基线不擅自回退，并不表示这些值已由代码合并证明正确。最终真机任务启动前
 应输出配置 fingerprint，由实验 owner 确认。
 
+#### 已知遗留：稀疏物理卡布局 padding
+
+`49bf6cc8` 修改 `_build_layout_bundles`，按每个节点 YAML 中最大的物理卡号补齐
+`0..max_device` bundle。其出发点是假定 Ray 会把 placement group 内 12 个稀疏设备压缩编号为
+`0..11`；但 `dev/sync-rollout` 的 2026-08-28 T4 实机日志与该假定冲突：launcher 以
+`NPUS_PER_NODE=12`、`ASCEND_RT_VISIBLE_DEVICES=4..15` 启动 Ray，12-bundle placement group
+实际探测并成功映射了物理卡 `4..15`，随后越过 placement、拉起全部 rollout engine 和训练 actor，
+直到权重同步阶段才暴露另一个协议问题。
+
+当前先保留 `49bf6cc8`，不在本轮完整性修复中改共享 placement 代码，也不通过把 single52
+launcher 改成 16 卡或修改 Polar 卡池掩盖矛盾。因此异构 single52 真机回归暂时受此遗留阻塞：
+现实现会为 YAML 最大卡号 15 申请 16 个 bundle，而恢复后的已验证 launcher 只向 Ray 注册 12 卡。
+后续应单独复现实机的 Ray 设备编号语义，再定点撤销 padding 或实现兼容映射；验收必须保持
+sync launcher 的 `12 + 4..15` 外部契约不变。
+
 ### 3.7 远端运行产物和配置清理
 
 #### 运行产物
