@@ -123,14 +123,140 @@ def main():
     if role == "P":
         if os.environ.get("PROBE_MODE") == "nosleep_dual":
             run_producer_nosleep(engine, session, coord_dir)
+        elif os.environ.get("PROBE_MODE") == "alias":
+            run_producer_alias(engine, session, coord_dir)
         else:
             run_producer(engine, session, npu_id, coord_dir)
     else:
         if os.environ.get("PROBE_MODE") == "nosleep_dual":
             run_consumer_nosleep(engine, session, coord_dir)
+        elif os.environ.get("PROBE_MODE") == "alias":
+            run_consumer_alias(engine, session, coord_dir)
         else:
             run_consumer(engine, session, npu_id, coord_dir)
     return 0
+
+
+def _alias_lib():
+    """ctypes bindings for the ACL VMM functions used to alias-map a CaMem
+    physical handle onto a second (fresh) virtual address."""
+    import ctypes
+
+    lib = ctypes.CDLL("libascendcl.so")
+    lib.aclrtReserveMemAddress.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_ulonglong,
+    ]
+    lib.aclrtReserveMemAddress.restype = ctypes.c_int
+    lib.aclrtMapMem.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint64, ctypes.c_ulonglong]
+    lib.aclrtMapMem.restype = ctypes.c_int
+    lib.aclrtUnmapMem.argtypes = [ctypes.c_void_p]
+    lib.aclrtUnmapMem.restype = ctypes.c_int
+    return lib, ctypes
+
+
+def alias_map(lib, ct, p_mem_handle, size):
+    """Reserve a fresh VA and map it to the physical handle stored at
+    p_mem_handle (the C-level aclrtDrvMemHandle* owned by CaMem)."""
+    handle = ct.c_uint64.from_address(p_mem_handle).value
+    alias = ct.c_void_p()
+    ret = lib.aclrtReserveMemAddress(ct.byref(alias), size, 0, None, 0)
+    assert ret == 0, f"aclrtReserveMemAddress(alias) failed ret={ret}"
+    ret = lib.aclrtMapMem(alias.value, size, 0, handle, 0)
+    assert ret == 0, f"aclrtMapMem(alias) failed ret={ret}"
+    return alias.value
+
+
+def run_producer_alias(engine, session, coord_dir):
+    """Alias-VA design validation (RoCE path):
+    phase0: alias-map the pool tensor's physical handle to a fresh VA,
+            register the ALIAS, D reads it -> proves alias + registration work.
+    phase1: unregister+unmap alias, CaMem sleep/wake (new physical pages at
+            the SAME compute VA), map a NEW alias VA to the new handle,
+            register it, fill new pattern via compute VA -> D reads the new
+            alias and must see the new pattern.  This is the root fix.
+    """
+    import torch
+
+    alloc, kv = make_kv_tensor("kv")
+    va = kv.data_ptr()
+    handle4 = alloc.pointer_to_data[va].handle  # (device, alignedSize, d_mem, p_memHandle)
+    size = handle4[1]
+    lib, ct = _alias_lib()
+
+    alias1 = alias_map(lib, ct, handle4[3], size)
+    kv.fill_(PATTERN["phase0"])
+    torch.npu.synchronize()
+    ret = engine.register_memory(alias1, size)
+    assert ret == 0, f"register alias failed ret={ret}"
+    record(coord_dir, "P", "alias_phase0", compute_va=hex(va), alias_va=hex(alias1), size=size)
+    publish(coord_dir, "p_session", {"session": session, "va": alias1, "size": size})
+    publish(coord_dir, "p_phase0", {"pattern": PATTERN["phase0"]})
+    wait_for(coord_dir, "d_phase0")
+
+    # ---- sleep/wake with alias rotation ----
+    ret = engine.unregister_memory(alias1)
+    log("P", f"unregister alias1 ret={ret}")
+    ret = lib.aclrtUnmapMem(alias1)
+    assert ret == 0, f"aclrtUnmapMem(alias1) failed ret={ret}"
+    camem_sleep_wake(alloc)  # unmap primary + free physical; wake: NEW handle mapped at same VA
+    assert kv.data_ptr() == va
+    kv.fill_(PATTERN["phase1"])
+    torch.npu.synchronize()
+    selfcheck = int(kv[: 1024 * 1024].sum().item()) == PATTERN["phase1"] * 1024 * 1024
+    alias2 = alias_map(lib, ct, handle4[3], size)
+    assert alias2 != alias1, "alias VA must be fresh (old one is NIC-poisoned)"
+    ret = engine.register_memory(alias2, size)
+    assert ret == 0, f"register alias2 failed ret={ret}"
+    record(
+        coord_dir,
+        "P",
+        "alias_phase1",
+        alias2=hex(alias2),
+        alias1=hex(alias1),
+        alias_fresh=alias2 != alias1,
+        selfcheck_ok=selfcheck,
+    )
+    publish(coord_dir, "p_phase1", {"va": alias2, "pattern": PATTERN["phase1"]})
+    wait_for(coord_dir, "d_phase1")
+    log("P", "alias mode done")
+
+
+def run_consumer_alias(engine, session, coord_dir):
+    import torch
+
+    _alloc, recv = make_kv_tensor("recv")
+    ret = engine.register_memory(recv.data_ptr(), SIZE)
+    assert ret == 0, f"D register failed ret={ret}"
+
+    info = wait_for(coord_dir, "p_session")
+    p_session, p_alias = info["session"], info["va"]
+
+    wait_for(coord_dir, "p_phase0")
+    recv.zero_()
+    ret, n = read_remote(engine, p_session, p_alias, recv)
+    cls = classify(recv[:n], PATTERN["phase0"])
+    record(coord_dir, "D", "alias_phase0_baseline", transfer_ret=ret, **cls)
+    publish(coord_dir, "d_phase0", {})
+
+    p1 = wait_for(coord_dir, "p_phase1")
+    # fresh engine -> drops cached segment descriptor (which holds alias1)
+    from mooncake.engine import TransferEngine
+
+    engine2 = TransferEngine()
+    ret = engine2.initialize(sys.argv[3], "P2PHANDSHAKE", "ascend", "")
+    assert ret == 0, f"D engine2 init failed ret={ret}"
+    ret = engine2.register_memory(recv.data_ptr(), SIZE)
+    assert ret == 0
+    recv.zero_()
+    ret, n = read_remote(engine2, p_session, p1["va"], recv)
+    cls = classify(recv[:n], PATTERN["phase1"])
+    record(coord_dir, "D", "alias_phase1_post_wake", transfer_ret=ret, **cls)
+    publish(coord_dir, "d_phase1", {})
+    log("D", "alias mode done")
 
 
 def run_producer_nosleep(engine, session, coord_dir):

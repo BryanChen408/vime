@@ -1,7 +1,7 @@
 # PD 分离 sleep/wake KV 传输失效(根因 B)修复设计方案
 
 日期:2026-09-12
-状态:方案A已实现(vllm-ascend-023@pr-11976 commit 7ec3f98e),待 E2E 验证
+状态:**方案A已被断链+重注册取代(2026-09-13)**;最终实现见 §2A,已提交待 E2E
 关联文档:`pd_sync_precision_handoff_20260911.md`(整体问题背景)、`pd_sync_debug_handoff_20260910.md`(完整调试史)
 探针脚本:`tools/mooncake_sleep_wake_probe.py`(本仓库)
 
@@ -106,16 +106,19 @@ wake_up(改造):
 
 **vime(编排侧,三行量级):** 启动脚本/YAML 透传 `VIME_PD_FRESH_VA_ON_WAKE`;sleep/wake 编排不变;验证探针(`VIME_PD_SLEEP_WAKE_RELOAD_DIAG`、`VIME_PD_KV_XFER_HASH`)现成复用。
 
-### 2.3.1 VA 换新机制(2026-09-12 已验证定稿)
+### 2.3.1 最终根因与修复(2026-09-13 裸ADXL探针定稿,取代 fresh-VA 路线)
 
-~~候选 a(drop 引用自动释放 VA)~~ **已证伪**:CaMem 池从不在运行期调 my_free(`pointer_to_data` 只增不减,empty_cache 对池无效);且 my_free 内部是 unmap+freePhysical+releaseVA 三连,对已解映射 VA 二次 unmap 会崩——所以既不能靠 drop 引用释放 VA,也**绝不能**让已遗忘的张量走到 my_free。
+**关键转折**:裸 ADXL 复现(绕过 Mooncake 全部层级,`tools/adxl_raw_remap_probe.cc`)证明——同 VA 的"断链→注销→remap→重注册"在裸 ADXL 层**完全正确**(P/D 双侧 phase 全过)。之前所有"同 VA 刷新无效"的结论是 Mooncake 层造成的假象:
 
-**定稿:遗忘式(sleep 遗忘 + wake 新池)**,探针 `/tmp/va_forget_probe.py` 两周期验证 PASS(每轮全新 VA、无崩溃、新张量可写):
-- sleep:connector 注销 KV 区域 → `allocator.sleep()` 照常 unmap+freePhysical(KV 物理页真释放)→ **把 KV 条目从 `allocator.pointer_to_data` 摘除**(CaMem 遗忘:防止 wake remap 旧 VA、防止下轮 sleep 二次 unmap)→ (可选)ctypes 调 `aclrtReleaseMemAddress(va)` 回收 VA 预留,消除每轮 VA 泄漏;
-- wake:`allocator.wake_up()` 只对剩余条目(weights)remap → **新开 `use_memory_pool("kv_cache")` 上下文重跑 `model_runner.initialize_kv_cache(kv_cache_config)`**——一次调用完成新 VA 分配 + attention backend 重建 + 引用重绑 + connector 注册(与 init 同路径同顺序,索引配对不变式天然满足)→ 旧池对象存入全局列表永不析构(防 my_free 二次 unmap);
-- 图:`CUDAGraphWrapper.clear_all_graphs()` + `capture_model()`。
+> **真根因**:连接活跃时 ADXL `DeregisterMem` 返回 `PARAM_INVALID`(注册被连接 pin 住),而 Mooncake `AscendDirectTransport::unregisterLocalMemory` 用 `(void)` 吞掉该错误 → 解注册从未生效 → 重注册同 VA 被去重 → 陈旧绑定永久存活 → wake 后传输投旧页/全零。
 
-**开关语义**:`VIME_PD_FRESH_VA_ON_WAKE=1` 开新路径;默认关;与 `VIME_KV_SLEEP_PERSISTENT=1`(现 workaround)**互斥,同开即 assert**。另注意:P 引擎 prefill 不走 FULL_DECODE_ONLY 的 decode 图,图重捕获成本集中在 D 侧。
+**最终修复(断链版,已实现 vllm-ascend-023@1bcb4a4b)**:
+- `worker.sleep(level=2)`:`global_te.unregister_all()`(带重试,持续失败 raise——静默失败正是本 bug 温床);
+- `worker.wake_up(kv_cache)`:`global_te.register_saved_regions()`(同 VA 重注册,绑到新物理页);
+- 开关 `VIME_PD_KV_REREGISTER_ON_WAKE`(默认关,与 sleep-persistent 互斥);
+- 前提:sleep 时无活跃连接 → 变体 S:`ASCEND_USE_SHORT_CONNECTION=1`(零 Mooncake 改动,每传输建链开销 25~90ms 待实测);变体 P(后备):Mooncake 补丁暴露 `disconnect_all` + 修 `(void)` 吞错误,需重编译,保长连接性能。
+
+**被取代的路线存档**:fresh-VA + 重捕获(commit 7ec3f98e,git 历史保留)——放弃原因:打破 vLLM sleep 模式"VA 稳定"核心不变式,重捕获路径连续踩 5 个框架一次性假设(编译产物持旧对象/builder 缓冲区池内分配/图参数单例等),收敛不可控。别名 VA 方案被探针证伪(ADXL 不支持别名 VA 传输,基线 503900)。
 
 ### 2.3.2 影响面复核(2026-09-12 评审)
 
