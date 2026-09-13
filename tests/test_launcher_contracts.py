@@ -15,6 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = REPO_ROOT / "scripts" / "run-qwen36-35b-polar-multi-pd.sh"
 SYNC_HYBRID = REPO_ROOT / "scripts" / "start_sync_hybrid.sh"
 SYNC_SINGLE52 = REPO_ROOT / "scripts" / "start_sync_hybrid_single52.sh"
+SYNC_HOMO_SINGLE52 = REPO_ROOT / "scripts" / "start_sync_homo_single52.sh"
 
 
 def _source_text(path: Path) -> str:
@@ -190,16 +191,33 @@ def test_sync_launcher_pins_sync_durable_and_probe_contract() -> None:
         assert async_only not in source
 
 
-def test_single52_launcher_uses_local_layout_and_explicit_sync() -> None:
-    source = _source_text(SYNC_SINGLE52)
-    assert "resource_layout.single52_hybrid_colocate.yaml" in source
-    assert 'FEAT_SYNC_ROLLOUT="${FEAT_SYNC_ROLLOUT:-1}"' in source
-    assert 'POLAR_SYNC_OVERSUBSCRIBE_FACTOR="${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0}"' in source
-    assert 'VIME_MEM_PROBE="${VIME_MEM_PROBE:-1}"' in source
+def test_single52_launchers_preserve_proven_sync_contracts() -> None:
+    hybrid = _source_text(SYNC_SINGLE52)
+    homo = _source_text(SYNC_HOMO_SINGLE52)
+
+    for path, source in ((SYNC_SINGLE52, hybrid), (SYNC_HOMO_SINGLE52, homo)):
+        result = subprocess.run(["bash", "-n", str(path)], text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stderr
+        assert "FEAT_SYNC_ROLLOUT=1" in source
+        assert "VIME_MEM_PROBE=1" in source
+        assert "FEAT_TRAIN_EXPANDABLE=1" in source
+        assert "VIME_EMPTY_CACHE_PER_STEP=1" in source
+        assert "POLAR_TRAJECTORY_PG_FLOOR=0.05" in source
+        assert "HCCL_INTER_HCCS_DISABLE=false" in source
+        assert "OPERATOR_DATA_ROOT=/home/docker/datasets/op_tasks/op_assets_cudallm_filtered189" in source
+
+    assert "ASCEND_RT_VISIBLE_DEVICES=4,5,6,7,8,9,10,11,12,13,14,15" in hybrid
+    assert "NNODES=1  NPUS_PER_NODE=12" in hybrid
+    assert "RESOURCE_LAYOUT=/workspace/vime/scripts/resource_layout.single52_hybrid_colocate.yaml" in hybrid
+    assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15" in homo
+    assert "NNODES=1  NPUS_PER_NODE=16" in homo
+    assert "resource_layout.single52_homo_colocate.yaml" in homo
 
 
 def test_launchers_do_not_reintroduce_online_mtp_or_yarn() -> None:
-    source = "\n".join(_source_text(path) for path in (RUNNER, SYNC_HYBRID, SYNC_SINGLE52))
+    source = "\n".join(
+        _source_text(path) for path in (RUNNER, SYNC_HYBRID, SYNC_SINGLE52, SYNC_HOMO_SINGLE52)
+    )
     assert re.search(r"(?i)\bmtp\b|yarn|rope_parameters", source) is None
 
 
