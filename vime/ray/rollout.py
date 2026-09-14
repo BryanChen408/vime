@@ -1,10 +1,12 @@
 import dataclasses
+import json
 import importlib
 import itertools
 import logging
 import multiprocessing
 import random
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -464,6 +466,161 @@ class RolloutServer:
         return payload
 
 
+def _first_divergence_index(a: list[int] | None, b: list[int] | None) -> int | None:
+    """Index of the first position where two token-id lists differ (None if equal)."""
+    if a is None or b is None:
+        return None
+    for index, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return index
+    if len(a) != len(b):
+        return min(len(a), len(b))
+    return None
+
+
+def _analyze_direct_vs_pd(direct_body: dict[str, Any], pd_body: dict[str, Any]) -> dict[str, Any]:
+    """Compare same-nonce direct (no Mooncake) outputs with P->D handoff outputs.
+
+    Both probe modes used the same prompt, sampling parameters and cache salt
+    in the same weight version.  Greedy decoding makes cross-engine kernel
+    jitter possible but rare, so we report the first divergence position per
+    pair instead of bare hash equality:
+
+    - direct outputs consistent across engines AND P->D outputs match them ⇒
+      both weight reload and the KV handoff are healthy at probe scale;
+    - direct healthy but P->D diverges early ⇒ the Mooncake KV/session path is
+      the corruption boundary;
+    - direct already garbage on one role ⇒ that role's reloaded model state is
+      broken before any KV transfer happens.
+    """
+    direct_results = direct_body.get("results") if isinstance(direct_body, dict) else None
+    pd_results = pd_body.get("results") if isinstance(pd_body, dict) else None
+    direct_by_engine: dict[tuple[str, int], dict[str, Any]] = {}
+    for result in direct_results or []:
+        role = result.get("engine_role")
+        index = result.get("engine_index")
+        if role is not None and index is not None:
+            direct_by_engine[(str(role), int(index))] = result
+
+    direct_hashes = sorted({result.get("output_sha256") for result in direct_by_engine.values()})
+    direct_consistent = bool(direct_hashes) and len(direct_hashes) == 1
+
+    per_pair: dict[str, Any] = {}
+    pair_hashes = sorted({result.get("output_sha256") for result in pd_results or []})
+    for pair in pd_results or []:
+        decode_index = pair.get("decode_index")
+        prefill_index = pair.get("prefill_index")
+        direct = direct_by_engine.get(("decode", int(decode_index))) if decode_index is not None else None
+        if direct is None:
+            continue
+        divergence = _first_divergence_index(
+            direct.get("output_token_ids"),
+            pair.get("output_token_ids"),
+        )
+        per_pair[f"{prefill_index}:{decode_index}"] = {
+            "direct_sha256": direct.get("output_sha256"),
+            "pair_sha256": pair.get("output_sha256"),
+            "first_divergence": divergence,
+            "direct_first_ids": (direct.get("output_token_ids") or [])[:8],
+            "pair_first_ids": (pair.get("output_token_ids") or [])[:8],
+            "prefill_first_ids": (pair.get("prefill_token_ids") or [])[:8],
+            "direct_token_count": direct.get("output_token_count"),
+            "pair_token_count": pair.get("output_token_count"),
+        }
+
+    matches = [
+        entry["direct_sha256"] == entry["pair_sha256"]
+        for entry in per_pair.values()
+        if entry["direct_sha256"] and entry["pair_sha256"]
+    ]
+    direct_matches_pd = bool(matches) and all(matches) and direct_consistent
+    divergences = [entry["first_divergence"] for entry in per_pair.values() if entry["first_divergence"] is not None]
+    return {
+        "direct_consistent": direct_consistent if direct_hashes else None,
+        "pd_pairs_consistent": pd_body.get("outputs_consistent") if isinstance(pd_body, dict) else None,
+        "direct_matches_pd": direct_matches_pd if matches else None,
+        "direct_distinct_hashes": len(direct_hashes),
+        "pd_distinct_hashes": len(pair_hashes),
+        "first_divergence": min(divergences) if divergences else None,
+        "per_pair": per_pair,
+    }
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+
+def _pd_revalidate_direct_vs_pd(
+    router_ip: str,
+    router_port: int,
+    *,
+    cycle: str,
+    policy_version: int | str,
+    timeout: float,
+    log_tag: str,
+    probe_tokens: int | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run the direct (no-Mooncake) control and the P->D revalidation back to back.
+
+    Both modes share one probe nonce → identical prompt + cache_salt, same
+    weight version ⇒ the only legal output comparison in this system.  The
+    direct control is best-effort: a kv_producer engine that refuses local
+    serving must not abort the run, since the decode-side direct results
+    alone still bound the boundary.  The P->D half stays fatal on transport
+    failure — that is the path production traffic depends on.
+    """
+    import httpx
+
+    host = _wrap_ipv6(str(router_ip).strip("[]"))
+    url = f"http://{host}:{router_port}/vime/pd-revalidate"
+    probe_nonce = f"{cycle}-{policy_version}-{uuid.uuid4()}"
+    logger.info(
+        "%s start cycle=%s policy_version=%s url=%s timeout=%ss nonce=%s",
+        log_tag,
+        cycle,
+        policy_version,
+        url,
+        timeout,
+        probe_nonce,
+    )
+
+    def _post_revalidate(client: httpx.Client, mode: str) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "cycle": str(cycle),
+            "policy_version": policy_version,
+            "probe_nonce": probe_nonce,
+            "mode": mode,
+        }
+        if probe_tokens is not None:
+            body["probe_tokens"] = probe_tokens
+        response = client.post(url, json=body)
+        try:
+            response_body = response.json()
+        except Exception:
+            response_body = {"raw": response.text[:1000]}
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Mooncake PD revalidate mode={mode} failed HTTP "
+                f"{response.status_code}: {response_body}"
+            )
+        if not isinstance(response_body, dict) or response_body.get("ok") is not True:
+            raise RuntimeError(
+                f"Mooncake PD revalidate mode={mode} returned invalid result: {response_body}"
+            )
+        return response_body
+
+    with httpx.Client(timeout=timeout, trust_env=False) as client:
+        try:
+            direct_body = _post_revalidate(client, "direct")
+        except Exception as exc:
+            logger.warning("%s direct control unavailable cycle=%s error=%s", log_tag, cycle, exc)
+            direct_body = {"ok": False, "mode": "direct", "error": str(exc), "results": []}
+        pd_body = _post_revalidate(client, "pd")
+    return direct_body, pd_body
+
+
+
 @ray.remote
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
@@ -528,6 +685,87 @@ class RolloutManager:
         if srv is None or srv.router_ip is None or srv.prometheus_port is None:
             return None
         return f"http://{srv.router_ip}:{srv.prometheus_port}/metrics"
+
+    def post_wake_pd_probe(self, policy_version: int, cycle: str) -> dict[str, Any]:
+        """Revalidate every Mooncake P->D pair after KV wake.
+
+        ``/ready`` only proves the proxy's startup preflight.  This control call is
+        used by the synchronous colocated E2E path after each level-2 wake, while
+        Polar admission is still closed, so a failed remote-KV transfer aborts the
+        policy boundary instead of becoming a later empty rollout.
+        """
+        import os
+
+        srv = self._get_updatable_server()
+        if srv is None or srv.router_ip is None or srv.router_port is None:
+            raise RuntimeError("PD post-wake probe requires an updatable server with a router address")
+
+        worker_types = {group.worker_type for group in srv.server_groups}
+        if not {"prefill", "decode"}.issubset(worker_types):
+            raise RuntimeError(
+                "PD post-wake probe requested, but the updatable server has no prefill/decode groups: "
+                f"{sorted(worker_types)}"
+            )
+        if str(getattr(self.args, "disaggregation_backend", "")).lower() != "mooncake":
+            raise RuntimeError(
+                "PD post-wake probe is only valid with --disaggregation-backend mooncake"
+            )
+
+        engines = [engine for engine in srv.engines if engine is not None]
+        weight_versions = ray.get([engine.get_weight_version.remote() for engine in engines])
+        if not engines or any(version is None for version in weight_versions) or len(set(weight_versions)) != 1:
+            raise RuntimeError(
+                "PD post-wake probe found inconsistent engine weight versions: "
+                f"{weight_versions!r} (engines={len(engines)})"
+            )
+        logger.info(
+            "PD-POST-WAKE-PROBE weight versions consistent cycle=%s policy_version=%s "
+            "engines=%s version=%s",
+            cycle,
+            policy_version,
+            len(engines),
+            weight_versions[0],
+        )
+
+        timeout = float(os.environ.get("VIME_PD_POST_WAKE_PROBE_TIMEOUT", "180"))
+        direct_body, response_body = _pd_revalidate_direct_vs_pd(
+            srv.router_ip,
+            srv.router_port,
+            cycle=str(cycle),
+            policy_version=policy_version,
+            timeout=timeout,
+            log_tag="PD-POST-WAKE-PROBE",
+        )
+
+        direct_vs_pd = _analyze_direct_vs_pd(direct_body, response_body)
+        logger.info(
+            "PD-POST-WAKE-PROBE pass cycle=%s policy_version=%s pairs=%s/%s "
+            "outputs_consistent=%s direct_consistent=%s direct_matches_pd=%s "
+            "first_divergence=%s",
+            cycle,
+            policy_version,
+            response_body.get("passed_results"),
+            response_body.get("expected_results"),
+            response_body.get("outputs_consistent"),
+            direct_vs_pd.get("direct_consistent"),
+            direct_vs_pd.get("direct_matches_pd"),
+            direct_vs_pd.get("first_divergence"),
+        )
+        if (
+            response_body.get("outputs_consistent") is not True
+            or direct_vs_pd.get("direct_matches_pd") is not True
+        ):
+            logger.warning(
+                "PD-POST-WAKE-PROBE boundary evidence cycle=%s direct_vs_pd=%s",
+                cycle,
+                json.dumps(direct_vs_pd, ensure_ascii=True, sort_keys=True),
+            )
+        response_body["engine_count"] = len(engines)
+        response_body["weight_versions"] = [str(version) for version in weight_versions]
+        response_body["direct_probe"] = direct_body
+        response_body["direct_vs_pd"] = direct_vs_pd
+        return response_body
+
 
     def get_metrics_router_addr(self) -> str | None:
         """Public wrapper for remote calls from the driver process."""

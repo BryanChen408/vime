@@ -1,4 +1,5 @@
 import logging
+import os
 
 import ray
 
@@ -21,13 +22,24 @@ def _prepare_rollout_memory_handoff(args, actor_model, rollout_manager, tag) -> 
     actor_model.probe_memory(f"{tag} after onload_weights")
 
 
-def _finish_rollout_memory_handoff(args, actor_model, rollout_manager, tag) -> None:
+def _finish_rollout_memory_handoff(args, actor_model, rollout_manager, tag, policy_version=None) -> None:
     """Restore rollout KV first, then return trainer allocators to train mode."""
     if not args.offload_rollout:
         return
     ray.get(rollout_manager.onload_kv.remote())
     # Read while the handoff allocator policy is still active.
     actor_model.probe_memory(f"{tag} after onload_kv")
+    if os.environ.get("VIME_PD_POST_WAKE_PROBE", "0") == "1":
+        # Mooncake PD only: after each level-2 wake, revalidate every P->D pair
+        # while Polar admission is still closed; a stale KV handoff aborts the
+        # policy boundary instead of becoming a later garbage rollout.
+        logger.info("Running Mooncake PD post-wake probe cycle=%s", tag)
+        ray.get(
+            rollout_manager.post_wake_pd_probe.remote(
+                policy_version=policy_version if policy_version is not None else tag,
+                cycle=tag,
+            )
+        )
     actor_model.finish_memory_handoff()
 
 
@@ -95,6 +107,7 @@ def train(args):
             actor_model,
             rollout_manager,
             "startup",
+            policy_version=args.start_rollout_id,
         )
 
         if durable_polar_boundary:
@@ -218,6 +231,7 @@ def train(args):
                     actor_model,
                     rollout_manager,
                     f"rollout {rollout_id}",
+                    policy_version=next_policy_version,
                 )
                 # Resume only after train, weight sync, KV restore, and an all-engine
                 # weight-version proof succeeded.
