@@ -1,0 +1,1106 @@
+diff --git a/vllm_ascend/ascend_config.py b/vllm_ascend/ascend_config.py
+index 4c2a5fcf..2d7ee55c 100644
+--- a/vllm_ascend/ascend_config.py
++++ b/vllm_ascend/ascend_config.py
+@@ -928,6 +928,11 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
+ 
+ def init_ascend_config(vllm_config):
+     additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
++    logger.warning(
++        "[ADDCFG-ENGINE] additional_config_keys=%s recompute_scheduler_enable=%s",
++        sorted(additional_config.keys()),
++        additional_config.get("recompute_scheduler_enable", False),
++    )
+     refresh = additional_config.get("refresh", False) if additional_config else False
+     global _ASCEND_CONFIG
+     if (
+diff --git a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+index d4d83633..198257f2 100644
+--- a/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
++++ b/vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py
+@@ -142,6 +142,111 @@ class GroupTransferInfo:
+     is_state_group: bool
+ 
+ 
++_KV_XFER_HASH_ENV = "VIME_PD_KV_XFER_HASH"
++_KV_XFER_HASH_MARKER = "pd-post-wake"
++_KV_XFER_HASH_MAX_ELEMS = 4096
++
++
++def _kv_xfer_hash_enabled() -> bool:
++    """Gate the byte-level transfer probe (diagnostic only, marked requests)."""
++    return os.environ.get(_KV_XFER_HASH_ENV, "0") == "1"
++
++
++def _kv_xfer_hash_marked(request_id: str | None) -> bool:
++    return bool(request_id) and _KV_XFER_HASH_MARKER in request_id
++
++
++def _kv_block_sample_sha256(tensor: torch.Tensor, block_id: int) -> dict:
++    """Sample-hash one KV/state block; must never break the transfer path."""
++    try:
++        flat = tensor[block_id].detach().reshape(-1)
++        head = flat[: _KV_XFER_HASH_MAX_ELEMS].float().cpu().numpy()
++        tail = flat[-_KV_XFER_HASH_MAX_ELEMS:].float().cpu().numpy()
++        return {
++            "sha256": hashlib.sha256(head.tobytes()).hexdigest()[:16],
++            "tail_sha256": hashlib.sha256(tail.tobytes()).hexdigest()[:16],
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++        }
++    except Exception as exc:  # diagnostic code must never break KV transfer
++        return {"error": f"{type(exc).__name__}: {exc}"}
++
++
++def _kv_xfer_hash_log(
++    side: str,
++    request_id: str,
++    kv_caches: dict[str, Any],
++    kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]],
++    block_ids_per_group: Any,
++    as_kv_cache_tuple,
++    block_size_scale_per_addr: Any,
++    ids_are_kernel_granular: bool = False,
++) -> None:
++    """Log a per-(group, first-layer, cache_idx, edge-block) sample hash.
++
++    P and D log the same record shape so an offline join on
++    (req, group, layer, cache_idx) can tell whether the bytes the producer
++    holds equal the bytes the consumer received — the decisive split between
++    "transfer/addressing wrong" and "consumer-side usage wrong".
++
++    ``block_ids_per_group`` carries LOGICAL block ids; attention tensors use a
++    smaller kernel block size, so the tensor row of a logical block is
++    ``logical_id * block_size_scale[layer][cache_idx]`` — hashing the raw
++    logical id as a tensor row reads an unrelated (usually untouched) region.
++    """
++    try:
++        for group_id, (group_spec, layer_indices) in kv_group2layeridx.items():
++            if not isinstance(block_ids_per_group, (list, tuple)) or group_id >= len(block_ids_per_group):
++                continue
++            ids = block_ids_per_group[group_id]
++            if not isinstance(ids, (list, tuple)) or not ids:
++                continue
++            probe_blocks = [ids[0]] + ([ids[-1]] if len(ids) > 1 else [])
++            layer_names = group_spec.get("layer_names") or []
++            if not layer_names or not layer_indices:
++                continue
++            # Cover first/mid/last layer of the group, not just the first: a
++            # per-layer addressing bug hides behind a single-layer match.
++            n_layers = len(layer_names)
++            probe_layer_pos = sorted({0, n_layers // 2, n_layers - 1})
++            for cache_entry_name, layer_idx in (
++                (layer_names[p], layer_indices[p]) for p in probe_layer_pos
++            ):
++                cache_entry = kv_caches.get(cache_entry_name)
++                if cache_entry is None:
++                    continue
++                for cache_idx, tensor in enumerate(as_kv_cache_tuple(cache_entry)):
++                    if ids_are_kernel_granular:
++                        scale = 1
++                    else:
++                        try:
++                            scale = max(1, int(block_size_scale_per_addr[layer_idx][cache_idx]))
++                        except Exception:
++                            scale = 1
++                    for block_id in probe_blocks:
++                        kernel_block = int(block_id) * scale
++                        rec = _kv_block_sample_sha256(tensor, kernel_block)
++                        logger.warning(
++                            "[KV-XFER-HASH] side=%s req=%s group=%s layer=%s name=%s "
++                            "cache_idx=%s block=%s kernel_block=%s scale=%s sha=%s tail_sha=%s shape=%s dtype=%s",
++                            side,
++                            request_id,
++                            group_id,
++                            layer_idx,
++                            cache_entry_name,
++                            cache_idx,
++                            block_id,
++                            kernel_block,
++                            scale,
++                            rec.get("sha256", rec.get("error")),
++                            rec.get("tail_sha256"),
++                            rec.get("shape"),
++                            rec.get("dtype"),
++                        )
++    except Exception:
++        logger.exception("[KV-XFER-HASH] failed side=%s req=%s", side, request_id)
++
++
+ @dataclass
+ class SizedDict(OrderedDict):
+     def __init__(self, max_size=16000, *args, **kwargs):
+@@ -321,6 +426,7 @@ class KVCacheSendingThread(threading.Thread):
+     def run_busy_loop(self, sock: zmq.Socket):  # type: ignore
+         encoder = msgspec.msgpack.Encoder()
+         encoded_data = encoder.encode(self.metadata)
++        encoded_epoch = getattr(global_te, "epoch", 0)
+         size_in_bytes = len(encoded_data)
+         if logger.isEnabledFor(logging.DEBUG):
+             logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes", str(size_in_bytes))
+@@ -357,6 +463,15 @@ class KVCacheSendingThread(threading.Thread):
+ 
+                 msg = decoder.decode(payload[0])
+                 if msg[0] == GET_META_MSG:
++                    # After a wake-time engine recreate the rpc port (and the
++                    # whole engine generation) changed: serve fresh metadata.
++                    if getattr(global_te, "epoch", 0) != encoded_epoch:
++                        try:
++                            self.metadata.te_rpc_port = global_te.transfer_engine.get_rpc_port()
++                            encoded_data = encoder.encode(self.metadata)
++                            encoded_epoch = getattr(global_te, "epoch", 0)
++                        except Exception:
++                            logger.exception("[MOONCAKE-TE] failed to re-encode handshake metadata")
+                     sock.send_multipart((identity, b"", encoded_data))
+                 elif msg[0] == DONE_RECVING_MSG:
+                     logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
+@@ -732,6 +847,23 @@ class KVCacheRecvingThread(threading.Thread):
+         """Handle a KV cache transfer request."""
+         remote_request_id = req_meta["remote_request_id"]
+         local_block_ids: BlockIds = req_meta["local_block_ids"]
++        # Engine-generation gate: after a wake-time engine recreate, every
++        # cached remote handshake (base addrs, rpc ports, strides) belongs to
++        # the stale generation and must be re-fetched before any transfer.
++        if getattr(self, "_te_epoch", -1) != global_te.epoch:
++            self._te_epoch = global_te.epoch
++            local_key = (self.local_engine_id, self.local_handshake_port)
++            local_entry = self.kv_caches_base_addr.get(local_key[0], {}).get(local_key[1])                 if self.local_engine_id in self.kv_caches_base_addr else None
++            self.kv_caches_base_addr.clear()
++            if local_entry is not None:
++                self.kv_caches_base_addr[local_key[0]][local_key[1]] = local_entry
++            self.remote_te_port.clear()
++            self.remote_block_stride_per_addr.clear()
++            self.remote_kv_group2layeridx.clear()
++            logger.warning(
++                "[MOONCAKE-TE] recv thread invalidated remote metadata caches epoch=%s",
++                self._te_epoch,
++            )
+         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
+         group_pulls: list[GroupPull] = req_meta["group_pulls"]
+         remote_engine_id = req_meta["remote_engine_id"]
+@@ -893,7 +1025,7 @@ class KVCacheRecvingThread(threading.Thread):
+             dst_list,
+             length_list,
+         )
+-        ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
++        ret = global_te.transfer_engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+         if ret < 0:
+             logger.error(
+                 "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
+@@ -902,6 +1034,21 @@ class KVCacheRecvingThread(threading.Thread):
+             )
+             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
+ 
++        if _kv_xfer_hash_enabled() and _kv_xfer_hash_marked(remote_request_id):
++            # Consumer-side byte evidence: hash the just-pulled local blocks so
++            # they can be joined with the producer's [KV-XFER-HASH] side=P rows.
++            torch.npu.synchronize()
++            _kv_xfer_hash_log(
++                "D",
++                remote_request_id,
++                self.kv_caches,
++                self.kv_group2layeridx,
++                local_block_ids,
++                MooncakeConnectorWorker._as_kv_cache_tuple,
++                self.block_size_scale,
++                ids_are_kernel_granular=True,
++            )
++
+         req_end_time = time.perf_counter()
+         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+         logger.info(
+@@ -1381,6 +1528,10 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
+     def __init__(self):
+         self.requests: dict[str, ReqMeta] = {}
+         self.requests_to_send: dict[str, float] = {}
++        # Diagnostic-only (VIME_PD_KV_XFER_HASH): marked request_id -> block ids
++        # per group, so the producer worker can hash exactly the blocks the
++        # consumer will pull.
++        self.requests_to_send_blocks: dict[str, Any] = {}
+         self.reqs_in_batch: set[str] = set()
+ 
+     def add_new_req(
+@@ -1563,6 +1714,10 @@ class MooncakeConnectorScheduler:
+         # the scheduler. Used to make metadata passed to Worker.
+         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, int]] = {}
+         self._reqs_need_send: dict[str, float] = {}
++        # Diagnostic-only (VIME_PD_KV_XFER_HASH): marked request block ids,
++        # shipped to the worker via MooncakeConnectorMetadata so the producer
++        # can hash exactly the bytes the consumer is about to pull.
++        self._reqs_send_block_probe: dict[str, Any] = {}
+         self._reqs_in_batch: set[str] = set()
+ 
+         # master-slave meta information for cross-nodes
+@@ -1652,6 +1807,10 @@ class MooncakeConnectorScheduler:
+     def _state_prefill_token_count(self, num_prompt_tokens: int) -> int:
+         """D-side only. Returns N-1 for Mamba models since the decoder
+         always recomputes the last token and must start from h(N-1)."""
++        if os.environ.get("VIME_PD_DISABLE_MAMBA_TRUNCATE", "0") == "1":
++            # A/B diagnostic: bypass the h(N-1) contract entirely (P and D must
++            # both run with the flag set to stay consistent).
++            return num_prompt_tokens
+         if self.need_truncate and num_prompt_tokens > 1:
+             return num_prompt_tokens - 1
+         return num_prompt_tokens
+@@ -1663,6 +1822,8 @@ class MooncakeConnectorScheduler:
+ 
+         Guarded by ``_p_side_truncated`` to avoid repeated truncation if the
+         request is preempted and rescheduled."""
++        if os.environ.get("VIME_PD_DISABLE_MAMBA_TRUNCATE", "0") == "1":
++            return
+         params = request.kv_transfer_params
+         if (
+             params is not None
+@@ -1766,6 +1927,8 @@ class MooncakeConnectorScheduler:
+         self._reqs_need_recv.clear()
+         meta.requests_to_send = self._reqs_need_send
+         self._reqs_need_send = {}
++        meta.requests_to_send_blocks = self._reqs_send_block_probe
++        self._reqs_send_block_probe = {}
+         meta.reqs_in_batch = self._reqs_in_batch
+         self._reqs_in_batch = set()
+ 
+@@ -1801,6 +1964,8 @@ class MooncakeConnectorScheduler:
+         if delay_free_blocks:
+             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
+             self._reqs_need_send[request.request_id] = time.time()
++            if _kv_xfer_hash_enabled() and _kv_xfer_hash_marked(request.request_id):
++                self._reqs_send_block_probe[request.request_id] = computed_block_ids
+ 
+         return delay_free_blocks, dict(
+             do_remote_prefill=True,
+@@ -3260,6 +3425,20 @@ class MooncakeConnectorWorker:
+                 else:
+                     self.kv_send_thread.add_not_transfer_request(req_id)
+ 
++        if _kv_xfer_hash_enabled() and metadata.requests_to_send_blocks:
++            # Producer-side byte evidence for marked requests: hash exactly the
++            # blocks the consumer is about to pull (before any free/reuse).
++            for req_id, probe_block_ids in metadata.requests_to_send_blocks.items():
++                _kv_xfer_hash_log(
++                    "P",
++                    req_id,
++                    self.kv_caches,
++                    self.kv_group2layeridx,
++                    probe_block_ids,
++                    self._as_kv_cache_tuple,
++                    self.block_size_scale,
++                )
++
+         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size > 1:
+             for req_id, delay_start_time in metadata.requests_to_send.items():
+                 self.kv_send_thread.add_delayed_request(req_id, delay_start_time)
+diff --git a/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py b/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
+index 7cf309b0..52d21739 100644
+--- a/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
++++ b/vllm_ascend/distributed/kv_transfer/utils/mooncake_transfer_engine.py
+@@ -1,12 +1,21 @@
++import logging
++import os
+ import threading
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ class GlobalTE:
+     def __init__(self):
+         self.transfer_engine = None
+         self.is_register_buffer: bool = False
++        self.registered_regions: list[tuple[int, int]] = []
+         self.transfer_engine_lock = threading.Lock()
+         self.register_buffer_lock = threading.Lock()
++        self._init_args: tuple[str, str] | None = None
++        # Bumped every time the engine is recreated; consumers use it to
++        # invalidate cached session/remote metadata from the old generation.
++        self.epoch: int = 0
+ 
+     def get_transfer_engine(self, hostname: str, device_name: str | None):
+         if self.transfer_engine is None:
+@@ -26,18 +35,232 @@ class GlobalTE:
+                     ret_value = self.transfer_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name)
+                     if ret_value != 0:
+                         raise RuntimeError(f"TransferEngine initialization failed with ret_value: {ret_value}")
++                    self._init_args = (hostname, device_name)
+         return self.transfer_engine
+ 
++    def recreate_engine(self, reason: str = "wake") -> bool:
++        """Recreate the transfer engine after CaMem level-2 sleep.
++
++        The cached ADXL segment handle_map_ inside TransferEnginePy is keyed by
++        target session and opened once forever.  After a level-2 sleep remaps
++        the physical pages of the registered regions, the peer's cached segment
++        silently points at the stale registration generation and reads zeros
++        with a success status.  The only way to drop that cache is to build a
++        new TransferEngine (its destructor closes every cached segment) and
++        re-register the KV regions on it.  `epoch` is bumped so connector
++        threads invalidate remote metadata learned from the old generation.
++        """
++        with self.transfer_engine_lock:
++            if self._init_args is None:
++                logger.warning("[MOONCAKE-TE] recreate skipped reason=%s: engine never initialized", reason)
++                return False
++            hostname, device_name = self._init_args
++            try:
++                from mooncake.engine import TransferEngine  # type: ignore
++            except ImportError:
++                return False
++            old_engine = self.transfer_engine
++            try:
++                new_engine = TransferEngine()
++                ret_value = new_engine.initialize(hostname, "P2PHANDSHAKE", "ascend", device_name or "")
++                if ret_value != 0:
++                    logger.warning("[MOONCAKE-TE] recreate initialize failed reason=%s ret=%s", reason, ret_value)
++                    return False
++                with self.register_buffer_lock:
++                    for ptr, size in self.registered_regions:
++                        ret_value = new_engine.register_memory(ptr, size)
++                        if ret_value != 0:
++                            logger.warning(
++                                "[MOONCAKE-TE] recreate register failed reason=%s ptr=%s ret=%s",
++                                reason,
++                                ptr,
++                                ret_value,
++                            )
++                            return False
++                self.transfer_engine = new_engine
++                self.epoch += 1
++                logger.warning(
++                    "[MOONCAKE-TE] pid=%s recreated transfer engine reason=%s epoch=%s regions=%s",
++                    os.getpid(),
++                    reason,
++                    self.epoch,
++                    len(self.registered_regions),
++                )
++            except Exception:
++                logger.warning("[MOONCAKE-TE] recreate raised reason=%s", reason, exc_info=True)
++                return False
++            finally:
++                # Drop our reference; the old engine's destructor closes every
++                # cached (stale) segment once remaining holders release it.
++                del old_engine
++            return True
++
+     def register_buffer(self, ptrs: list[int], sizes: list[int]):
+         with self.register_buffer_lock:
+             assert self.transfer_engine is not None, "Transfer engine must be initialized"
+             if self.is_register_buffer:
+                 return
+-            for ptr, size in zip(ptrs, sizes):
++            regions = list(zip(ptrs, sizes, strict=True))
++            for ptr, size in regions:
+                 ret_value = self.transfer_engine.register_memory(ptr, size)
+                 if ret_value != 0:
+                     raise RuntimeError("Mooncake memory registration failed.")
++            self.registered_regions = regions
++            self.is_register_buffer = True
++            logger.warning(
++                "[MOONCAKE-TE] pid=%s registered %s KV regions first=(%s, %s)",
++                os.getpid(),
++                len(regions),
++                regions[0][0] if regions else None,
++                regions[0][1] if regions else None,
++            )
++
++    def unregister_all(self, reason: str = "sleep", retries: int = 5, retry_sleep_s: float = 1.0) -> bool:
++        """Unregister every registered KV region, keeping the region list for
++        a later register_saved_regions().
++
++        ADXL refuses DeregisterMem (PARAM_INVALID) while a peer connection is
++        open, and Mooncake swallows that error inside unregisterLocalMemory —
++        so this retries briefly (peer disconnects race with us at sleep time)
++        and RAISES on persistent failure: a silently failed deregistration is
++        exactly the stale-binding bug this exists to prevent.
++        """
++        import time
++
++        with self.register_buffer_lock:
++            if not self.is_register_buffer or self.transfer_engine is None:
++                logger.warning(
++                    "[MOONCAKE-TE] pid=%s unregister_all skipped reason=%s is_register_buffer=%s",
++                    os.getpid(),
++                    reason,
++                    self.is_register_buffer,
++                )
++                return False
++            for attempt in range(retries):
++                failed = 0
++                for ptr, _size in self.registered_regions:
++                    ret_value = self.transfer_engine.unregister_memory(ptr)
++                    if ret_value != 0:
++                        failed += 1
++                if failed == 0:
++                    break
++                logger.warning(
++                    "[MOONCAKE-TE] pid=%s unregister attempt %s/%s reason=%s failed=%s (peer disconnect race?)",
++                    os.getpid(),
++                    attempt + 1,
++                    retries,
++                    reason,
++                    failed,
++                )
++                time.sleep(retry_sleep_s)
++            if failed != 0:
++                raise RuntimeError(
++                    f"unregister_all failed after {retries} attempts (reason={reason}): "
++                    "ADXL refused deregistration; stale NIC bindings would survive the remap"
++                )
++            self.is_register_buffer = False
++            logger.warning(
++                "[MOONCAKE-TE] pid=%s unregistered %s regions reason=%s",
++                os.getpid(),
++                len(self.registered_regions),
++                reason,
++            )
++            return True
++
++    def register_saved_regions(self, reason: str = "wake") -> bool:
++        """Re-register the saved KV regions after a wake-time remap.
++
++        The VAs are unchanged (CaMem remaps in place), but the physical pages
++        are new, so a fresh RegisterMem binds the NIC translation to the new
++        pages.  Raw-ADXL probe verified this restores faithful transfers.
++        """
++        with self.register_buffer_lock:
++            if self.is_register_buffer or self.transfer_engine is None:
++                logger.warning(
++                    "[MOONCAKE-TE] pid=%s register_saved_regions skipped reason=%s is_register_buffer=%s",
++                    os.getpid(),
++                    reason,
++                    self.is_register_buffer,
++                )
++                return False
++            for ptr, size in self.registered_regions:
++                ret_value = self.transfer_engine.register_memory(ptr, size)
++                if ret_value != 0:
++                    raise RuntimeError(f"register_saved_regions failed reason={reason} ptr={ptr} ret={ret_value}")
+             self.is_register_buffer = True
++            logger.warning(
++                "[MOONCAKE-TE] pid=%s re-registered %s regions reason=%s first=(%s, %s)",
++                os.getpid(),
++                len(self.registered_regions),
++                reason,
++                self.registered_regions[0][0] if self.registered_regions else None,
++                self.registered_regions[0][1] if self.registered_regions else None,
++            )
++            return True
++
++    def refresh_buffer(self, reason: str = "wake") -> bool:
++        """Re-register KV regions after CaMem remaps their physical backing.
++
++        CaMem level-2 sleep releases the physical pages behind the same virtual
++        addresses. Mooncake registrations are tied to the old mapping, so they
++        must be dropped before registering the remapped regions again.
++
++        Every branch logs at WARNING with the pid: this runs in each vLLM
++        WorkerProc (the process that owns the connector-side registration), and
++        a silent early-return here previously made it impossible to tell
++        "refresh never ran" from "refresh ran and succeeded".
++        """
++        if os.environ.get("VIME_MOONCAKE_SKIP_REFRESH", "0") == "1":
++            return False
++        with self.register_buffer_lock:
++            if not self.is_register_buffer or self.transfer_engine is None or not self.registered_regions:
++                logger.warning(
++                    "[MOONCAKE-TE] pid=%s refresh skipped reason=%s is_register_buffer=%s "
++                    "has_engine=%s regions=%s",
++                    os.getpid(),
++                    reason,
++                    self.is_register_buffer,
++                    self.transfer_engine is not None,
++                    len(self.registered_regions),
++                )
++                return False
++            unregister_memory = getattr(self.transfer_engine, "unregister_memory", None)
++            if unregister_memory is None:
++                logger.warning(
++                    "[MOONCAKE-TE] pid=%s refresh impossible reason=%s: transfer engine has no unregister_memory",
++                    os.getpid(),
++                    reason,
++                )
++                return False
++            for ptr, _size in self.registered_regions:
++                ret_value = unregister_memory(ptr)
++                if ret_value != 0:
++                    logger.warning(
++                        "[MOONCAKE-TE] pid=%s unregister failed reason=%s ptr=%s ret=%s",
++                        os.getpid(),
++                        reason,
++                        ptr,
++                        ret_value,
++                    )
++                    return False
++            for ptr, size in self.registered_regions:
++                ret_value = self.transfer_engine.register_memory(ptr, size)
++                if ret_value != 0:
++                    logger.warning(
++                        "[MOONCAKE-TE] pid=%s re-register failed reason=%s ptr=%s ret=%s",
++                        os.getpid(),
++                        reason,
++                        ptr,
++                        ret_value,
++                    )
++                    return False
++            logger.warning(
++                "[MOONCAKE-TE] pid=%s refreshed %s KV registrations reason=%s",
++                os.getpid(),
++                len(self.registered_regions),
++                reason,
++            )
++            return True
+ 
+ 
+ global_te = GlobalTE()
+diff --git a/vllm_ascend/envs.py b/vllm_ascend/envs.py
+index 18fd67d8..062cb2e7 100644
+--- a/vllm_ascend/envs.py
++++ b/vllm_ascend/envs.py
+@@ -113,6 +113,18 @@ env_variables: dict[str, Callable[[], Any]] = {
+     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
+     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
+     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
++    # PD sleep/wake root fix (RoCE/ADXL): at level-2 sleep, unregister the KV
++    # regions from the transfer engine; at wake, re-register the same VAs.
++    # Background: ADXL refuses DeregisterMem (PARAM_INVALID) while a connection
++    # is open, and Mooncake swallows that error, so without a disconnect the
++    # deregistration silently never happens and the stale VA->PA NIC binding
++    # survives a CaMem remap (post-wake transfers hit freed pages).  Requires
++    # connections to be closed at sleep time — pair with
++    # ASCEND_USE_SHORT_CONNECTION=1 (or a Mooncake disconnectAll patch).
++    # Raw-ADXL probe (tools/adxl_raw_remap_probe) verified: disconnect ->
++    # deregister -> remap -> register restores faithful transfers both ways.
++    # Default off.
++    "VIME_PD_KV_REREGISTER_ON_WAKE": lambda: bool(int(os.getenv("VIME_PD_KV_REREGISTER_ON_WAKE", "0"))),
+ }
+ 
+ # end-env-vars-definition
+diff --git a/vllm_ascend/ops/gdn_attn_builder.py b/vllm_ascend/ops/gdn_attn_builder.py
+index 9bf14670..3fd01070 100644
+--- a/vllm_ascend/ops/gdn_attn_builder.py
++++ b/vllm_ascend/ops/gdn_attn_builder.py
+@@ -13,6 +13,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import os
++
++from vllm.logger import logger
+ from dataclasses import dataclass
+ 
+ import torch
+@@ -28,8 +31,12 @@ from vllm.v1.attention.backends.utils import (
+     NULL_BLOCK_ID,
+     compute_causal_conv1d_metadata,
+     mamba_get_block_table_tensor,
+-    split_decodes_and_prefills,
+ )
++# Use the Ascend variant: it carries the PD-decode recompute hook that forces
++# the 1-token remote recompute step into the decode branch (the upstream split
++# leaves it classified as a 1-token prefill with initial state, which the
++# compiled chunk_gated_delta_rule path mishandles).
++from vllm_ascend.attention.utils import split_decodes_and_prefills
+ from vllm.v1.kv_cache_interface import AttentionSpec
+ 
+ from vllm_ascend.ops.triton.fla.utils import (
+@@ -413,6 +420,8 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
+     ) -> GDNAttentionMetadata:
+         m = common_attn_metadata
+ 
++        self._vime_gdn_meta_probe = os.environ.get("VIME_GDN_META_PROBE", "0") == "1"
++
+         query_start_loc = m.query_start_loc
+         query_start_loc_cpu = m.query_start_loc_cpu
+         context_lens_tensor = m.compute_num_computed_tokens()
+@@ -636,6 +645,42 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
+         else:
+             has_initial_state = None
+ 
++        if getattr(self, "_vime_gdn_meta_probe", False):
++            try:
++                if m.num_reqs == 1:
++                    logger.warning(
++                        "[GDN-META] num_decodes=%s num_prefills=%s num_decode_tokens=%s "
++                        "num_prefill_tokens=%s num_spec_decodes=%s spec_masks=%s "
++                        "non_spec_state_idx=%s prefill_state_idx=%s prefill_has_init=%s "
++                        "block_row0=%s context_lens=%s qsl_cpu=%s",
++                        num_decodes,
++                        num_prefills,
++                        num_decode_tokens,
++                        num_prefill_tokens,
++                        num_spec_decodes,
++                        spec_sequence_masks is not None,
++                        (
++                            non_spec_state_indices_tensor[:4].tolist()
++                            if non_spec_state_indices_tensor is not None
++                            else None
++                        ),
++                        (
++                            prefill_state_indices[:4].tolist()
++                            if prefill_state_indices is not None
++                            else None
++                        ),
++                        (
++                            prefill_has_initial_state[:4].tolist()
++                            if prefill_has_initial_state is not None
++                            else None
++                        ),
++                        block_table_tensor[0][:4].tolist() if block_table_tensor is not None else None,
++                        context_lens_tensor.tolist(),
++                        query_start_loc_cpu.tolist(),
++                    )
++            except Exception:
++                logger.exception("[GDN-META] probe failed")
++
+         assert not (num_decodes > 0 and num_spec_decodes > 0), (
+             f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
+         )
+diff --git a/vllm_ascend/utils.py b/vllm_ascend/utils.py
+index bf19a77d..5a6b28de 100644
+--- a/vllm_ascend/utils.py
++++ b/vllm_ascend/utils.py
+@@ -1165,9 +1165,20 @@ def is_pd_decode_recompute_scheduler_enabled(vllm_config: VllmConfig | None = No
+         if vllm_config is None:
+             return False
+         kv_cfg = vllm_config.kv_transfer_config
++        enabled = get_ascend_config().recompute_scheduler_enable
++        if not globals().get("_pd_recomp_probe_logged", False):
++            globals()["_pd_recomp_probe_logged"] = True
++            import logging as _logging
++            _logging.getLogger(__name__).warning(
++                "[PD-RECOMP-GATE] kv_cfg=%s is_consumer=%s is_producer=%s recompute_enable=%s",
++                "set" if kv_cfg is not None else "none",
++                getattr(kv_cfg, "is_kv_consumer", None),
++                getattr(kv_cfg, "is_kv_producer", None),
++                enabled,
++            )
+         if kv_cfg is None or not kv_cfg.is_kv_consumer or kv_cfg.is_kv_producer:
+             return False
+-        return get_ascend_config().recompute_scheduler_enable
++        return enabled
+     except (RuntimeError, AttributeError):
+         return False
+ 
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+index bb090282..25536970 100644
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -17,8 +17,10 @@
+ # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
+ #
+ 
++import json
+ import logging
+ import math
++import os
+ import sys
+ import time
+ from collections import defaultdict, deque
+@@ -189,7 +191,7 @@ from vllm_ascend.distributed.parallel_state import (
+     get_virtual_pipeline_parallel_size,
+     set_virtual_pipeline_parallel_rank,
+ )
+-from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler
++from vllm_ascend.sample.rejection_sampler import AscendRejectionSampler, greedy_sample
+ 
+ if TYPE_CHECKING:
+     import xgrammar as xgr  # type: ignore[import-untyped]
+@@ -925,7 +927,57 @@ class NPUModelRunner(GPUModelRunner):
+                     req_state.prev_num_draft_len = 0
+ 
+         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
+-        return super()._update_states(scheduler_output)
++        result = super()._update_states(scheduler_output)
++        self._vime_probe_scheduled = getattr(scheduler_output, "num_scheduled_tokens", {}) or {}
++        self._vime_runner_probe_marked_requests(scheduler_output)
++        return result
++
++    def _vime_runner_probe_marked_requests(self, scheduler_output=None) -> None:
++        """One-shot per marked PD request: dump the runner-visible scheduling truth.
++
++        The connector proves which blocks it PULLED; this probe proves which
++        blocks the runner actually READS (block table) and at which computed
++        offset.  Any mismatch between the two is the consumption-side bug.
++        """
++        if os.getenv("VIME_PD_RUNNER_PROBE", "0") != "1":
++            return
++        try:
++            for req_id, req_state in self.requests.items():
++                if "pd-post-wake" not in req_id:
++                    continue
++                if getattr(req_state, "_vime_runner_probe_logged", False):
++                    continue
++                req_state._vime_runner_probe_logged = True
++                block_summary = []
++                for group_ids in req_state.block_ids:
++                    ids = list(group_ids)
++                    block_summary.append(
++                        ids[:4] + ["..."] + ids[-4:] if len(ids) > 8 else ids
++                    )
++                fed_ids = None
++                try:
++                    req_index = self.input_batch.req_id_to_index.get(req_id)
++                    scheduled = getattr(self, "_vime_probe_scheduled", {}).get(req_id, 0)
++                    if req_index is not None and 0 < scheduled <= 8:
++                        n_computed = int(self.input_batch.num_computed_tokens_cpu[req_index])
++                        fed_ids = (
++                            self.input_batch.token_ids_cpu[req_index, n_computed : n_computed + scheduled]
++                            .tolist()
++                        )
++                except Exception:
++                    fed_ids = None
++                logger.warning(
++                    "[RUNNER-PROBE] req=%s num_computed=%s num_tokens=%s "
++                    "output_tokens=%s fed_ids=%s block_ids_per_group=%s",
++                    req_id,
++                    req_state.num_computed_tokens,
++                    req_state.num_tokens,
++                    len(req_state.output_token_ids),
++                    fed_ids,
++                    block_summary,
++                )
++        except Exception:
++            logger.exception("[RUNNER-PROBE] failed to dump request state")
+ 
+     def _pad_query_start_loc_for_fia(
+         self,
+@@ -3485,7 +3537,172 @@ class NPUModelRunner(GPUModelRunner):
+         )
+         return async_output
+ 
++    def _log_mtp_sync_debug_verification(
++        self,
++        logits: torch.Tensor,
++        spec_decode_metadata: SpecDecodeMetadata,
++        sampling_metadata: SamplingMetadata,
++        draft_probs: torch.Tensor | None,
++        sampler_output: SamplerOutput,
++    ) -> None:
++        if os.getenv("VIME_MTP_SYNC_DEBUG", "0").strip().lower() not in {
++            "1",
++            "true",
++            "yes",
++            "on",
++        } or getattr(self, "_vime_mtp_sync_debug_sample_logged", False):
++            return
++
++        # This is diagnostic-only and intentionally synchronizes a small first
++        # batch to make target/draft disagreement visible in one log record.
++        try:
++            metadata = spec_decode_metadata
++            draft_ids = metadata.draft_token_ids
++            target_logits = logits[metadata.target_logits_indices]
++            if get_ascend_config().enable_reduce_sample:
++                target_top_ids = greedy_sample(target_logits)
++            else:
++                target_top_ids = target_logits.argmax(dim=-1)
++
++            max_rows = min(12, draft_ids.numel())
++            all_draft_cpu = draft_ids.cpu().tolist()
++            draft_cpu = all_draft_cpu[:max_rows]
++            target_top_cpu = target_top_ids[:max_rows].cpu().tolist()
++            top1_matches = [draft == target for draft, target in zip(draft_cpu, target_top_cpu, strict=True)]
++            output_cpu = sampler_output.sampled_token_ids.cpu().tolist()
++
++            accepted_prefixes = []
++            offset = 0
++            for req_idx, num_draft in enumerate(metadata.num_draft_tokens):
++                accepted = 0
++                for pos in range(num_draft):
++                    if output_cpu[req_idx][pos] != all_draft_cpu[offset + pos]:
++                        break
++                    accepted += 1
++                accepted_prefixes.append(accepted)
++                offset += num_draft
++
++            checked_logits = target_logits[:max_rows]
++            finite = torch.isfinite(checked_logits)
++            nonfinite = checked_logits.numel() - int(finite.sum().cpu())
++            temperatures = getattr(sampling_metadata, "temperature", None)
++            if torch.is_tensor(temperatures):
++                temperatures = temperatures[:8].cpu().tolist()
++            record = {
++                "all_greedy": sampling_metadata.all_greedy,
++                "all_random": sampling_metadata.all_random,
++                "draft_probs_present": draft_probs is not None,
++                "stored_draft_probs_present": getattr(self, "_draft_probs", None) is not None,
++                "draft_sample_method": getattr(self.speculative_config, "draft_sample_method", None),
++                "rejection_sample_method": getattr(self.speculative_config, "rejection_sample_method", None),
++                "pipeline_parallel_world_size": get_pp_group().world_size,
++                "temperatures": temperatures,
++                "num_draft_tokens": metadata.num_draft_tokens[:8],
++                "draft_ids": draft_cpu,
++                "target_top_ids": target_top_cpu,
++                "top1_matches": top1_matches,
++                "accepted_prefixes": accepted_prefixes[:8],
++                "target_logits_shape": list(target_logits.shape),
++                "target_logits_nonfinite": nonfinite,
++                "reduce_sample": get_ascend_config().enable_reduce_sample,
++            }
++            logger.warning("[MTP_SYNC_DEBUG] phase=verify record=%s", json.dumps(record, sort_keys=True))
++        except Exception:
++            logger.exception("[MTP_SYNC_DEBUG] failed to capture target/draft verification")
++        finally:
++            self._vime_mtp_sync_debug_sample_logged = True
++
+     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
++    _LAYER_PROBE_MODULES = (
++        "language_model.model.layers.0.linear_attn",
++        "language_model.model.layers.2.linear_attn",
++        "language_model.model.layers.3.self_attn.attn",
++        "language_model.model.layers.39.self_attn.attn",
++    )
++
++    def _layer_probe_capture(self, name: str, output: Any) -> None:
++        try:
++            tensor = output[0] if isinstance(output, (tuple, list)) else output
++            if not torch.is_tensor(tensor):
++                return
++            flat = tensor.detach().reshape(-1)[:4096]
++            rec = flat.float().cpu().numpy()
++            import hashlib as _hl
++
++            self._vime_layer_probe_cache[name] = _hl.sha256(rec.tobytes()).hexdigest()[:16]
++        except Exception:
++            pass
++
++    def _layer_probe_install(self) -> None:
++        if getattr(self, "_vime_layer_probe_installed", False):
++            return
++        self._vime_layer_probe_installed = True
++        self._vime_layer_probe_cache = {}
++        model = getattr(self, "model", None)
++        if model is None:
++            return
++        modules = dict(model.named_modules())
++        resolved = {}
++        for full_name, module in modules.items():
++            for target in self._LAYER_PROBE_MODULES:
++                if full_name == target or full_name.endswith("." + target) or target.endswith("." + full_name):
++                    resolved[target] = module
++        for name in self._LAYER_PROBE_MODULES:
++            module = resolved.get(name)
++            if module is None:
++                logger.warning("[LAYER-PROBE] module not found: %s", name)
++                continue
++            module.register_forward_hook(
++                lambda _m, _i, output, name=name: self._layer_probe_capture(name, output)
++            )
++
++    def _log_marked_request_logits(self, logits: torch.Tensor | None) -> None:
++        """One-shot top-k logits dump for marked PD probe requests.
++
++        Distinguishes "context is noise" (near-uniform logits) from "context is
++        coherent but wrong" (confident but unexpected argmax) — the first is a
++        data-plane corruption signature, the second a sequence/position one.
++        """
++        if os.getenv("VIME_PD_LOGITS_PROBE", "0") != "1" or logits is None:
++            return
++        try:
++            req_ids = list(self.input_batch.req_ids)
++            # Attribution-safety: only fire when the marked request is the sole
++            # request in the batch AND is being sampled this step (logits has a
++            # row for it).  Otherwise row ordering vs req_ids is ambiguous.
++            if len(req_ids) != 1:
++                return
++            if not ("pd-post-wake" in req_ids[0] or "pd-direct" in req_ids[0]):
++                return
++            marked = [(0, req_ids[0])]
++            rows = logits[:1]
++            if rows.shape[0] < 1:
++                return
++            self._layer_probe_install()
++            top_vals, top_ids = rows.topk(k=6, dim=-1)
++            for idx, req_id in marked:
++                if getattr(self, "_vime_logits_probe_logged", None) is None:
++                    self._vime_logits_probe_logged = {}
++                seen = self._vime_logits_probe_logged.get(req_id, 0)
++                if seen >= 3:
++                    continue
++                # First logged row fires right after hook install (empty cache);
++                # rows 2-3 carry the layer hashes of the preceding forwards.
++                self._vime_logits_probe_logged[req_id] = seen + 1
++                vals = [round(float(v), 4) for v in top_vals[idx].cpu().tolist()]
++                ids = top_ids[idx].cpu().tolist()
++                layer_hashes = dict(getattr(self, "_vime_layer_probe_cache", {}))
++                self._vime_layer_probe_cache = {}
++                logger.warning(
++                    "[LOGITS-PROBE] req=%s top_ids=%s top_vals=%s layer_hashes=%s",
++                    req_id,
++                    ids,
++                    vals,
++                    layer_hashes,
++                )
++        except Exception:
++            logger.exception("[LOGITS-PROBE] failed to dump logits")
++
+     def _sample(self, logits, spec_decode_metadata):
+         # Sample the next token and get logprobs if needed.
+         self.input_batch.update_async_output_token_ids()
+@@ -3496,6 +3713,7 @@ class NPUModelRunner(GPUModelRunner):
+             if self.input_batch.sampling_metadata.top_k is not None and get_ascend_config().enable_reduce_sample:
+                 max_topk = self.input_batch.top_k_cpu[self.input_batch.top_k_cpu < logits.shape[1]].max()
+                 self.sampler.prepare_sampling(max_topk)
++            self._log_marked_request_logits(logits)
+             return self.sampler(
+                 logits=logits,
+                 sampling_metadata=sampling_metadata,
+@@ -3517,6 +3735,13 @@ class NPUModelRunner(GPUModelRunner):
+             logits,
+             sampling_metadata,
+         )
++        self._log_mtp_sync_debug_verification(
++            logits,
++            spec_decode_metadata,
++            sampling_metadata,
++            draft_probs,
++            sampler_output,
++        )
+         return sampler_output
+ 
+     # TODO: remove this func after eagle_proposer is refactored and
+diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
+index d4a4ad92..f376b34d 100644
+--- a/vllm_ascend/worker/worker.py
++++ b/vllm_ascend/worker/worker.py
+@@ -49,7 +49,13 @@ from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+ from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput, VppContinuationOutput
++from vllm.v1.outputs import (
++    EMPTY_MODEL_RUNNER_OUTPUT,
++    AsyncModelRunnerOutput,
++    DraftTokenIds,
++    ModelRunnerOutput,
++    VppContinuationOutput,
++)
+ from vllm.v1.utils import report_usage_stats
+ from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
+ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
+@@ -226,6 +232,15 @@ class NPUWorker(WorkerBase):
+             self.sleep_wakeup_manager.sleep()
+ 
+         allocator = CaMemAllocator.get_instance()
++        if level == 2 and envs_ascend.VIME_PD_KV_REREGISTER_ON_WAKE and has_kv_transfer_group():
++            # Root fix (1/2): unregister KV regions BEFORE the unmap, while the
++            # pages are still mapped.  ADXL refuses DeregisterMem with
++            # PARAM_INVALID while a peer connection is open (and Mooncake
++            # swallows that error), so this only works if connections are
++            # closed at sleep time — pair with ASCEND_USE_SHORT_CONNECTION=1.
++            from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
++
++            global_te.unregister_all(reason="worker.sleep level=2")
+         allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+         free_bytes_after_sleep, total = torch.npu.mem_get_info()
+         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+@@ -254,6 +269,43 @@ class NPUWorker(WorkerBase):
+         allocator = CaMemAllocator.get_instance()
+         allocator.wake_up(tags=tags)
+ 
++        # Level-2 CaMem wake remaps the physical backing of KV cache tensors at
++        # the same virtual addresses.  The Mooncake/ADXL NIC registration still
++        # points at the freed old pages.  Root fix (VIME_PD_KV_REREGISTER_ON_WAKE):
++        # the sleep hook unregistered the regions (made possible by closing
++        # ADXL connections first — ADXL refuses DeregisterMem while connected),
++        # so here we re-register the same VAs, binding fresh physical pages.
++        # Raw-ADXL probe verified this restores faithful transfers both ways.
++        if tags is None or "kv_cache" in tags:
++            if envs_ascend.VIME_PD_KV_REREGISTER_ON_WAKE and has_kv_transfer_group():
++                from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
++
++                global_te.register_saved_regions(reason=f"worker.wake_up tags={tags}")
++            else:
++                try:
++                    from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
++
++                    global_te.recreate_engine(reason=f"worker.wake_up tags={tags}")
++                except Exception:
++                    logger.warning("[MOONCAKE-TE] KV registration refresh raised after wake", exc_info=True)
++            try:
++                import os as _os
++
++                if _os.environ.get("VIME_PD_KV_PTR_PROBE", "0") == "1":
++                    kv_caches = getattr(self.model_runner, "kv_caches", None)
++                    if kv_caches:
++                        entry = kv_caches[0]
++                        tensor = entry[0] if isinstance(entry, (tuple, list)) else entry
++                        logger.warning(
++                            "[KV-PTR-PROBE] pid=%s tags=%s kv0.data_ptr=%s n_entries=%s",
++                            _os.getpid(),
++                            tags,
++                            tensor.data_ptr(),
++                            len(kv_caches),
++                        )
++            except Exception:
++                logger.warning("[KV-PTR-PROBE] failed", exc_info=True)
++
+         hidden_size = self.vllm_config.model_config.hf_text_config.hidden_size
+         model = self.model_runner.model
+         # [vime 2026-08-21] 训推同步(checkpoint-format layerwise reload)场景下必须跳过
+@@ -358,16 +410,43 @@ class NPUWorker(WorkerBase):
+ 
+         with torch.device(self.device):
+             if self._is_checkpoint_format:
++                drafter = getattr(self.model_runner, "drafter", None)
++
++                def load_weights_with_mtp(weights):
++                    target_weights = []
++                    mtp_weights = []
++                    for name, weight in weights:
++                        (mtp_weights if name.startswith("mtp.") else target_weights).append((name, weight))
++                    if target_weights:
++                        model.load_weights(weights=iter(target_weights))
++                    if mtp_weights:
++                        draft_model = getattr(drafter, "model", None)
++                        if draft_model is None:
++                            raise RuntimeError(
++                                f"Received {len(mtp_weights)} MTP weights but the vLLM drafter model is unavailable"
++                            )
++                        draft_model.load_weights(weights=iter(mtp_weights))
++
+                 self.weight_transfer_engine.receive_weights(
+                     typed_update_info,
+-                    load_weights=model.load_weights,
++                    load_weights=load_weights_with_mtp,
+                 )
+             else:
++                drafter = getattr(self.model_runner, "drafter", None)
+ 
+                 def load_weights_direct(weights: list[tuple[str, torch.Tensor]]) -> None:
+                     with torch.no_grad():
+                         for name, weight in weights:
+-                            param = model.get_parameter(name)
++                            if name.startswith("mtp."):
++                                draft_model = getattr(drafter, "model", None)
++                                if draft_model is None:
++                                    raise RuntimeError(
++                                        "Received an MTP weight but the vLLM drafter model is unavailable"
++                                    )
++                                name = name.replace("mtp.", "model.", 1)
++                                param = draft_model.get_parameter(name)
++                            else:
++                                param = model.get_parameter(name)
+                             param.copy_(weight)
+ 
+                 self.weight_transfer_engine.receive_weights(
+@@ -982,7 +1061,20 @@ class NPUWorker(WorkerBase):
+         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+         if self.vllm_config.model_config.enable_sleep_mode:
+             allocator = CaMemAllocator.get_instance()
+-            context = allocator.use_memory_pool(tag="kv_cache")
++            import os as _os
++
++            assert not (
++                envs_ascend.VIME_PD_KV_REREGISTER_ON_WAKE and _os.environ.get("VIME_KV_SLEEP_PERSISTENT", "0") == "1"
++            ), "VIME_PD_KV_REREGISTER_ON_WAKE and VIME_KV_SLEEP_PERSISTENT are mutually exclusive"
++            if _os.environ.get("VIME_KV_SLEEP_PERSISTENT", "0") == "1":
++                # Mooncake registrations bind NIC/HCA translations to physical
++                # pages; a CaMem unmap breaks them in a way no in-process
++                # re-registration refreshes (post-wake pulls read zeros).
++                # Keeping KV mapped across sleep makes the registrations
++                # permanently valid at the cost of resident KV memory.
++                context = allocator.use_memory_pool(tag=CaMemAllocator.sleep_persistent_tag)
++            else:
++                context = allocator.use_memory_pool(tag="kv_cache")
+         else:
+             from contextlib import nullcontext
+ 
