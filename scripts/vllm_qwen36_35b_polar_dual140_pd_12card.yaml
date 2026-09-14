@@ -17,7 +17,7 @@ vllm:
         num_gpus_per_engine: 2
         overrides:
           disable_hybrid_kv_cache_manager: false
-          enable_prefix_caching: true
+          enable_prefix_caching: false
           pd_topology:
             prefill:
               dp_size: 1
@@ -36,7 +36,7 @@ vllm:
         num_gpus_per_engine: 2
         overrides:
           disable_hybrid_kv_cache_manager: false
-          enable_prefix_caching: true
+          enable_prefix_caching: false
           # 必须 == 全局 262144:写小(如 131072)会让超长的 polar 会话被 decode 直接
           # 400 拒掉(131159 run 里 176 次),session 全 ERROR 白跑。KV 按需分配,
           # 提上限不占静态显存;KV 满了请求排队(waiting)而不是报错。
