@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import functools
 import hashlib
+import json
 import os
 import time
 import uuid
@@ -294,12 +295,18 @@ async def _wait_for_backends_ready(
                 attempts=attempts,
                 last_request_id=request_id,
             )
-            for prefill_client_info in prefill_clients:
-                for decode_client_info in decode_clients:
+            # Startup preflight only proves the control plane and initial
+            # checkpoint can serve a request.  It must NOT be recorded as a
+            # baseline for post-weight-sync comparison: the first actor
+            # update intentionally changes the weights, so any pre-sync vs
+            # post-sync output comparison is invalid by construction.
+            for prefill_index, prefill_client_info in enumerate(prefill_clients):
+                for decode_index, decode_client_info in enumerate(decode_clients):
+                    pair_request_id = f"{request_id}-{prefill_index}-{decode_index}"
                     await _run_pd_preflight(
                         prefill_client_info,
                         decode_client_info,
-                        request_id,
+                        pair_request_id,
                     )
 
             _set_readiness_status(
@@ -429,12 +436,92 @@ def _parse_decode_urls(decode_list):
     return [url[0] for url in decode_list]
 
 
-def _build_preflight_request() -> dict[str, Any]:
+def _build_preflight_request(probe_nonce: str | None = None) -> dict[str, Any]:
+    content = "ping" if probe_nonce is None else f"pd-post-wake-probe:{probe_nonce}"
     return {
-        "messages": [{"role": "user", "content": "ping"}],
+        "messages": [{"role": "user", "content": content}],
         "max_tokens": 1,
         "temperature": 0.0,
         "stream": False,
+    }
+
+
+def _build_post_wake_probe_request(probe_nonce: str, approximate_tokens: int | None = None) -> dict[str, Any]:
+    if approximate_tokens is None:
+        approximate_tokens = int(os.environ.get("VIME_PD_POST_WAKE_PROBE_TOKENS", "24576"))
+    if approximate_tokens < 2048 or approximate_tokens > 65536:
+        raise ValueError(
+            "VIME_PD_POST_WAKE_PROBE_TOKENS must be between 2048 and 65536, "
+            f"got {approximate_tokens}"
+        )
+    # Keep the model input byte-identical between lifecycle stages. cache_salt
+    # isolates the requests from any local/external prefix cache without
+    # changing the token sequence whose output is compared.
+    content = "PD lifecycle fixed diagnostic input.\n" + "probe " * approximate_tokens
+    return {
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 64,
+        "min_tokens": 64,
+        "temperature": 0.0,
+        "seed": 1234,
+        "ignore_eos": True,
+        "return_token_ids": True,
+        "cache_salt": f"vime-pd-probe-{probe_nonce}",
+        "stream": False,
+    }
+
+
+def _response_fingerprint(body: dict[str, Any]) -> dict[str, Any]:
+    choices = body.get("choices") if isinstance(body, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise RuntimeError(
+            "probe response missing choices; "
+            f"body_type={type(body).__name__}"
+        )
+
+    choice = choices[0]
+    output_token_ids = choice.get("token_ids")
+    if isinstance(output_token_ids, list):
+        # Parser output can legitimately be empty for reasoning/tool models.
+        # When available, raw generated IDs are the only precision signal.
+        semantic_output: dict[str, Any] = {"token_ids": output_token_ids}
+        comparison_mode = "token_ids"
+    else:
+        message = choice.get("message")
+        semantic_output = {"finish_reason": choice.get("finish_reason")}
+        if isinstance(message, dict):
+            semantic_output["message"] = {
+                key: message.get(key)
+                for key in ("reasoning_content", "content", "tool_calls", "function_call")
+                if message.get(key) is not None
+            }
+        elif choice.get("text") is not None:
+            semantic_output["text"] = choice.get("text")
+        comparison_mode = "parsed_response"
+
+    canonical = json.dumps(
+        semantic_output,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
+    return {
+        "output_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "output_preview": canonical[:240],
+        "output_token_count": len(output_token_ids) if isinstance(output_token_ids, list) else 0,
+        # Keep the raw ids (bounded) so the caller can locate the first
+        # divergence instead of reducing every difference to hash!=hash.
+        "output_token_ids": output_token_ids[:256] if isinstance(output_token_ids, list) else None,
+        "first_output_token_id": (
+            output_token_ids[0]
+            if isinstance(output_token_ids, list) and output_token_ids
+            else None
+        ),
+        "comparison_mode": comparison_mode,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
     }
 
 
@@ -449,10 +536,12 @@ async def _run_pd_preflight(
     prefill_client_info: dict[str, Any],
     decode_client_info: dict[str, Any],
     request_id: str,
-) -> None:
+    req_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     api = "/v1/chat/completions"
-    req_data = _build_preflight_request()
+    req_data = dict(req_data or _build_preflight_request())
     headers = _make_internal_headers(request_id)
+    started = time.perf_counter()
 
     prefill_payload = _build_prefill_request(api, req_data, request_id)
     prefill_response = await prefill_client_info["client"].post(
@@ -462,11 +551,34 @@ async def _run_pd_preflight(
     )
     try:
         prefill_response.raise_for_status()
-        kv_transfer_params = _extract_prefill_kv_transfer_params(
-            prefill_response.json()
-        )
+        prefill_body = prefill_response.json()
+        kv_transfer_params = _extract_prefill_kv_transfer_params(prefill_body)
     finally:
         await prefill_response.aclose()
+
+    # The prefill leg samples one token after its local prefill.  That token is
+    # the model's own continuation of the exact KV it hands off, so it is the
+    # cleanest P-side health signal: if it differs from the direct run's first
+    # token, the disagg prefill path itself is broken before any transfer.
+    prefill_token_ids: list[int] | None = None
+    prefill_content_preview: str | None = None
+    prefill_finish_reason: str | None = None
+    try:
+        prefill_choices = prefill_body.get("choices") if isinstance(prefill_body, dict) else None
+        if isinstance(prefill_choices, list) and prefill_choices and isinstance(prefill_choices[0], dict):
+            candidate = prefill_choices[0].get("token_ids")
+            if isinstance(candidate, list):
+                prefill_token_ids = candidate[:8]
+            prefill_finish_reason = prefill_choices[0].get("finish_reason")
+            prefill_message = prefill_choices[0].get("message")
+            if isinstance(prefill_message, dict):
+                prefill_content_preview = str(
+                    prefill_message.get("reasoning_content") or prefill_message.get("content") or ""
+                )[:160]
+            elif prefill_choices[0].get("text") is not None:
+                prefill_content_preview = str(prefill_choices[0].get("text"))[:160]
+    except Exception:
+        prefill_token_ids = None
 
     decode_payload = _build_decode_payload(req_data, kv_transfer_params)
     decode_response = await decode_client_info["client"].post(
@@ -486,6 +598,69 @@ async def _run_pd_preflight(
             "PD preflight decode response missing choices; "
             f"body_type={type(body).__name__}"
         )
+
+    remote_block_ids = kv_transfer_params.get("remote_block_ids")
+    remote_group_block_counts = (
+        [len(group) if isinstance(group, list) else None for group in remote_block_ids]
+        if isinstance(remote_block_ids, list)
+        else None
+    )
+    # Cap per-group ids for log/response size; the full list is only needed for
+    # byte-level follow-ups, where the first/last blocks are what get hashed.
+    remote_block_ids_capped = (
+        [group[:4] + (["..."] if len(group) > 8 else []) + group[-4:] if isinstance(group, list) else group
+         for group in remote_block_ids]
+        if isinstance(remote_block_ids, list)
+        else None
+    )
+    return {
+        "request_id": request_id,
+        "prefill_url": prefill_client_info["url"],
+        "decode_url": decode_client_info["url"],
+        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
+        "remote_engine_id": kv_transfer_params.get("remote_engine_id"),
+        "remote_host": kv_transfer_params.get("remote_host"),
+        "remote_port": kv_transfer_params.get("remote_port"),
+        "remote_group_block_counts": remote_group_block_counts,
+        "remote_block_ids_capped": remote_block_ids_capped,
+        "prefill_token_ids": prefill_token_ids,
+        "prefill_content_preview": prefill_content_preview,
+        "prefill_finish_reason": prefill_finish_reason,
+        **_response_fingerprint(body),
+    }
+
+
+async def _run_direct_probe(
+    client_info: dict[str, Any],
+    request_id: str,
+    req_data: dict[str, Any],
+) -> dict[str, Any]:
+    """Serve the deterministic probe request on one engine without any KV handoff.
+
+    A same-weight-version P->D pair output is only comparable against something
+    that never crosses Mooncake: the same prompt served locally by the decode
+    (or prefill) engine itself.  This is the control half of the direct-vs-PD
+    precision boundary check.
+    """
+    api = "/v1/chat/completions"
+    headers = _make_internal_headers(request_id)
+    started = time.perf_counter()
+    response = await client_info["client"].post(
+        api,
+        json=dict(req_data),
+        headers=headers,
+    )
+    try:
+        response.raise_for_status()
+        body = response.json()
+    finally:
+        await response.aclose()
+    return {
+        "request_id": request_id,
+        "url": client_info["url"],
+        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
+        **_response_fingerprint(body),
+    }
 
 
 async def listen_for_disconnect(request: Request) -> None:
@@ -854,6 +1029,211 @@ async def metrics() -> PlainTextResponse:
     assert proxy_state is not None
     payload = await _collect_backend_metrics(proxy_state)
     return PlainTextResponse(payload, media_type="text/plain; version=0.0.4")
+
+@app.post("/vime/pd-revalidate")
+async def pd_revalidate(request: Request):
+    """Run deterministic long-context requests in one of two modes.
+
+    ``mode="pd"`` (default): exercise the production P->D Mooncake handoff for
+    the selected pair subset.  ``mode="direct"``: serve the identical request
+    locally on each selected engine with no KV transfer, which is the control
+    half of the same-weight-version direct-vs-PD boundary check.  Comparisons
+    across modes are only meaningful when the caller passes the same
+    ``probe_nonce`` (same prompt, same cache salt) in the same weight version.
+    """
+    assert proxy_state is not None
+    if not app.state.ready.is_set():
+        raise HTTPException(status_code=503, detail="PD proxy is not ready")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    cycle = str(payload.get("cycle", "unknown"))
+    policy_version = payload.get("policy_version")
+    probe_nonce = str(payload.get("probe_nonce") or f"{cycle}-{uuid.uuid4()}")
+    mode = str(payload.get("mode", "pd")).lower()
+    if mode not in ("pd", "direct"):
+        raise HTTPException(status_code=400, detail=f"mode must be 'pd' or 'direct', got {mode!r}")
+    probe_tokens = payload.get("probe_tokens")
+    if probe_tokens is not None:
+        if not isinstance(probe_tokens, int) or isinstance(probe_tokens, bool):
+            raise HTTPException(status_code=400, detail="probe_tokens must be an integer")
+        if probe_tokens < 2048 or probe_tokens > 65536:
+            raise HTTPException(status_code=400, detail="probe_tokens out of range [2048, 65536]")
+    # Debug callers may select a small subset of pairs to isolate one side's
+    # sleep/wake lifecycle.  The default remains the full Cartesian product.
+    def _selected_indices(key: str, size: int) -> list[int]:
+        raw = payload.get(key)
+        if raw is None:
+            return list(range(size))
+        if not isinstance(raw, list) or not all(isinstance(index, int) and not isinstance(index, bool) for index in raw):
+            raise HTTPException(status_code=400, detail=f"{key} must be a list of integer indices")
+        selected = sorted(set(raw))
+        if any(index < 0 or index >= size for index in selected):
+            raise HTTPException(status_code=400, detail=f"{key} contains an out-of-range index")
+        return selected
+
+    prefill_indices = _selected_indices("prefill_indices", len(proxy_state.prefill_clients))
+    decode_indices = _selected_indices("decode_indices", len(proxy_state.decode_clients))
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    if mode == "direct":
+        engine_targets = [
+            ("prefill", index, proxy_state.prefill_clients[index]) for index in prefill_indices
+        ] + [
+            ("decode", index, proxy_state.decode_clients[index]) for index in decode_indices
+        ]
+        for engine_role, engine_index, client_info in engine_targets:
+            request_id = f"pd-direct-{cycle}-{engine_role}{engine_index}-{uuid.uuid4()}"
+            try:
+                req_data = _build_post_wake_probe_request(probe_nonce, probe_tokens)
+                result = await _run_direct_probe(client_info, request_id, req_data)
+                result.update(
+                    {
+                        "engine_role": engine_role,
+                        "engine_index": engine_index,
+                        "probe_nonce": probe_nonce,
+                    }
+                )
+                results.append(result)
+                logger.info(
+                    "PD-DIRECT-PROBE pass cycle=%s policy_version=%s request_id=%s "
+                    "role=%s index=%s elapsed_ms=%s comparison_mode=%s output_tokens=%s "
+                    "output_sha256=%s",
+                    cycle,
+                    policy_version,
+                    request_id,
+                    engine_role,
+                    engine_index,
+                    result["elapsed_ms"],
+                    result["comparison_mode"],
+                    result["output_token_count"],
+                    result["output_sha256"],
+                )
+            except Exception as exc:
+                failure = {
+                    "request_id": request_id,
+                    "engine_role": engine_role,
+                    "engine_index": engine_index,
+                    "url": client_info["url"],
+                    "error": str(exc),
+                }
+                failures.append(failure)
+                logger.error(
+                    "PD-DIRECT-PROBE fail cycle=%s policy_version=%s request_id=%s "
+                    "role=%s index=%s error=%s",
+                    cycle,
+                    policy_version,
+                    request_id,
+                    engine_role,
+                    engine_index,
+                    exc,
+                    exc_info=True,
+                )
+        expected_results = len(engine_targets)
+    else:
+        for decode_index in decode_indices:
+            decode_client_info = proxy_state.decode_clients[decode_index]
+            for prefill_index in prefill_indices:
+                prefill_client_info = proxy_state.prefill_clients[prefill_index]
+                request_id = f"pd-post-wake-{cycle}-{prefill_index}-{decode_index}-{uuid.uuid4()}"
+                try:
+                    req_data = _build_post_wake_probe_request(probe_nonce, probe_tokens)
+                    result = await _run_pd_preflight(
+                        prefill_client_info,
+                        decode_client_info,
+                        request_id,
+                        req_data=req_data,
+                    )
+                    result.update(
+                        {
+                            "prefill_index": prefill_index,
+                            "decode_index": decode_index,
+                            "probe_nonce": probe_nonce,
+                        }
+                    )
+                    results.append(result)
+                    logger.info(
+                        "PD-POST-WAKE-PROBE pass cycle=%s policy_version=%s request_id=%s "
+                        "prefill=%s decode=%s elapsed_ms=%s remote_engine_id=%s "
+                        "remote_group_block_counts=%s comparison_mode=%s output_tokens=%s "
+                        "output_sha256=%s",
+                        cycle,
+                        policy_version,
+                        request_id,
+                        prefill_index,
+                        decode_index,
+                        result["elapsed_ms"],
+                        result["remote_engine_id"],
+                        result["remote_group_block_counts"],
+                        result["comparison_mode"],
+                        result["output_token_count"],
+                        result["output_sha256"],
+                    )
+                except Exception as exc:
+                    failure = {
+                        "request_id": request_id,
+                        "prefill_index": prefill_index,
+                        "decode_index": decode_index,
+                        "prefill_url": prefill_client_info["url"],
+                        "decode_url": decode_client_info["url"],
+                        "error": str(exc),
+                    }
+                    failures.append(failure)
+                    logger.error(
+                        "PD-POST-WAKE-PROBE fail cycle=%s policy_version=%s request_id=%s "
+                        "prefill=%s decode=%s error=%s",
+                        cycle,
+                        policy_version,
+                        request_id,
+                        prefill_index,
+                        decode_index,
+                        exc,
+                        exc_info=True,
+                    )
+        expected_results = len(prefill_indices) * len(decode_indices)
+
+    outputs_comparable = bool(results) and all(
+        result.get("comparison_mode") == "token_ids"
+        and int(result.get("output_token_count") or 0) > 0
+        for result in results
+    )
+    distinct_output_sha256 = sorted({result["output_sha256"] for result in results})
+    outputs_consistent = outputs_comparable and len(distinct_output_sha256) == 1
+    ok = (
+        not failures
+        and len(results) == expected_results
+        and outputs_comparable
+    )
+    response = {
+        "ok": ok,
+        "mode": mode,
+        "cycle": cycle,
+        "policy_version": policy_version,
+        "prefill_instances": len(proxy_state.prefill_clients),
+        "decode_instances": len(proxy_state.decode_clients),
+        "expected_results": expected_results,
+        "passed_results": len(results),
+        "failed_results": len(failures),
+        "outputs_comparable": outputs_comparable,
+        "outputs_consistent": outputs_consistent,
+        "distinct_output_sha256": distinct_output_sha256,
+        "results": results,
+        "failures": failures,
+    }
+    if ok and not outputs_consistent:
+        logger.warning(
+            "PD-REVALIDATE outputs differ within mode=%s cycle=%s distinct=%s",
+            mode,
+            cycle,
+            len(distinct_output_sha256),
+        )
+    return JSONResponse(status_code=200 if ok else 502, content=response)
 
 
 if __name__ == "__main__":
