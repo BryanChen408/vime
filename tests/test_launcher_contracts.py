@@ -266,6 +266,7 @@ def test_yarn_smoke_profile_is_isolated_and_capacity_matched() -> None:
     assert "Qwen3.6-35B-A3B_yarn_smoke" in source
     assert 'export NUM_ROLLOUT="${NUM_ROLLOUT:-2}"' in source
     assert "YARN_PREFLIGHT_ONLY" in source
+    assert 'export VIME_SAVE_TIS_LOGPROBS="${VIME_SAVE_TIS_LOGPROBS:-${POLAR_OUTPUT_DIR}/tis_evidence}"' in source
     assert 'exec bash "${SCRIPT_DIR}/start_sync_homo_single52.sh"' in source
     assert "start_sync_hybrid_single52.sh" not in source
     assert "profile.t2a.yaml" not in source

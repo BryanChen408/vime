@@ -45,6 +45,7 @@ export RUN_ID="${RUN_ID:-qwen36_yarn_smoke_$(date +%Y%m%d-%H%M%S)}"
 export SAVE="${SAVE:-/workspace/Qwen3.6-35B-A3B_yarn_smoke}"
 export SAVE_HF="${SAVE_HF:-/workspace/Qwen3.6-35B-A3B_yarn_smoke/rollout_{rollout_id}}"
 export POLAR_OUTPUT_DIR="${POLAR_OUTPUT_DIR:-output/polar_bridge_yarn_smoke}"
+export VIME_SAVE_TIS_LOGPROBS="${VIME_SAVE_TIS_LOGPROBS:-${POLAR_OUTPUT_DIR}/tis_evidence}"
 export LOG_FILE="${LOG_FILE:-/mnt/pipeline-data/train_log/train_${RUN_ID}.log}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-2}"
 

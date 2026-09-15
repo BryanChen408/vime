@@ -912,6 +912,7 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    current_log_probs_for_evidence = log_probs
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")
@@ -1063,15 +1064,19 @@ def policy_loss_function(
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
         train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
 
-        # Save per-token logprobs for train-inference consistency analysis
-        _save_ci_logprobs = os.environ.get("VIME_SAVE_TIS_LOGPROBS", "")
-        if _save_ci_logprobs:
-            _save_path = os.path.join(_save_ci_logprobs, f"tis_logprobs_step{getattr(args, 'curr_iteration', 0)}_rank{dist.get_rank()}.pt")
-            torch.save({
-                "old_log_probs": old_log_probs.detach().cpu(),
-                "rollout_log_probs": rollout_log_probs.detach().cpu(),
-            }, _save_path)
-            print(f"[VIME_SAVE_TIS_LOGPROBS] rank{dist.get_rank()} saved TIS logprobs to {_save_path}", flush=True)
+        from .validation_evidence import save_tis_validation_evidence
+
+        evidence_path = save_tis_validation_evidence(
+            args,
+            batch,
+            train_log_probs=train_log_probs_for_tis,
+            current_log_probs=current_log_probs_for_evidence,
+        )
+        if evidence_path is not None:
+            print(
+                f"[VIME_SAVE_TIS_LOGPROBS] rank{dist.get_rank()} saved validation evidence to {evidence_path}",
+                flush=True,
+            )
 
     reported_loss = {
         "loss": loss.clone().detach(),
