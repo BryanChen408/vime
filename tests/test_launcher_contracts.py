@@ -18,6 +18,7 @@ MODEL_SCRIPT = REPO_ROOT / "scripts" / "models" / "qwen3.5-35B-A3B.sh"
 SYNC_HYBRID = REPO_ROOT / "scripts" / "start_sync_hybrid.sh"
 SYNC_SINGLE52 = REPO_ROOT / "scripts" / "start_sync_hybrid_single52.sh"
 SYNC_HOMO_SINGLE52 = REPO_ROOT / "scripts" / "start_sync_homo_single52.sh"
+YARN_SMOKE_SINGLE52 = REPO_ROOT / "scripts" / "start_qwen36_yarn_smoke_single52.sh"
 
 
 def _source_text(path: Path) -> str:
@@ -248,6 +249,55 @@ def test_launchers_do_not_reintroduce_online_mtp_and_keep_yarn_opt_in() -> None:
     assert "FEAT_YARN=1" not in _source_text(SYNC_HOMO_SINGLE52)
 
 
+def test_yarn_smoke_profile_is_isolated_and_capacity_matched() -> None:
+    source = _source_text(YARN_SMOKE_SINGLE52)
+
+    assert "export FEAT_YARN=1" in source
+    assert 'YARN_SMOKE_CONTEXT_LEN="${YARN_SMOKE_CONTEXT_LEN:-262144}"' in source
+    assert '"${YARN_SMOKE_CONTEXT_LEN}" -ne 262144' in source
+    assert "homo stage-1 launcher only supports YARN_SMOKE_CONTEXT_LEN=262144" in source
+    for name in (
+        "SEQ_LENGTH",
+        "MAX_POSITION_EMBEDDINGS",
+        "ROLLOUT_MAX_CONTEXT_LEN",
+        "VLLM_MAX_MODEL_LEN",
+    ):
+        assert f'export {name}="${{YARN_SMOKE_CONTEXT_LEN}}"' in source
+    assert "Qwen3.6-35B-A3B_yarn_smoke" in source
+    assert 'export NUM_ROLLOUT="${NUM_ROLLOUT:-2}"' in source
+    assert "YARN_PREFLIGHT_ONLY" in source
+    assert 'exec bash "${SCRIPT_DIR}/start_sync_homo_single52.sh"' in source
+    assert "start_sync_hybrid_single52.sh" not in source
+    assert "profile.t2a.yaml" not in source
+    assert "profile.vime.yaml" not in source
+
+
+def test_yarn_smoke_profile_is_shell_valid() -> None:
+    result = subprocess.run(
+        ["bash", "-n", str(YARN_SMOKE_SINGLE52)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_yarn_stage1_smoke_rejects_a_later_capacity_length() -> None:
+    env = _shell_env()
+    env["YARN_SMOKE_CONTEXT_LEN"] = "270000"
+    result = subprocess.run(
+        ["bash", str(YARN_SMOKE_SINGLE52)],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "homo stage-1 launcher only supports YARN_SMOKE_CONTEXT_LEN=262144" in result.stderr
+
+
 def test_qwen36_model_defaults_to_standard_rope() -> None:
     result = _evaluate_yarn_model(enabled="0")
     assert result.returncode == 0, result.stderr
@@ -280,6 +330,7 @@ def test_qwen36_yarn_uses_one_fingerprint_for_training_and_rollout() -> None:
     assert "--yarn-correction-range-round-to-int" in args
     assert '--vllm-hf-overrides "${QWEN36_VLLM_HF_OVERRIDES}"' in _source_text(RUNNER)
     assert "--vllm-allow-long-max-model-len" in _source_text(RUNNER)
+    assert '--max-position-embeddings "${MAX_POSITION_EMBEDDINGS:-${SEQ_LENGTH:-131072}}"' in _source_text(RUNNER)
 
 
 def test_qwen36_yarn_rejects_invalid_boolean_gate() -> None:

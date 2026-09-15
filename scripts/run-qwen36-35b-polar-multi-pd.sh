@@ -505,7 +505,10 @@ MISC_ARGS=(
 )
 
 # ─── 特性开关(默认全 OFF = baseline 逐位不变)───
-[ "${FEAT_YARN}" = "1" ] && VLLM_ARGS+=(--vllm-allow-long-max-model-len)
+if [ "${FEAT_YARN}" = "1" ]; then
+   PERF_ARGS+=(--max-position-embeddings "${MAX_POSITION_EMBEDDINGS:-${SEQ_LENGTH:-131072}}")
+   VLLM_ARGS+=(--vllm-allow-long-max-model-len)
+fi
 [ "${FEAT_ASYNC_SCHED:-0}" = "1" ] && VLLM_ARGS+=(--vllm-async-scheduling)
 EP_ON=0
 # FEAT_CROSS_DP_EP=1:跨 DP EP —— DP(external-LB)+ EP 同开,EP world=dp×tp。vLLM 自动 flatten
