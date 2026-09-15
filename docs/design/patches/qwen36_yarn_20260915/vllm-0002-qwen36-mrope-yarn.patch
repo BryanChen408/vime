@@ -1,0 +1,164 @@
+diff --git a/tests/kernels/core/test_mrope_yarn.py b/tests/kernels/core/test_mrope_yarn.py
+new file mode 100644
+index 000000000..2019a8d5b
+--- /dev/null
++++ b/tests/kernels/core/test_mrope_yarn.py
+@@ -0,0 +1,78 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.config import VllmConfig, set_current_vllm_config
++from vllm.model_executor.layers.rotary_embedding.mrope import MRotaryEmbedding
++from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
++    YaRNScalingRotaryEmbedding,
++)
++
++
++@pytest.fixture(autouse=True)
++def default_vllm_config():
++    with set_current_vllm_config(VllmConfig()):
++        yield
++
++
++def _qwen35_mrope(**kwargs) -> MRotaryEmbedding:
++    return MRotaryEmbedding(
++        head_size=256,
++        rotary_dim=64,
++        max_position_embeddings=262_144,
++        base=10_000_000.0,
++        is_neox_style=True,
++        dtype=torch.float32,
++        mrope_section=[11, 11, 10],
++        mrope_interleaved=True,
++        scaling_factor=4.0,
++        beta_fast=32,
++        beta_slow=1,
++        truncate=True,
++        **kwargs,
++    )
++
++
++def test_yarn_mrope_uses_original_context_for_correction_range(monkeypatch):
++    monkeypatch.setattr(
++        MRotaryEmbedding,
++        "_compute_cos_sin_cache",
++        lambda self: torch.empty(0, self.rotary_dim),
++    )
++    rope = _qwen35_mrope()
++    expected = YaRNScalingRotaryEmbedding._compute_inv_freq(
++        SimpleNamespace(
++            base=rope.base,
++            rotary_dim=rope.rotary_dim,
++            beta_fast=rope.beta_fast,
++            beta_slow=rope.beta_slow,
++            max_position_embeddings=rope.original_max_position_embeddings,
++            truncate=rope.truncate,
++            extrapolation_factor=rope.extrapolation_factor,
++        ),
++        rope.scaling_factor,
++    )
++
++    torch.testing.assert_close(
++        rope._compute_inv_freq(rope.scaling_factor), expected, rtol=0, atol=0
++    )
++
++
++def test_yarn_mrope_does_not_apply_scaling_factor_twice_to_cache():
++    rope = MRotaryEmbedding(
++        head_size=16,
++        rotary_dim=8,
++        max_position_embeddings=128,
++        base=10_000.0,
++        is_neox_style=True,
++        dtype=torch.float32,
++        mrope_section=[2, 1, 1],
++        scaling_factor=4.0,
++    )
++
++    assert rope.cache_max_position_num == 512
++    assert rope.cos_sin_cache.shape == (512, 8)
+diff --git a/vllm/model_executor/layers/rotary_embedding/mrope.py b/vllm/model_executor/layers/rotary_embedding/mrope.py
+index 3c946dd13..49ee8f277 100644
+--- a/vllm/model_executor/layers/rotary_embedding/mrope.py
++++ b/vllm/model_executor/layers/rotary_embedding/mrope.py
+@@ -220,6 +220,7 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
+         beta_slow: int = 1,
+         truncate: bool = True,
+     ) -> None:
++        self.original_max_position_embeddings = max_position_embeddings
+         self.scaling_factor = scaling_factor
+         self.extrapolation_factor = extrapolation_factor
+         self.attn_factor = attn_factor
+@@ -233,8 +234,8 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
+             self.mscale = 1.0
+ 
+         # In Qwen2.5-VL, the maximum index value is related to the duration of
+-        # the input video. We enlarge max_position_embeddings to 4 times to get
+-        # a larger the cos and sin cache.
++        # the input video. This cache length must not be used as YaRN's
++        # original context length when computing its correction range.
+         self.cache_max_position_num = max_position_embeddings * 4
+         super().__init__(
+             head_size,
+@@ -253,12 +254,21 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
+     def _compute_inv_freq(self, base: float) -> torch.Tensor:
+         if self.scaling_factor is None:
+             return super()._compute_inv_freq(base)
+-        return YaRNScalingRotaryEmbedding._compute_inv_freq(self, base)
++        return YaRNScalingRotaryEmbedding._compute_inv_freq(
++            self,
++            base,
++            self.original_max_position_embeddings,
++        )
+ 
+     def _compute_cos_sin_cache(self) -> torch.Tensor:
+         if self.scaling_factor is None:
+             return super()._compute_cos_sin_cache()
+-        return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
++        inv_freq = self._compute_inv_freq(self.scaling_factor)
++        t = torch.arange(self.cache_max_position_num, dtype=torch.float32)
++        freqs = torch.einsum("i,j -> ij", t, inv_freq)
++        cos = freqs.cos() * self.mscale
++        sin = freqs.sin() * self.mscale
++        return torch.cat((cos, sin), dim=-1)
+ 
+     def forward_native(
+         self,
+diff --git a/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py b/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py
+index f01ca1e23..89315bec9 100644
+--- a/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py
++++ b/vllm/model_executor/layers/rotary_embedding/yarn_scaling_rope.py
+@@ -46,19 +46,26 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
+             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+         )
+ 
+-    def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
++    def _compute_inv_freq(
++        self,
++        scaling_factor: float,
++        original_max_position_embeddings: int | None = None,
++    ) -> torch.Tensor:
+         pos_freqs = self.base ** (
+             torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+         )
+         inv_freq_extrapolation = 1.0 / pos_freqs
+         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
+ 
++        if original_max_position_embeddings is None:
++            original_max_position_embeddings = self.max_position_embeddings
++
+         low, high = yarn_find_correction_range(
+             self.beta_fast,
+             self.beta_slow,
+             self.rotary_dim,
+             self.base,
+-            self.max_position_embeddings,
++            original_max_position_embeddings,
+             self.truncate,
+         )
+         # Get n-d rotational scaling corrected for extrapolation
