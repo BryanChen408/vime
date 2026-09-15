@@ -185,6 +185,36 @@ def test_yarn_training_and_rollout_fingerprints_match(monkeypatch, caplog):
 
 
 @pytest.mark.unit
+def test_yarn_training_only_replay_does_not_require_rollout_config(monkeypatch, caplog):
+    module = load_arguments_module(monkeypatch)
+    args = make_yarn_args(
+        debug_train_only=True,
+        vllm_hf_overrides=None,
+        vllm_allow_long_max_model_len=False,
+        rollout_max_context_len=None,
+        vllm_max_model_len=None,
+    )
+
+    with caplog.at_level("INFO"):
+        module._validate_yarn_consistency(args)
+
+    assert "Resolved training-only YaRN fingerprint" in caplog.text
+
+
+@pytest.mark.unit
+def test_yarn_training_only_replay_rejects_training_capacity_mismatch(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_yarn_args(
+        debug_train_only=True,
+        vllm_hf_overrides=None,
+        max_position_embeddings=65536,
+    )
+
+    with pytest.raises(ValueError, match="training replay capacity mismatch"):
+        module._validate_yarn_consistency(args)
+
+
+@pytest.mark.unit
 def test_yarn_fingerprint_mismatch_is_rejected(monkeypatch):
     module = load_arguments_module(monkeypatch)
     args = make_yarn_args()

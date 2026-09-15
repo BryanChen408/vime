@@ -139,6 +139,26 @@ def _validate_yarn_consistency(args):
     training_enabled = training["rope_type"] == "yarn"
     rollout_enabled = rollout is not None and rollout.get("rope_type", rollout.get("type")) == "yarn"
 
+    if getattr(args, "debug_train_only", False):
+        if not training_enabled:
+            return
+
+        capacities = {
+            "seq_length": getattr(args, "seq_length", None),
+            "max_position_embeddings": getattr(args, "max_position_embeddings", None),
+        }
+        if any(value is None for value in capacities.values()):
+            raise ValueError(f"YaRN training replay requires explicit training capacity fields: {capacities}")
+        if len(set(capacities.values())) != 1:
+            raise ValueError(f"YaRN training replay capacity mismatch: {capacities}")
+
+        logger.info(
+            "Resolved training-only YaRN fingerprint: %s; capacity: %s",
+            json.dumps(training, sort_keys=True),
+            json.dumps(capacities, sort_keys=True),
+        )
+        return
+
     if not training_enabled and not rollout_enabled:
         return
     if training_enabled != rollout_enabled:
