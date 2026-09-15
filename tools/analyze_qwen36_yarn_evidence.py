@@ -48,6 +48,50 @@ def _stats(values: torch.Tensor) -> dict[str, float | int]:
     }
 
 
+def _signed_stats(values: torch.Tensor) -> dict[str, float | int]:
+    values = values.float().flatten()
+    if values.numel() == 0:
+        return {
+            "count": 0,
+            "mean": math.nan,
+            "min": math.nan,
+            "p05": math.nan,
+            "p50": math.nan,
+            "p95": math.nan,
+            "max": math.nan,
+        }
+    return {
+        "count": int(values.numel()),
+        "mean": float(values.mean().item()),
+        "min": float(values.min().item()),
+        "p05": _quantile(values, 0.05),
+        "p50": _quantile(values, 0.50),
+        "p95": _quantile(values, 0.95),
+        "max": float(values.max().item()),
+    }
+
+
+def _delta_diagnostics(delta: torch.Tensor) -> dict[str, Any]:
+    delta = delta.float().flatten()
+    importance_ratio = torch.exp(delta)
+    return {
+        "signed_delta": _signed_stats(delta),
+        "absolute_delta": _stats(delta.abs()),
+        "importance_ratio": {
+            **_stats(importance_ratio),
+            "min": float(importance_ratio.min().item()),
+        },
+        "fractions": {
+            "abs_delta_gt_0_1": float((delta.abs() > 0.1).float().mean().item()),
+            "abs_delta_gt_1": float((delta.abs() > 1.0).float().mean().item()),
+            "importance_ratio_gt_2": float((importance_ratio > 2.0).float().mean().item()),
+            "importance_ratio_outside_0_5_2": float(
+                ((importance_ratio < 0.5) | (importance_ratio > 2.0)).float().mean().item()
+            ),
+        },
+    }
+
+
 def _sample_key(record: dict[str, Any], index: int) -> tuple[Any, ...]:
     return (
         int(record["step"]),
@@ -171,6 +215,106 @@ def summarize(path: Path) -> dict[str, Any]:
     return result
 
 
+def boundary_analysis(
+    path: Path,
+    *,
+    boundary: int | None = None,
+    bin_size: int = 32_768,
+) -> dict[str, Any]:
+    if bin_size <= 0:
+        raise ValueError("bin_size must be positive")
+    records = load_evidence(path)
+    if boundary is None:
+        boundaries = {
+            int(record["yarn_fingerprint"]["original_max_position_embeddings"])
+            for record in records
+            if record["yarn_fingerprint"].get("original_max_position_embeddings") is not None
+        }
+        if len(boundaries) != 1:
+            raise ValueError(
+                "could not infer one original_max_position_embeddings value; "
+                f"found {sorted(boundaries)}"
+            )
+        boundary = boundaries.pop()
+
+    positions = []
+    deltas = []
+    for record in records:
+        for index in range(len(record["total_lengths"])):
+            vectors = _valid_vectors(record, index)
+            positions.append(vectors["positions"].long())
+            deltas.append(vectors["train_log_probs"] - vectors["rollout_log_probs"])
+    all_positions = torch.cat(positions)
+    all_deltas = torch.cat(deltas).float()
+    max_position = int(all_positions.max().item())
+    if max_position < boundary:
+        raise ValueError(f"no extrapolated positions at or above boundary {boundary}")
+
+    extrapolated_width = max_position - boundary + 1
+    before_start = boundary - extrapolated_width
+
+    def region(start: int, end: int) -> dict[str, Any]:
+        mask = (all_positions >= start) & (all_positions < end)
+        if not mask.any():
+            raise ValueError(f"no evidence tokens in position range [{start}, {end})")
+        return {
+            "position_start_inclusive": start,
+            "position_end_exclusive": end,
+            **_delta_diagnostics(all_deltas[mask]),
+        }
+
+    before = region(before_start, boundary)
+    after = region(boundary, max_position + 1)
+    before_abs = before["absolute_delta"]
+    after_abs = after["absolute_delta"]
+    before_clip = before["fractions"]["importance_ratio_gt_2"]
+    after_clip = after["fractions"]["importance_ratio_gt_2"]
+    comparison = {
+        "equal_width_tokens_per_sample": extrapolated_width,
+        "after_to_before_abs_mean_ratio": after_abs["mean"] / before_abs["mean"],
+        "after_to_before_abs_p95_ratio": after_abs["p95"] / before_abs["p95"],
+        "after_minus_before_importance_ratio_gt_2_fraction": after_clip - before_clip,
+        "diagnostic_thresholds": {
+            "max_abs_mean_ratio": 1.10,
+            "max_abs_p95_ratio": 1.10,
+            "max_importance_ratio_gt_2_fraction_increase": 0.01,
+        },
+    }
+    comparison["no_boundary_cliff"] = bool(
+        comparison["after_to_before_abs_mean_ratio"] <= 1.10
+        and comparison["after_to_before_abs_p95_ratio"] <= 1.10
+        and comparison["after_minus_before_importance_ratio_gt_2_fraction"] <= 0.01
+    )
+
+    bins = []
+    for start in range(0, max_position + 1, bin_size):
+        end = min(start + bin_size, max_position + 1)
+        mask = (all_positions >= start) & (all_positions < end)
+        if mask.any():
+            bins.append(
+                {
+                    "position_start_inclusive": start,
+                    "position_end_exclusive": end,
+                    **_delta_diagnostics(all_deltas[mask]),
+                }
+            )
+
+    return {
+        "evidence_dir": str(path),
+        "boundary_position": boundary,
+        "max_logit_position": max_position,
+        "token_count": int(all_positions.numel()),
+        "regions": {
+            "all": region(int(all_positions.min().item()), max_position + 1),
+            "within_original": region(int(all_positions.min().item()), boundary),
+            "equal_width_before_boundary": before,
+            "extrapolated": after,
+        },
+        "boundary_comparison": comparison,
+        "position_bins": bins,
+    }
+
+
 def _token_map(records: list[dict[str, Any]], field: str) -> dict[tuple[Any, ...], float]:
     result: dict[tuple[Any, ...], float] = {}
     for record in records:
@@ -227,6 +371,14 @@ def _parse_args() -> argparse.Namespace:
     compare_parser.add_argument("reference_dir", type=Path)
     compare_parser.add_argument("candidate_dir", type=Path)
     compare_parser.add_argument("--output", type=Path)
+
+    boundary_parser = subparsers.add_parser(
+        "boundary", help="Compare train/rollout deltas before and after the YaRN boundary"
+    )
+    boundary_parser.add_argument("evidence_dir", type=Path)
+    boundary_parser.add_argument("--boundary", type=int)
+    boundary_parser.add_argument("--bin-size", type=int, default=32_768)
+    boundary_parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
@@ -234,8 +386,14 @@ def main() -> None:
     args = _parse_args()
     if args.command == "summary":
         result = summarize(args.evidence_dir)
-    else:
+    elif args.command == "compare":
         result = compare(args.reference_dir, args.candidate_dir)
+    else:
+        result = boundary_analysis(
+            args.evidence_dir,
+            boundary=args.boundary,
+            bin_size=args.bin_size,
+        )
     rendered = json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n"
     print(rendered, end="")
     if args.output is not None:

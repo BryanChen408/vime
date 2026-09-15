@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tools.analyze_qwen36_yarn_evidence import compare, summarize
+from tools.analyze_qwen36_yarn_evidence import boundary_analysis, compare, summarize
 from vime.backends.megatron_utils import validation_evidence
 
 
@@ -83,6 +83,25 @@ def test_compare_requires_and_compares_identical_token_keys(tmp_path: Path) -> N
     assert result["token_sets_equal"] is True
     assert result["shared_token_count"] == 3
     assert result["train_logprob_abs_diff"]["max"] == pytest.approx(0.01, abs=1e-6)
+
+
+def test_boundary_analysis_compares_equal_width_position_regions(tmp_path: Path) -> None:
+    evidence = tmp_path / "boundary"
+    records = [
+        _record(cp_rank=0, cp_size=2, positions=[1, 3], values=[-1.0, -2.0]),
+        _record(cp_rank=1, cp_size=2, positions=[4], values=[-3.0]),
+    ]
+    for record in records:
+        record["yarn_fingerprint"]["original_max_position_embeddings"] = 4
+    _write(evidence, records)
+
+    result = boundary_analysis(evidence, bin_size=2)
+
+    assert result["boundary_position"] == 4
+    assert result["regions"]["equal_width_before_boundary"]["signed_delta"]["count"] == 1
+    assert result["regions"]["extrapolated"]["signed_delta"]["count"] == 1
+    assert result["boundary_comparison"]["after_to_before_abs_mean_ratio"] == pytest.approx(1.0)
+    assert result["boundary_comparison"]["no_boundary_cliff"] is True
 
 
 def test_runtime_dump_is_microbatch_unique_and_self_describing(tmp_path: Path, monkeypatch) -> None:
