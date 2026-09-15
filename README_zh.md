@@ -53,6 +53,7 @@ vLLM 社区横向支持许多 LLM post-training 框架，包括（按字母顺�
 有关环境配置、数据准备、训练启动和关键代码分析的完整快速开始指南，请参考：
 
 - [快速开始指南](./docs/zh/get_started/quick_start.md)
+- [Qwen3.6 YaRN 开启与配置](./docs/README_qwen36_yarn.md)
 
 我们还提供了一些未在快速开始中覆盖的使用示例，请查看 [examples](examples/)。
 

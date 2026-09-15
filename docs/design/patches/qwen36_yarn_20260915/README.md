@@ -72,7 +72,7 @@ git -C /path/to/Megatron-LM diff --check
 git -C /path/to/vllm diff --check
 
 cd /path/to/Megatron-LM
-pytest -q \
+python3 -m pytest -q --noconftest \
   tests/unit_tests/test_yarn_arguments.py \
   tests/unit_tests/models/test_yarn_rotary_pos_embedding.py
 
@@ -82,3 +82,26 @@ cd /path/to/vllm
 
 The VIME preflight and end-to-end launch commands are documented in
 [`../../../README_qwen36_yarn.md`](../../../README_qwen36_yarn.md).
+
+The two Megatron test files have their own CPU fixtures. `--noconftest` isolates
+them from the repository-wide CUDA/Transformer Engine and dataset-download
+fixtures, which are unavailable in the tested Ascend environment.
+
+## Bundle and transplant verification (2026-09-15)
+
+- Both patch series applied in order to detached worktrees at the listed bases.
+  The Megatron result matched `78c0ead8c`, including the new tests; all three
+  vLLM YaRN files matched the tested working copy. The unrelated GSM8K change
+  was excluded.
+- VIME was transplanted onto local `a3-pd@9e744502` as nine commits. All 38
+  YaRN-only paths and 12 a3-pd-only paths were preserved. The sole shared path,
+  `vllm_engine.py`, retained both the per-group configuration merge and the
+  YaRN child-process environment injection.
+- Focused VIME tests: 142 passed before and after transplant. Megatron isolated
+  YaRN tests: 13 passed. Shell syntax and Python compilation checks passed.
+- After transplant, the 262144-token configuration preflight and the CPU
+  Transformers/Megatron/vLLM comparison at positions through 299999 passed.
+  The dedicated vLLM pytest suite was not rerun during packaging because its
+  required `.venv` was absent; the VIME math tool exercised the patched code.
+- No full rollout/training run was repeated after transplant. The earlier
+  300K run evidence remains scoped to its recorded runtime and revision.
