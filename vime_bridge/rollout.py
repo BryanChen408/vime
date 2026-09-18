@@ -259,6 +259,7 @@ def prepare_initial_policy(args: Any, policy_version: int) -> dict[str, Any]:
         kind="bootstrap",
     )
     _set_policy_transition(transition)
+    partial_rollout = bool(getattr(args, "polar_partial_rollout", False))
     payload = _post_policy_control(
         args,
         "/rollout/admin/policy/bootstrap/begin",
@@ -266,6 +267,8 @@ def prepare_initial_policy(args: Any, policy_version: int) -> dict[str, Any]:
             "transition_id": transition_id,
             "policy_namespace": namespace,
             "epoch": int(policy_version),
+            "partial_rollout": partial_rollout,
+            "partial_rollout_protocol": 2 if partial_rollout else 0,
         },
         transition_id=transition_id,
     )
@@ -281,13 +284,19 @@ def prepare_initial_policy(args: Any, policy_version: int) -> dict[str, Any]:
         transition,
         phases={"admission_closed", "ready_for_training"},
     )
-    if getattr(args, "polar_partial_rollout", False):
-        nodes = payload.get("gateway_nodes", {})
-        if (payload.get("partial_rollout_protocol") != 2 or not nodes
-                or not all(n.get("status") == "ok"
-                           and n.get("response", {}).get("partial_rollout_protocol") == 2
-                           for n in nodes.values())):
-            raise PolarRolloutSchedulerError("Session partial rollout requires protocol 2 on coordinator and all gateways")
+    nodes = payload.get("gateway_nodes", {})
+    if (payload.get("rollout_mode_negotiated") is not True
+            or payload.get("partial_rollout") is not partial_rollout
+            or payload.get("partial_rollout_protocol") != 2 or not nodes
+            or not all(n.get("status") == "ok"
+                       and n.get("response", {}).get("partial_rollout") is partial_rollout
+                       and n.get("response", {}).get("rollout_namespace") == namespace
+                       and n.get("response", {}).get("partial_rollout_protocol") == (2 if partial_rollout else 0)
+                       for n in nodes.values())):
+        raise PolarRolloutSchedulerError(
+            "Bootstrap rollout mode was not acknowledged by coordinator and all gateways; "
+            "upgrade Polar to a version supporting bootstrap mode negotiation"
+        )
     return {
         "all_paused": True,
         "all_drained": payload.get("phase") == "ready_for_training",

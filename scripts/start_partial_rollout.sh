@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Opt-in wrapper; keeps the resource layout/model/dataset options of the main launcher.
+# Vime negotiates session partial mode with Polar during bootstrap; no Polar-side
+# partial environment variables are needed. Both Polar services must support it.
 set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export POLAR_PARTIAL_ROLLOUT=1

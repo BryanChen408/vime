@@ -498,8 +498,9 @@ def test_sync_transaction_uses_zero_inflight_instead_of_worker_cutoff(
     }
 
 
-def test_bootstrap_closes_before_first_weight_evidence_and_commits_namespace(monkeypatch) -> None:
-    args = _args(polar_policy_transition_enabled=True)
+@pytest.mark.parametrize("partial", [False, True])
+def test_bootstrap_closes_before_first_weight_evidence_and_commits_namespace(monkeypatch, partial) -> None:
+    args = _args(polar_policy_transition_enabled=True, polar_partial_rollout=partial)
     calls = []
     monkeypatch.setattr(rollout, "_global_async_worker", None)
     monkeypatch.setattr(rollout, "_process_policy_transition", None)
@@ -511,7 +512,17 @@ def test_bootstrap_closes_before_first_weight_evidence_and_commits_namespace(mon
         calls.append((path, dict(json_payload), transition_id))
         if path.endswith("/bootstrap/begin"):
             assert context.from_engine_versions == {}
-            return _transition_payload(context, "admission_closed")
+            return {
+                **_transition_payload(context, "admission_closed"),
+                "rollout_mode_negotiated": True,
+                "partial_rollout": partial,
+                "partial_rollout_protocol": 2,
+                "gateway_nodes": {"n1": {"status": "ok", "response": {
+                    "partial_rollout": partial,
+                    "partial_rollout_protocol": 2 if partial else 0,
+                    "rollout_namespace": context.policy_namespace,
+                }}},
+            }
         if path.endswith("/confirm-drained"):
             return _transition_payload(context, "ready_for_training")
         if path.endswith("/commit"):
@@ -534,9 +545,48 @@ def test_bootstrap_closes_before_first_weight_evidence_and_commits_namespace(mon
         "transition_id": calls[0][2],
         "policy_namespace": namespace,
         "epoch": 0,
+        "partial_rollout": partial,
+        "partial_rollout_protocol": 2 if partial else 0,
     }
     assert rollout._last_committed_policy == (calls[0][2], namespace, 0)
     assert rollout._process_policy_transition is None
+
+
+@pytest.mark.parametrize("mismatch", ["legacy", "mode", "namespace", "node_error", "protocol", "no_nodes"])
+def test_bootstrap_requires_actual_mode_acknowledgement(monkeypatch, mismatch):
+    args = _args(polar_policy_transition_enabled=True, polar_partial_rollout=True)
+    monkeypatch.setattr(rollout, "_global_async_worker", None)
+    monkeypatch.setattr(rollout, "_process_policy_transition", None)
+
+    def post(*_args, **_kwargs):
+        context = rollout._current_policy_transition()
+        node = {"status": "ok", "response": {
+            "partial_rollout": True, "partial_rollout_protocol": 2,
+            "rollout_namespace": context.policy_namespace,
+        }}
+        payload = {
+            **_transition_payload(context, "admission_closed"),
+            "rollout_mode_negotiated": True, "partial_rollout": True,
+            "partial_rollout_protocol": 2,
+            "gateway_nodes": {"n1": node},
+        }
+        if mismatch == "legacy":
+            payload.pop("rollout_mode_negotiated")
+        elif mismatch == "mode":
+            node["response"]["partial_rollout"] = False
+        elif mismatch == "namespace":
+            node["response"]["rollout_namespace"] = "stale-run"
+        elif mismatch == "node_error":
+            node["status"] = "error"
+        elif mismatch == "protocol":
+            node["response"]["partial_rollout_protocol"] = 1
+        else:
+            payload["gateway_nodes"] = {}
+        return payload
+
+    monkeypatch.setattr(rollout, "_post_policy_control", post)
+    with pytest.raises(rollout.PolarRolloutSchedulerError, match="not acknowledged"):
+        rollout.prepare_initial_policy(args, 0)
 
 
 def test_explicit_policy_control_4xx_is_not_reconciled(monkeypatch) -> None:
