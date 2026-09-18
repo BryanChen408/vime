@@ -101,12 +101,13 @@ fi
 # async 是默认基线；同步 rollout 只在 train.py 中有明确的 zero-inflight 边界。
 # durable policy transition 同样依赖 train.py 的 prepare/finish 事务，train_async.py
 # 会重叠生成和权重变更，因此在启动前直接拒绝这个组合，避免 Ray 建好后才失败。
+POLAR_PARTIAL_ROLLOUT=${POLAR_PARTIAL_ROLLOUT:-0}
 FEAT_SYNC_ROLLOUT=${FEAT_SYNC_ROLLOUT:-0}
 case "${FEAT_SYNC_ROLLOUT}" in
    0|1) ;;
    *) echo "[launcher][FATAL] FEAT_SYNC_ROLLOUT must be 0 or 1, got ${FEAT_SYNC_ROLLOUT}" >&2; exit 1 ;;
 esac
-if [ "${FEAT_COLOCATE}" = "1" ] && [ "${FEAT_SYNC_ROLLOUT}" != "1" ]; then
+if [ "${FEAT_COLOCATE}" = "1" ] && [ "${FEAT_SYNC_ROLLOUT}" != "1" ] && [ "${POLAR_PARTIAL_ROLLOUT}" != "1" ]; then
    echo "[launcher][FATAL] FEAT_COLOCATE=1 requires FEAT_SYNC_ROLLOUT=1" >&2
    exit 1
 fi
@@ -295,7 +296,7 @@ TOPO_ARGS=(
 
 # 训练入口和 rollout 函数必须成对选择：同步入口一次性等待每个 group 到终态，
 # 返回时没有跨步 session；异步入口继续复用远端 session_pool/persistent worker。
-if [ "${FEAT_SYNC_ROLLOUT}" = "1" ]; then
+if [ "${FEAT_SYNC_ROLLOUT}" = "1" ] && [ "${POLAR_PARTIAL_ROLLOUT}" != "1" ]; then
    ROLLOUT_FN=vime_bridge.rollout.generate_rollout_polar_sync
    SYNC_FACTOR=${POLAR_SYNC_OVERSUBSCRIBE_FACTOR:-1.0}
    python3 - "${SYNC_FACTOR}" <<'PY'
@@ -320,6 +321,9 @@ else
       --rollout-max-active-sessions "${POLAR_MAX_ACTIVE_SESSIONS:-16}"
       --rollout-release-on-postrun
    )
+   if [ -n "${POLAR_MAX_OWNED_GROUPS:-}" ]; then
+      SCHED_ARGS+=(--rollout-max-owned-groups "${POLAR_MAX_OWNED_GROUPS}")
+   fi
 fi
 
 # TIS 校正的是 vLLM logprob 与 Megatron 重算 logprob 的数值失配，与同步/异步
@@ -355,7 +359,7 @@ ROLLOUT_ARGS=(
 
 # session_pool 的 drain/staleness 只属于 async worker；sync 的 zero-inflight 契约
 # 不依赖这些参数。durable transition 两种模式都保留，sync 由事务层验证零在飞。
-if [ "${FEAT_SYNC_ROLLOUT}" = "1" ]; then
+if [ "${FEAT_SYNC_ROLLOUT}" = "1" ] && [ "${POLAR_PARTIAL_ROLLOUT}" != "1" ]; then
    DRAIN_ARGS=()
    STALENESS_ARGS=()
 else
@@ -378,6 +382,22 @@ else
    POLICY_TRANSITION_ARGS=(--no-polar-policy-transition-enabled)
 fi
 
+PARTIAL_ARGS=()
+if [ "${POLAR_PARTIAL_ROLLOUT}" = "1" ]; then
+   if [ "${TRAIN_ENTRY}" != "train.py" ] || [ "${POLAR_POLICY_TRANSITION_ENABLED}" != "1" ] || [ "${POLAR_DISABLE_TIS:-0}" = "1" ]; then
+      echo "[launcher][FATAL] partial rollout requires TRAIN_ENTRY=train.py, durable transitions and TIS" >&2
+      exit 1
+   fi
+   if [ -n "${POLAR_MAX_OFF_POLICY_STEPS:-}" ] && [ "${POLAR_MAX_OFF_POLICY_STEPS}" != "1" ]; then
+      echo "[launcher][FATAL] partial rollout staleness must equal 1" >&2
+      exit 1
+   fi
+   STALENESS_ARGS=(--rollout-max-off-policy-steps 1)
+   DRAIN_ARGS=(--no-polar-weight-update-drain-sessions)
+   PARTIAL_ARGS=(--polar-partial-rollout --get-mismatch-metrics)
+   POLAR_MIN_COMPLETE_ACCEPT_FRACTION=${POLAR_MIN_COMPLETE_ACCEPT_FRACTION:-1.0}
+fi
+
 POLAR_ARGS=(
    --polar-url "${POLAR_ROLLOUT_URL}"
    --polar-run-id "${RUN_ID}"
@@ -391,6 +411,7 @@ POLAR_ARGS=(
    ${DRAIN_ARGS[@]+"${DRAIN_ARGS[@]}"}
    ${POLICY_TRANSITION_ARGS[@]+"${POLICY_TRANSITION_ARGS[@]}"}
    ${STALENESS_ARGS[@]+"${STALENESS_ARGS[@]}"}
+   ${PARTIAL_ARGS[@]+"${PARTIAL_ARGS[@]}"}
 )
 
 # [FLOOR] 轨迹内 trace 保底权重(vime/ray/rollout.py 的 rollout_mask_sums 分母)。

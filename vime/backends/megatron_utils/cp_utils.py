@@ -168,6 +168,16 @@ def reduce_train_step_metrics(
     for x in losses_reduced:
         values = x["values"] if values is None else values + x["values"]
     assert len(keys) + 1 == values.numel()
+    from vime.utils.rollout_prob_metrics import STAT_KEYS, probability_diff_metrics
+
+    probability_stats = None
+    if STAT_KEYS[0] in keys:
+        indices = [keys.index(key) + 1 for key in STAT_KEYS]
+        # SUM sufficient statistics across microbatches and DP*CP; MAX separately.
+        probability_stats = values[indices].clone()
+        probability_stats[3] = torch.stack([x["values"][indices[3]] for x in losses_reduced]).max()
+        dist.all_reduce(probability_stats[:3], group=dp_with_cp_group)
+        dist.all_reduce(probability_stats[3:], op=dist.ReduceOp.MAX, group=dp_with_cp_group)
     dist.all_reduce(values, group=dp_with_cp_group)
     values = values.tolist()
 
@@ -177,7 +187,11 @@ def reduce_train_step_metrics(
     else:
         num_samples_or_tokens = step_global_batch_size
         cp_factor = 1
-    return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
+    result = {key: value * cp_factor / num_samples_or_tokens
+              for key, value in zip(keys, values[1:], strict=False) if key not in STAT_KEYS}
+    if probability_stats is not None:
+        result.update(probability_diff_metrics(*probability_stats.tolist()))
+    return result
 
 
 def rollout_log_metric_contribution(

@@ -281,6 +281,13 @@ def prepare_initial_policy(args: Any, policy_version: int) -> dict[str, Any]:
         transition,
         phases={"admission_closed", "ready_for_training"},
     )
+    if getattr(args, "polar_partial_rollout", False):
+        nodes = payload.get("gateway_nodes", {})
+        if (payload.get("partial_rollout_protocol") != 2 or not nodes
+                or not all(n.get("status") == "ok"
+                           and n.get("response", {}).get("partial_rollout_protocol") == 2
+                           for n in nodes.values())):
+            raise PolarRolloutSchedulerError("Session partial rollout requires protocol 2 on coordinator and all gateways")
     return {
         "all_paused": True,
         "all_drained": payload.get("phase") == "ready_for_training",
@@ -386,7 +393,7 @@ def commit_policy_update_boundary(
             # Publish the local detach fence, but do not make training wait for it.
             # It runs while the trainer is busy and finish_policy_update verifies it
             # before reopening admission.
-            worker.request_policy_versions_before(policy_version)
+            worker.request_policy_versions_before(policy_version - (1 if getattr(worker.config, "partial_rollout", False) else 0))
         transition = _require_policy_transition(policy_version)
         payload = _confirm_policy_transition_drained(
             args,
@@ -856,7 +863,7 @@ def _commit_active_policy_transition(
         worker = _global_async_worker
     if worker is not None and worker.config.scheduler_mode == "session_pool":
         worker.wait_policy_versions_before(
-            policy_version,
+            policy_version - (1 if getattr(worker.config, "partial_rollout", False) else 0),
             timeout=_policy_control_timeout(args),
         )
     payload = _post_policy_control(
@@ -947,6 +954,7 @@ def _begin_policy_transition(
                 "from_epoch": from_epoch,
                 "to_epoch": int(policy_version),
                 "engine_versions": evidence,
+                **({"partial_rollout": True} if getattr(args, "polar_partial_rollout", False) else {}),
             },
             transition_id=transition_id,
         )
@@ -962,6 +970,8 @@ def _begin_policy_transition(
             transition,
             phases={"admission_closed", "ready_for_training"},
         )
+        if getattr(args, "polar_partial_rollout", False) and payload.get("partial_rollout") is not True:
+            raise PolarRolloutSchedulerError("Polar coordinator did not acknowledge partial-rollout retention")
         return {
             "all_paused": True,
             "all_drained": payload.get("phase") == "ready_for_training",
@@ -1968,6 +1978,8 @@ class AsyncPolarRolloutWorker:
     def begin_policy_update_drain(self, policy_version: int) -> None:
         with self._state_lock:
             self._policy_update_draining = True
+            if self.config.partial_rollout:
+                self._admission_paused = True
             self._policy_update_target_version = int(policy_version)
             self._policy_update_drain_started_at = time.monotonic()
             self._policy_update_drain_complete.clear()
@@ -2049,6 +2061,8 @@ class AsyncPolarRolloutWorker:
 
     def finish_policy_update_drain(self) -> None:
         with self._state_lock:
+            if self.config.partial_rollout:
+                self._admission_paused = False
             self._policy_update_draining = False
             self._policy_update_target_version = None
             self._policy_update_drain_started_at = None
@@ -2072,7 +2086,12 @@ class AsyncPolarRolloutWorker:
                 if not self._ready_groups:
                     self._ready_group_count = len(self._ready_groups)
                     break
-                group_id = next(iter(self._ready_groups))
+                group_id = (min(self._ready_groups, key=lambda gid: (
+                    self._ready_groups[gid].completed.policy_version
+                    if self._ready_groups[gid].completed is not None else -1,
+                    self._ready_groups[gid].completed.completed_at
+                    if self._ready_groups[gid].completed is not None else 0,
+                )) if self.config.partial_rollout else next(iter(self._ready_groups)))
                 ready = self._ready_groups.pop(group_id)
                 self._ready_group_count = len(self._ready_groups)
 
@@ -2081,7 +2100,19 @@ class AsyncPolarRolloutWorker:
             completed = ready.completed
             if completed is None:
                 continue
-            staleness = max(0, int(rollout_id) - completed.policy_version)
+            if self.config.partial_rollout:
+                versions = [
+                    (getattr(sample, "metadata", {}) or {}).get("polar", {}).get("trajectory_metadata", {}).get("oldest_policy_version")
+                    for sample in completed.samples
+                ]
+                if any(v is None for v in versions):
+                    self._inc_metric("polar/partial/missing_provenance_groups")
+                    self._inc_metric("polar/dropped_groups")
+                    continue
+                completed.policy_version = min(int(v) for v in versions)
+                if completed.policy_version > self.current_policy_version():
+                    raise PolarRolloutSchedulerError("partial group carries a future policy version")
+            staleness = max(0, (self.current_policy_version() if self.config.partial_rollout else int(rollout_id)) - completed.policy_version)
             if staleness > self.config.max_off_policy_steps:
                 self._inc_metric("polar/stale_groups")
                 reason = (
@@ -2665,6 +2696,11 @@ class AsyncPolarRolloutWorker:
             config=self.config,
             unit=unit,
         )
+        if self.config.partial_rollout:
+            metadata = payload.setdefault("metadata", {})
+            metadata["partial_rollout"] = True
+            metadata["group_policy_version"] = unit.policy_version
+            metadata["policy_version"] = self.current_policy_version()
         return await self._submit_payload(client, payload)
 
     async def _poll_session_pool_run_release(

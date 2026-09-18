@@ -1089,6 +1089,20 @@ def policy_loss_function(
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
 
+    if args.get_mismatch_metrics and batch.get("rollout_log_probs"):
+        from vime.utils.rollout_prob_metrics import probability_diff_stats
+
+        local_masks = [
+            slice_log_prob_with_cp(mask, total, response, args.qkv_format,
+                                   max_seq_lens[i] if max_seq_lens is not None else None)
+            for i, (mask, total, response) in enumerate(zip(
+                batch["loss_masks"], total_lengths, response_lengths, strict=True))
+        ]
+        reported_loss.update(probability_diff_stats(
+            torch.cat(train_log_probs_for_tis), torch.cat(batch["rollout_log_probs"]),
+            torch.cat(local_masks),
+        ))
+
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 

@@ -770,6 +770,9 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    if getattr(args, "polar_partial_rollout", False) and num_steps_per_rollout != 1:
+        raise ValueError("Polar partial rollout requires exactly one optimizer step per policy epoch")
+
     microbatch_pbar = tqdm(
         total=sum(num_microbatches),
         desc=f"{getattr(model[0], 'role', 'actor')} train",
@@ -836,7 +839,8 @@ def train(
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {
-                f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
+                (f"training/{key}" if role == "actor" and key.startswith("rollout_probs_diff_")
+                 else f"train/{role_tag}{key}"): val.mean().item() if isinstance(val, torch.Tensor) else val
                 for key, val in loss_dict.items()
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm

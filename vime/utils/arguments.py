@@ -688,6 +688,8 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "preserves the existing bridge control path."
                 ),
             )
+            parser.add_argument("--polar-partial-rollout", action="store_true", default=False,
+                                help="Resume Polar sessions across one policy update; retain completed turns and restart interrupted calls.")
             parser.add_argument("--polar-policy-control-timeout", type=float, default=45.0)
             # 关掉 = 权重更新时不等 polar 的 in-flight session,直接丢。同步(colocate)训练下
             # 引擎整个训练步都在 sleep,等 session 只是白等,见 vime_bridge/rollout.py prepare_policy_update。

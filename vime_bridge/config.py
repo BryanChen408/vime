@@ -38,6 +38,7 @@ class PolarSlimeConfig:
     session_pool_pause_policy: str
     operator_tasks_dir: str | None = None
     session_pool_release_on_postrun: bool = False
+    partial_rollout: bool = False
 
 
 def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
@@ -114,6 +115,22 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         if max_off_policy_steps < 0:
             raise ValueError("rollout_max_off_policy_steps must be >= 0")
 
+    partial_rollout = bool(getattr(args, "polar_partial_rollout", False))
+    if partial_rollout:
+        if max_off_policy_steps_override is not None and max_off_policy_steps != 1:
+            raise ValueError("Polar partial rollout requires rollout_max_off_policy_steps=1")
+        max_off_policy_steps = 1
+        if scheduler_mode != "session_pool" or not getattr(args, "polar_policy_transition_enabled", False):
+            raise ValueError("Polar partial rollout requires session_pool and durable policy transitions")
+        if getattr(args, "mask_offpolicy_in_partial_rollout", False):
+            raise ValueError("Polar partial rollout trains old and new actions; age masking is forbidden")
+        if not getattr(args, "use_tis", False) or getattr(args, "use_rollout_logprobs", False):
+            raise ValueError("Polar partial rollout requires use_tis=True and use_rollout_logprobs=False")
+        if not getattr(args, "get_mismatch_metrics", False):
+            raise ValueError("Polar partial rollout requires get_mismatch_metrics=True for frozen train logprobs")
+        if update_weights_interval != 1 or not getattr(args, "offload_rollout", False):
+            raise ValueError("Polar partial rollout requires train.py synchronous boundary, offload_rollout and update_weights_interval=1")
+
     request_timeout = _first_configured(args, "rollout_request_timeout", "polar_request_timeout")
     if request_timeout is not None:
         request_timeout = float(request_timeout)
@@ -141,6 +158,9 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
     )
     if not 0.0 <= min_complete_accept_fraction <= 1.0:
         raise ValueError("polar_min_complete_accept_fraction must be between 0 and 1")
+
+    if partial_rollout and min_complete_accept_fraction != 1.0:
+        raise ValueError("Polar partial rollout requires min_complete_accept_fraction=1 (complete valid GRPO groups)")
 
     return PolarSlimeConfig(
         rollout_server_url=str(rollout_server_url).rstrip("/"),
@@ -177,6 +197,7 @@ def resolve_polar_slime_config(args: Any) -> PolarSlimeConfig:
         max_owned_groups=max_owned_groups,
         session_pool_pause_policy=session_pool_pause_policy,
         session_pool_release_on_postrun=session_pool_release_on_postrun,
+        partial_rollout=partial_rollout,
     )
 
 
